@@ -58,7 +58,7 @@ services:
     ports:
       - "${HARNESS_APP_PORT}:8443"
     volumes:
-      - ./data/git-repos:/srv/git-repos:Z
+      - ./data/git-repos:/var/lib/harness/repos:Z
     networks:
       harness-net:
         ipv4_address: 172.28.0.20

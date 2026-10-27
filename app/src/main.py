@@ -5,12 +5,14 @@ import hashlib
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import jwt
 import sqlalchemy as sa
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from pydantic import BaseModel, Field
+
+from src.indexer import index_repository, compute_embedding_768
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("HARNESS_JWT_SECRET", "change-me-secret")
@@ -309,3 +311,218 @@ async def agent_heartbeat_ws(websocket: WebSocket, session_id: str, token: str =
         active_connections.pop(session_id, None)
         with engine.begin() as conn:
             cleanup_disconnected_sessions(conn, [session_id], target_status="OFFLINE")
+
+
+class RepoIndexRequest(BaseModel):
+    repo_name: str = Field(..., min_length=2, max_length=150, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    repo_url: Optional[str] = None
+    branch: str = Field(default="main", max_length=150)
+
+
+class ContextPackRequest(BaseModel):
+    repo_name: str = Field(..., min_length=2, max_length=150)
+    query: str = Field(..., min_length=1, max_length=4000)
+    allowed_files: Optional[List[str]] = None
+    token_budget: int = Field(default=2000, ge=300, le=16000)
+    top_k: int = Field(default=5, ge=1, le=20)
+
+
+class SymbolValidationRequest(BaseModel):
+    repo_name: str = Field(..., min_length=2, max_length=150)
+    referenced_symbols: List[str]
+
+
+@app.post("/api/v1/repos/index")
+def trigger_repo_index(payload: RepoIndexRequest):
+    try:
+        result = index_repository(
+            engine=engine,
+            repo_name=payload.repo_name,
+            repo_url=payload.repo_url,
+            branch=payload.branch
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return {"status": "INDEXED", **result}
+
+
+@app.get("/api/v1/repos/{repo_name}/map")
+def get_repository_quick_map(repo_name: str):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.text("""
+                SELECT file_path, commit_sha, quick_summary, exported_symbols, imports,
+                       locked_by_task_id::text AS locked_by_task_id
+                FROM repo_file_map
+                WHERE repo_name = :rname
+                ORDER BY file_path ASC
+            """),
+            {"rname": repo_name}
+        ).mappings().all()
+    return {
+        "repo_name": repo_name,
+        "total_files": len(rows),
+        "files": [dict(r) for r in rows]
+    }
+
+
+@app.post("/api/v1/context/pack")
+def build_surgical_context_pack(payload: ContextPackRequest):
+    """
+    Construye un Context Pack quirurgico (< token_budget) combinando:
+    1. El Mapa Rapido de archivos relevantes.
+    2. Los fragmentos exactos AST mas cercanos en pgvector (HNSW cosine distance).
+    """
+    q_vec = compute_embedding_768(payload.query)
+    q_vec_str = "[" + ",".join(str(x) for x in q_vec) + "]"
+
+    with engine.connect() as conn:
+        # 1. Mapa rapido de archivos del repo
+        map_rows = conn.execute(
+            sa.text("""
+                SELECT file_path, quick_summary, locked_by_task_id::text AS locked_by_task_id
+                FROM repo_file_map
+                WHERE repo_name = :rname
+                ORDER BY file_path ASC
+            """),
+            {"rname": payload.repo_name}
+        ).mappings().all()
+
+        # 2. Busqueda vectorial HNSW en code_ast_vectors
+        if payload.allowed_files:
+            vec_rows = conn.execute(
+                sa.text("""
+                    SELECT m.file_path, v.symbol_name, v.symbol_signature,
+                           v.start_line, v.end_line, v.code_snippet,
+                           ROUND((1 - (v.embedding <=> CAST(:qvec AS vector)))::numeric, 4) AS similarity
+                    FROM code_ast_vectors v
+                    JOIN repo_file_map m ON m.id = v.file_id
+                    WHERE m.repo_name = :rname
+                      AND m.file_path = ANY(:afiles)
+                    ORDER BY v.embedding <=> CAST(:qvec AS vector) ASC
+                    LIMIT :topk
+                """),
+                {"qvec": q_vec_str, "rname": payload.repo_name, "afiles": payload.allowed_files, "topk": payload.top_k}
+            ).mappings().all()
+        else:
+            vec_rows = conn.execute(
+                sa.text("""
+                    SELECT m.file_path, v.symbol_name, v.symbol_signature,
+                           v.start_line, v.end_line, v.code_snippet,
+                           ROUND((1 - (v.embedding <=> CAST(:qvec AS vector)))::numeric, 4) AS similarity
+                    FROM code_ast_vectors v
+                    JOIN repo_file_map m ON m.id = v.file_id
+                    WHERE m.repo_name = :rname
+                    ORDER BY v.embedding <=> CAST(:qvec AS vector) ASC
+                    LIMIT :topk
+                """),
+                {"qvec": q_vec_str, "rname": payload.repo_name, "topk": payload.top_k}
+            ).mappings().all()
+
+    # Empaquetado respetando estrictamente el presupuesto de tokens (~4 caracteres por token)
+    char_budget = payload.token_budget * 4
+    used_chars = 0
+
+    repo_overview = []
+    for r in map_rows:
+        line = f"{r['quick_summary']} [LOCK={r['locked_by_task_id'] or 'FREE'}]"
+        if used_chars + len(line) > int(char_budget * 0.35):
+            break
+        repo_overview.append(line)
+        used_chars += len(line)
+
+    selected_snippets = []
+    for vr in vec_rows:
+        snippet_text = vr["code_snippet"]
+        remaining = char_budget - used_chars
+        if remaining <= 120:
+            break
+        if len(snippet_text) > remaining:
+            suffix = "\n# ... [truncated by token_budget]"
+            snippet_text = snippet_text[: max(0, remaining - len(suffix))] + suffix
+        used_chars += len(snippet_text)
+        selected_snippets.append({
+            "file_path": vr["file_path"],
+            "symbol_name": vr["symbol_name"],
+            "symbol_signature": vr["symbol_signature"],
+            "lines": [vr["start_line"], vr["end_line"]],
+            "similarity": float(vr["similarity"]),
+            "code_snippet": snippet_text
+        })
+
+    estimated_tokens = min(payload.token_budget, max(1, used_chars // 4))
+    return {
+        "repo_name": payload.repo_name,
+        "token_budget": payload.token_budget,
+        "estimated_tokens_used": estimated_tokens,
+        "allowed_files_contract": payload.allowed_files or "READ_ONLY_UNRESTRICTED",
+        "repo_quick_map": repo_overview,
+        "surgical_ast_chunks": selected_snippets
+    }
+
+
+@app.post("/api/v1/guardrails/validate-symbols")
+def validate_symbols_against_hallucination(payload: SymbolValidationRequest):
+    """Verifica si los metodos/clases que el agente intenta usar existen realmente en el AST del repositorio."""
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.text("""
+                SELECT file_path, exported_symbols
+                FROM repo_file_map
+                WHERE repo_name = :rname
+            """),
+            {"rname": payload.repo_name}
+        ).mappings().all()
+
+    known_symbols = {}
+    known_qualified = {}
+    known_classes = set()
+    for r in rows:
+        for sym in (r["exported_symbols"] or []):
+            info = {
+                "file_path": r["file_path"],
+                "signature": sym["signature"],
+                "type": sym["type"]
+            }
+            known_symbols[sym["name"]] = info
+            if sym.get("qualified_name"):
+                known_qualified[sym["qualified_name"]] = info
+            if sym.get("type") == "class":
+                known_classes.add(sym["name"])
+
+    valid = {}
+    hallucinated = []
+    for raw_ref in payload.referenced_symbols:
+        ref = raw_ref.strip()
+        if ref in known_qualified:
+            valid[ref] = known_qualified[ref]
+            continue
+        # Permite prefijos tipo modulo: src.main.register_agent_session
+        suffix_match = next((qn for qn in known_qualified if ref.endswith("." + qn)), None)
+        if suffix_match:
+            valid[ref] = known_qualified[suffix_match]
+            continue
+        if "." in ref:
+            prefix, last = ref.rsplit(".", 1)
+            # Clase.metodo inexistente: no vale con que exista una funcion top-level homonima
+            if prefix.split(".")[-1] in known_classes:
+                hallucinated.append(ref)
+            elif last in known_symbols:
+                valid[ref] = known_symbols[last]
+            else:
+                hallucinated.append(ref)
+            continue
+        if ref in known_symbols:
+            valid[ref] = known_symbols[ref]
+        else:
+            hallucinated.append(ref)
+
+    return {
+        "repo_name": payload.repo_name,
+        "is_clean": len(hallucinated) == 0,
+        "valid_symbols": valid,
+        "hallucinated_symbols": hallucinated,
+        "available_symbols_sample": list(known_symbols.keys())[:30]
+    }
