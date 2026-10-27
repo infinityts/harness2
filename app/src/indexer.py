@@ -4,9 +4,12 @@ import ast
 import math
 import json
 import hashlib
+import ipaddress
+import socket
 import subprocess
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse
 import urllib.request
 
 import sqlalchemy as sa
@@ -14,6 +17,11 @@ import sqlalchemy as sa
 REPOS_BASE_DIR = Path(os.getenv("HARNESS_REPOS_DIR", "/var/lib/harness/repos"))
 EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL", "")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+ALLOWED_GIT_HOSTS = {
+    h.strip().lower()
+    for h in os.getenv("ALLOWED_GIT_HOSTS", "github.com,gitlab.com,bitbucket.org").split(",")
+    if h.strip()
+}
 
 IGNORED_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build", "target", ".idea", ".vscode"}
 SUPPORTED_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".go", ".sql"}
@@ -30,11 +38,42 @@ def validate_repo_name(repo_name: str) -> str:
     return repo_name
 
 
+def _is_public_ip(ip_value: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_value.split("%", 1)[0])
+    except ValueError:
+        return False
+    return not (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_unspecified
+        or addr.is_multicast
+    )
+
+
 def validate_repo_url(repo_url: Optional[str]) -> Optional[str]:
     if not repo_url:
         return None
     if not REPO_URL_RE.fullmatch(repo_url):
         raise ValueError("repo_url invalida: solo se permiten URLs http(s)")
+    parsed = urlparse(repo_url)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise ValueError("repo_url sin host")
+    # Los hosts del allowlist se permiten sin resolver (github/gitlab/bitbucket).
+    if host in ALLOWED_GIT_HOSTS:
+        return repo_url
+    if host == "localhost" or host.endswith(".local") or host.endswith(".internal"):
+        raise ValueError("repo_url apunta a un host interno no permitido")
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or 443, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise ValueError(f"repo_url no resuelve: {host}") from exc
+    ips = {info[4][0] for info in infos}
+    if not ips or any(not _is_public_ip(ip) for ip in ips):
+        raise ValueError("repo_url apunta a una IP privada/loopback/link-local y no esta en ALLOWED_GIT_HOSTS")
     return repo_url
 
 
@@ -243,6 +282,7 @@ def index_repository(engine: sa.Engine, repo_name: str, repo_url: Optional[str] 
 
     files_indexed = 0
     vectors_created = 0
+    seen_files = set()
 
     with engine.begin() as conn:
         for root, dirs, files in os.walk(repo_path):
@@ -259,6 +299,7 @@ def index_repository(engine: sa.Engine, repo_name: str, repo_url: Optional[str] 
                     source = full_path.read_text(encoding="utf-8", errors="ignore")
                 except Exception:
                     continue
+                seen_files.add(rel_path)
 
                 parsed = parse_python_ast(source) if ext == ".py" else parse_generic_code(source, ext)
                 symbols = parsed["symbols"]
@@ -335,6 +376,20 @@ def index_repository(engine: sa.Engine, repo_name: str, repo_url: Optional[str] 
                         }
                     )
                     vectors_created += 1
+
+        # Reconciliacion: eliminar filas de archivos que ya no existen en el arbol actual.
+        # code_ast_vectors tiene ON DELETE CASCADE, asi que sus embeddings se limpian solos.
+        if seen_files:
+            conn.execute(
+                sa.text("""
+                    DELETE FROM repo_file_map
+                    WHERE repo_name = :rname
+                      AND NOT (file_path = ANY(:seen))
+                """),
+                {"rname": repo_name, "seen": list(seen_files)}
+            )
+        else:
+            conn.execute(sa.text("DELETE FROM repo_file_map WHERE repo_name = :rname"), {"rname": repo_name})
 
     return {
         "repo_name": repo_name,

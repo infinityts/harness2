@@ -1,40 +1,63 @@
 """Prueba E2E Etapa 1: registro, WS, purga de contexto y watchdog."""
-import asyncio, json, sys, time, urllib.request
+import asyncio, json, os, sys, time, urllib.request
 import websockets
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://11.0.0.3:8444"
 WS = BASE.replace("http", "ws", 1)
+ADMIN_KEY = os.environ.get("HARNESS_ADMIN_API_KEY", "")
+AUTH = {}
 
-def http(method, path, body=None):
-    req = urllib.request.Request(BASE + path, method=method,
-                                 data=json.dumps(body).encode() if body else None,
-                                 headers={"Content-Type": "application/json"})
+
+def http(method, path, body=None, headers=None):
+    h = {"Content-Type": "application/json", **AUTH, **(headers or {})}
+    req = urllib.request.Request(
+        BASE + path,
+        method=method,
+        data=json.dumps(body).encode() if body else None,
+        headers=h,
+    )
     with urllib.request.urlopen(req) as r:
         return json.loads(r.read())
+
 
 def show(title, obj):
     print(f"\n=== {title} ===\n" + json.dumps(obj, indent=2, default=str))
 
+
 def session(sid):
-    return next(s for s in http("GET", "/api/v1/sessions")["sessions"] if s["id"] == sid)
+    return next(s for s in http("GET", "/api/v1/sessions", headers={"X-Harness-Admin-Key": ADMIN_KEY})["sessions"] if s["id"] == sid)
+
 
 async def main():
-    reg = http("POST", "/api/v1/sessions/register", {
-        "engineer_username": "jcardona", "agent_tool": "opencode", "llm_provider": "local-qwen",
-        "skills": ["python", "rust", "git"], "max_context_tokens": 32000})
+    reg = http(
+        "POST",
+        "/api/v1/sessions/register",
+        {
+            "engineer_username": "jcardona", "agent_tool": "opencode", "llm_provider": "local-qwen",
+            "skills": ["python", "rust", "git"], "max_context_tokens": 32000,
+        },
+        headers={"X-Harness-Admin-Key": ADMIN_KEY},
+    )
     show("1. POST /api/v1/sessions/register", {**reg, "session_key": reg["session_key"][:25] + "...(truncado)"})
     sid = reg["session_id"]
+    AUTH["Authorization"] = f"Bearer {reg['session_key']}"
 
-    # Token invalido -> 4003
+    # Token invalido -> rechazo en handshake
     try:
-        async with websockets.connect(f"{WS}/ws/agent/{sid}?token=bad") as w:
+        async with websockets.connect(
+            f"{WS}/ws/agent/{sid}",
+            additional_headers={"Authorization": "Bearer bad"},
+        ) as w:
             await w.recv()
     except websockets.ConnectionClosed as e:
         print(f"\n=== 2. WS con token invalido ===\ncerrado con codigo {e.rcvd.code if e.rcvd else e}")
     except Exception as e:
         print(f"\n=== 2. WS con token invalido ===\nrechazado: {e}")
 
-    async with websockets.connect(f"{WS}{reg['ws_url']}") as w:
+    async with websockets.connect(
+        f"{WS}/ws/agent/{sid}",
+        additional_headers={"Authorization": f"Bearer {reg['session_key']}"},
+    ) as w:
         await w.send(json.dumps({"current_context_tokens": 22000}))
         show("3. WS heartbeat 22000/32000", json.loads(await w.recv()))
         show("   sesion en BD", {k: session(sid)[k] for k in ("status", "current_context_tokens")})
@@ -55,5 +78,6 @@ async def main():
             print("el socket NO fue cerrado")
 
     show("6. GET /api/v1/sessions (sesion de prueba)", session(sid))
+
 
 asyncio.run(main())

@@ -2,17 +2,28 @@ import os
 import json
 import uuid
 import hashlib
+import hmac
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+from typing import Any, List, Dict, Optional
 
 import jwt
 import sqlalchemy as sa
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, WebSocket, WebSocketDisconnect, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from src.indexer import index_repository, compute_embedding_768
+from src.orchestrator import (
+    ContractViolation,
+    TaskPermissionError,
+    complete_task,
+    dispatch_pending_tasks,
+    fail_task_checkpoint,
+    generate_dual_plans_and_synthesize,
+)
+
+ADMIN_API_KEY = os.getenv("HARNESS_ADMIN_API_KEY", "")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("HARNESS_JWT_SECRET", "change-me-secret")
@@ -35,6 +46,50 @@ class SessionRegisterRequest(BaseModel):
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def verify_auth(
+    x_harness_admin_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """Admin por X-Harness-Admin-Key o agente por Authorization: Bearer <session_key>."""
+    if ADMIN_API_KEY and x_harness_admin_key and hmac.compare_digest(x_harness_admin_key, ADMIN_API_KEY):
+        return {"role": "admin", "session_id": None}
+
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        try:
+            decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        except Exception:
+            raise HTTPException(status_code=401, detail="Invalid bearer token")
+        session_id = decoded.get("sub")
+        if not session_id:
+            raise HTTPException(status_code=401, detail="Invalid bearer token")
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.text("""
+                    SELECT id::text, status FROM agent_sessions
+                    WHERE id = CAST(:sid AS UUID)
+                      AND session_key_hash = :khash
+                      AND status IN ('ONLINE', 'BUSY')
+                """),
+                {"sid": session_id, "khash": hash_token(token)}
+            ).fetchone()
+        if not row:
+            raise HTTPException(status_code=401, detail="Session not active")
+        return {"role": "agent", "session_id": row[0], "status": row[1]}
+
+    raise HTTPException(
+        status_code=401,
+        detail="Missing credentials",
+        headers={"WWW-Authenticate": "Bearer"}
+    )
+
+
+def require_admin(auth: Dict[str, Any] = Depends(verify_auth)) -> Dict[str, Any]:
+    if auth.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin key required")
+    return auth
 
 
 def cleanup_disconnected_sessions(conn, session_ids: List[str], target_status: str = "OFFLINE"):
@@ -129,7 +184,7 @@ def health_check():
     }
 
 
-@app.post("/api/v1/sessions/register")
+@app.post("/api/v1/sessions/register", dependencies=[Depends(require_admin)])
 def register_agent_session(payload: SessionRegisterRequest):
     session_id = str(uuid.uuid4())
     now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -168,11 +223,11 @@ def register_agent_session(payload: SessionRegisterRequest):
         "session_id": session_id,
         "session_key": session_key,
         "status": "ONLINE",
-        "ws_url": f"/ws/agent/{session_id}?token={session_key}"
+        "ws_url": f"/ws/agent/{session_id}"
     }
 
 
-@app.get("/api/v1/sessions")
+@app.get("/api/v1/sessions", dependencies=[Depends(verify_auth)])
 def list_sessions():
     with engine.connect() as conn:
         rows = conn.execute(
@@ -188,7 +243,9 @@ def list_sessions():
 
 
 @app.post("/api/v1/sessions/{session_id}/context-purged")
-def confirm_context_purged(session_id: str):
+def confirm_context_purged(session_id: str, auth: Dict[str, Any] = Depends(verify_auth)):
+    if auth["role"] == "agent" and auth.get("session_id") != session_id:
+        raise HTTPException(status_code=403, detail="Cannot purge another session")
     with engine.begin() as conn:
         res = conn.execute(
             sa.text("""
@@ -204,7 +261,9 @@ def confirm_context_purged(session_id: str):
 
 
 @app.post("/api/v1/sessions/{session_id}/revoke")
-async def revoke_session(session_id: str):
+async def revoke_session(session_id: str, auth: Dict[str, Any] = Depends(verify_auth)):
+    if auth["role"] == "agent" and auth.get("session_id") != session_id:
+        raise HTTPException(status_code=403, detail="Cannot revoke another session")
     with engine.begin() as conn:
         cleanup_disconnected_sessions(conn, [session_id], target_status="REVOKED")
     ws = active_connections.pop(session_id, None)
@@ -214,8 +273,27 @@ async def revoke_session(session_id: str):
 
 
 @app.websocket("/ws/agent/{session_id}")
-async def agent_heartbeat_ws(websocket: WebSocket, session_id: str, token: str = Query(...)):
-    # 1. Validar firma JWT y hash en la base de datos
+async def agent_heartbeat_ws(websocket: WebSocket, session_id: str, token: Optional[str] = Query(default=None)):
+    # 1. Token por query (fallback legado), header Authorization o primer mensaje AUTH.
+    pre_accepted = False
+    if not token:
+        auth_header = websocket.headers.get("authorization") or ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        await websocket.accept()
+        pre_accepted = True
+        try:
+            first = await asyncio.wait_for(websocket.receive_json(), timeout=10)
+        except Exception:
+            await websocket.close(code=4003, reason="Missing session_key")
+            return
+        if not isinstance(first, dict) or first.get("type") != "AUTH" or not first.get("token"):
+            await websocket.close(code=4003, reason="AUTH message required")
+            return
+        token = str(first["token"])
+
+    # 2. Validar firma JWT y hash en la base de datos
     try:
         decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
         if decoded.get("sub") != session_id:
@@ -250,7 +328,8 @@ async def agent_heartbeat_ws(websocket: WebSocket, session_id: str, token: str =
             {"sid": session_id}
         )
 
-    await websocket.accept()
+    if not pre_accepted:
+        await websocket.accept()
     active_connections[session_id] = websocket
 
     try:
@@ -332,7 +411,7 @@ class SymbolValidationRequest(BaseModel):
     referenced_symbols: List[str]
 
 
-@app.post("/api/v1/repos/index")
+@app.post("/api/v1/repos/index", dependencies=[Depends(require_admin)])
 def trigger_repo_index(payload: RepoIndexRequest):
     try:
         result = index_repository(
@@ -348,7 +427,7 @@ def trigger_repo_index(payload: RepoIndexRequest):
     return {"status": "INDEXED", **result}
 
 
-@app.get("/api/v1/repos/{repo_name}/map")
+@app.get("/api/v1/repos/{repo_name}/map", dependencies=[Depends(verify_auth)])
 def get_repository_quick_map(repo_name: str):
     with engine.connect() as conn:
         rows = conn.execute(
@@ -368,7 +447,7 @@ def get_repository_quick_map(repo_name: str):
     }
 
 
-@app.post("/api/v1/context/pack")
+@app.post("/api/v1/context/pack", dependencies=[Depends(verify_auth)])
 def build_surgical_context_pack(payload: ContextPackRequest):
     """
     Construye un Context Pack quirurgico (< token_budget) combinando:
@@ -463,7 +542,7 @@ def build_surgical_context_pack(payload: ContextPackRequest):
     }
 
 
-@app.post("/api/v1/guardrails/validate-symbols")
+@app.post("/api/v1/guardrails/validate-symbols", dependencies=[Depends(verify_auth)])
 def validate_symbols_against_hallucination(payload: SymbolValidationRequest):
     """Verifica si los metodos/clases que el agente intenta usar existen realmente en el AST del repositorio."""
     with engine.connect() as conn:
@@ -526,3 +605,159 @@ def validate_symbols_against_hallucination(payload: SymbolValidationRequest):
         "hallucinated_symbols": hallucinated,
         "available_symbols_sample": list(known_symbols.keys())[:30]
     }
+
+
+class PlanProposeRequest(BaseModel):
+    requested_by: str = Field(..., min_length=2, max_length=100)
+    repo_name: str = Field(..., min_length=2, max_length=150)
+    requirement_prompt: str = Field(..., min_length=5, max_length=8000)
+    required_skills_hint: Optional[List[str]] = None
+    plan_a_override: Optional[Dict[str, Any]] = None
+    plan_b_override: Optional[Dict[str, Any]] = None
+
+
+class TaskCompleteRequest(BaseModel):
+    commit_sha: str = Field(default="", max_length=64)
+    modified_files: List[str] = Field(default_factory=list)
+    summary: str = Field(default="", max_length=2000)
+
+
+class TaskFailRequest(BaseModel):
+    error_reason: str = Field(..., min_length=1, max_length=2000)
+    git_diff_summary: Optional[str] = None
+    release: bool = True
+
+
+@app.post("/api/v1/plans/propose", dependencies=[Depends(require_admin)])
+def propose_dual_plan(payload: PlanProposeRequest):
+    try:
+        with engine.begin() as conn:
+            result = generate_dual_plans_and_synthesize(
+                conn=conn,
+                repo_name=payload.repo_name,
+                requested_by=payload.requested_by,
+                requirement_prompt=payload.requirement_prompt,
+                required_skills_hint=payload.required_skills_hint,
+                plan_a_override=payload.plan_a_override,
+                plan_b_override=payload.plan_b_override,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return result
+
+
+@app.post("/api/v1/tasks/dispatch", dependencies=[Depends(require_admin)])
+async def dispatch_tasks():
+    with engine.begin() as conn:
+        dispatched = dispatch_pending_tasks(conn, HEARTBEAT_TIMEOUT, MAX_CONTEXT_RATIO)
+
+    for item in dispatched:
+        ws = active_connections.get(item["assigned_to"]["session_id"])
+        if ws:
+            try:
+                await ws.send_json({"event": "TASK_ASSIGNED", "task": item})
+            except Exception:
+                pass
+
+    return {"dispatched": dispatched, "count": len(dispatched)}
+
+
+@app.get("/api/v1/tasks", dependencies=[Depends(verify_auth)])
+def list_tasks(
+    status: Optional[str] = None,
+    plan_id: Optional[str] = None,
+    assigned_session_id: Optional[str] = None,
+):
+    clauses = []
+    params: Dict[str, Any] = {}
+    if status:
+        clauses.append("status = :status")
+        params["status"] = status
+    if plan_id:
+        clauses.append("plan_id = CAST(:plan_id AS UUID)")
+        params["plan_id"] = plan_id
+    if assigned_session_id:
+        clauses.append("assigned_session_id = CAST(:assigned_session_id AS UUID)")
+        params["assigned_session_id"] = assigned_session_id
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.text(f"""
+                SELECT id::text, plan_id::text, assigned_session_id::text, title,
+                       required_skills, git_branch, allowed_files, allow_dependency_changes,
+                       failed_attempts_memory, status, created_at
+                FROM harness_tasks{where}
+                ORDER BY created_at ASC
+            """),
+            params
+        ).mappings().all()
+
+    return {"tasks": [dict(r) for r in rows]}
+
+
+@app.post("/api/v1/tasks/{task_id}/complete")
+async def complete_task_endpoint(
+    task_id: str,
+    payload: TaskCompleteRequest,
+    auth: Dict[str, Any] = Depends(verify_auth),
+):
+    session_id = auth.get("session_id") if auth["role"] == "agent" else None
+    try:
+        with engine.begin() as conn:
+            result = complete_task(
+                conn=conn,
+                task_id=task_id,
+                session_id=session_id,
+                commit_sha=payload.commit_sha,
+                modified_files=payload.modified_files,
+                summary=payload.summary,
+            )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except TaskPermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ContractViolation as exc:
+        raise HTTPException(status_code=403, detail={"error": "Contract Violation", "files": exc.files})
+
+    ws = active_connections.get(result["assigned_session_id"]) if result["assigned_session_id"] else None
+    if ws:
+        try:
+            await ws.send_json({"event": "CLEAR_LLM_CONTEXT", "task_id": task_id})
+        except Exception:
+            pass
+
+    return result
+
+
+@app.post("/api/v1/tasks/{task_id}/fail-checkpoint")
+async def fail_task_endpoint(
+    task_id: str,
+    payload: TaskFailRequest,
+    auth: Dict[str, Any] = Depends(verify_auth),
+):
+    session_id = auth.get("session_id") if auth["role"] == "agent" else None
+    try:
+        with engine.begin() as conn:
+            result = fail_task_checkpoint(
+                conn=conn,
+                task_id=task_id,
+                session_id=session_id,
+                error_reason=payload.error_reason,
+                git_diff_summary=payload.git_diff_summary,
+                release=payload.release,
+            )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except TaskPermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+
+    if result["released"] and result["assigned_session_id"]:
+        ws = active_connections.get(result["assigned_session_id"])
+        if ws:
+            try:
+                await ws.send_json({"event": "CLEAR_LLM_CONTEXT", "task_id": task_id})
+            except Exception:
+                pass
+
+    return result
