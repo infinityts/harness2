@@ -317,34 +317,23 @@ WAR_ROOM_HTML = r"""<!doctype html>
 
         <section id="viewEngineers" class="view hidden">
           <div class="view-head">
-            <div><h1>Ingenieros y Accesos</h1><p>Invita por correo, aprueba proyectos y define skills por membresía.</p></div>
+            <div><h1>Usuarios y Accesos</h1><p>Crea la cuenta primero y asígnale proyectos después. Sin sorpresas ni accesos automáticos.</p></div>
+            <div class="spacer"></div>
+            <button id="newUserBtn" class="btn primary" type="button">+ Crear Usuario</button>
           </div>
-          <div class="grid-2" style="align-items:start">
-            <div class="card stack">
-              <h3>Crear / invitar ingeniero</h3>
-              <div class="form-grid">
-                <div class="field"><label for="eEmail">Email</label><input id="eEmail" type="email" placeholder="dev1@empresa.com"></div>
-                <div class="field"><label for="eName">Nombre completo</label><input id="eName" placeholder="Dev Uno"></div>
-                <div class="field"><label for="ePassword">Contraseña inicial (opcional)</label><input id="ePassword" type="password" autocomplete="new-password" placeholder="Si se omite, se genera"></div>
-                <div class="field"><label for="eInvite">Invite token (opcional)</label><input id="eInvite" placeholder="token de invitación"></div>
-              </div>
-              <div class="field">
-                <label>Proyectos aprobados y skills</label>
-                <div id="eProjects" class="stack" style="gap:7px"></div>
-              </div>
-              <button id="createEngineerBtn" class="btn primary" type="button">Crear / Invitar Ingeniero</button>
-              <div id="engineerResult" class="result-box hidden"></div>
+          <div class="card stack">
+            <div class="row">
+              <span class="pill info">1. Crear usuario</span>
+              <span class="pill info">2. Asignar proyecto</span>
+              <span class="pill info">3. Compartir credenciales</span>
             </div>
-            <div class="card stack">
-              <h3>Accesos por proyecto</h3>
-              <div class="row"><input id="engSearch" class="grow" placeholder="Filtrar por correo o proyecto"></div>
-              <div class="table-wrap">
-                <table>
-                  <thead><tr><th>Ingeniero</th><th>Proyecto</th><th>Skills</th><th>Estado</th><th></th></tr></thead>
-                  <tbody id="engineersTable"></tbody>
-                </table>
-              </div>
+            <div class="row">
+              <input id="userSearch" class="grow" placeholder="Buscar por correo o nombre">
+              <button id="usersRefresh" class="btn sm" type="button">Refrescar</button>
+              <span id="usersCount" class="muted" style="font-size:12px"></span>
             </div>
+            <div class="login-note">Un usuario puede tener varios proyectos. Cada proyecto tendrá su propia sesión y configuración MCP independiente.</div>
+            <div id="usersList" class="project-grid"></div>
           </div>
         </section>
 
@@ -508,7 +497,7 @@ const TOOL_LABELS = { opencode:"OpenCode", claudecode:"Claude Code", cursor:"Cur
 const state = {
   token: null, adminKey: null, user: null, role: null,
   projects: [], topology: null, activeView: "projects",
-  projectFilter: "all", selectedSession: null, ws: null,
+  adminUsers: [], projectFilter: "all", selectedSession: null, ws: null,
   sessionsByProject: {}, bundles: {}, consoleLines: 0,
 };
 let refreshTimer = null;
@@ -564,7 +553,7 @@ function navItems() {
   if (state.role === "ADMIN") {
     return [
       { id:"projects", icon:"▦", label:"Proyectos", bottom:"Proyectos" },
-      { id:"engineers", icon:"☺", label:"Ingenieros y Accesos", bottom:"Equipo" },
+      { id:"engineers", icon:"☺", label:"Usuarios y Accesos", bottom:"Usuarios" },
       { id:"warroom", icon:"◎", label:"Sala de Control", bottom:"War Room" },
       { id:"smtp", icon:"✉", label:"SMTP y Correos", bottom:"SMTP" },
     ];
@@ -587,10 +576,10 @@ function setView(name) {
   Object.values(views).forEach(id => $(id).classList.add("hidden"));
   if (views[name]) $(views[name]).classList.remove("hidden");
   document.querySelectorAll("[data-view]").forEach(btn => btn.classList.toggle("active", btn.dataset.view === name));
-  $("topTitle").textContent = ({projects:"Proyectos", engineers:"Ingenieros y Accesos", warroom:"Sala de Control", smtp:"SMTP y Correos", myprojects:"Mis Proyectos"})[name] || "Harness";
+  $("topTitle").textContent = ({projects:"Proyectos", engineers:"Usuarios y Accesos", warroom:"Sala de Control", smtp:"SMTP y Correos", myprojects:"Mis Proyectos"})[name] || "Harness";
   closeDrawer();
   if (name === "warroom") { if (state.role === "ADMIN") { ensureWarRoom(); } }
-  if (name === "engineers") renderEngineers();
+  if (name === "engineers") loadAdminUsers();
   if (name === "projects") renderProjects();
   if (name === "smtp") { loadSmtpConfig(); loadEmailLogs(); }
   if (name === "myprojects") renderMyProjects();
@@ -754,76 +743,161 @@ function renderProjectChoosers() {
   if (prevPlan && [...plan.options].some(o => o.value === prevPlan)) plan.value = prevPlan;
 }
 
-function renderEngineers() {
-  const tbody = $("engineersTable");
-  const container = $("eProjects");
-  if (!tbody || !container) return;
-  container.innerHTML = state.projects.map(p => `<div class="check-row" data-eng-project="${esc(p.id)}"><input type="checkbox" class="eng-project-check"><div class="grow"><div style="font-weight:650">${esc(p.display_name)} <span class="muted mono" style="font-size:11px">${esc(p.project_slug)}</span></div><input class="skills-input" placeholder="skills: python, fastapi"></div></div>`).join("");
-  container.querySelectorAll(".eng-project-check").forEach(chk => {
-    chk.onchange = () => { const input = chk.closest(".check-row").querySelector(".skills-input"); input.disabled = !chk.checked; };
-    chk.dispatchEvent(new Event("change"));
+async function loadAdminUsers() {
+  try {
+    const data = await api("/api/v1/admin/users");
+    state.adminUsers = data.users || [];
+    renderAdminUsers();
+  } catch (err) {
+    toast(err.message, "bad");
+  }
+}
+
+function renderAdminUsers() {
+  const box = $("usersList");
+  if (!box) return;
+  const q = ($("userSearch").value || "").toLowerCase();
+  const users = (state.adminUsers || []).filter(u =>
+    !q || (u.email || "").toLowerCase().includes(q) || (u.full_name || "").toLowerCase().includes(q)
+  );
+  $("usersCount").textContent = `${users.length} usuario(s)`;
+  if (!users.length) {
+    box.innerHTML = '<div class="card"><div class="muted">No hay usuarios que coincidan. Usa “+ Crear Usuario”.</div></div>';
+    return;
+  }
+  box.innerHTML = users.map(u => {
+    const memberships = u.memberships || [];
+    const approved = memberships.filter(m => m.status === "APPROVED");
+    const membershipRows = memberships.length ? memberships.map(m => `<div class="row" style="justify-content:space-between;gap:8px;padding:6px 0;border-top:1px solid var(--line)">
+      <div style="min-width:0">
+        <span class="mono" style="font-size:12px">${esc(m.project_slug)}</span>
+        <span class="pill ${m.status === "APPROVED" ? "ok" : "bad"}">${esc(m.status)}</span>
+        <div class="muted" style="font-size:11px">${esc((m.allowed_skills || []).join(", ") || "sin skills")}</div>
+      </div>
+      ${m.status === "APPROVED" ? `<button class="btn sm danger" data-revoke-project="${esc(m.project_id)}" data-revoke-user="${esc(u.id)}" type="button">Revocar</button>` : ""}
+    </div>`).join("") : '<div class="muted" style="font-size:12px">Sin proyectos asignados. Usa “Asignar proyecto”.</div>';
+    return `<article class="card project-card">
+      <div class="row"><div style="flex:1;min-width:0"><h2>${esc(u.full_name || u.email)}</h2><div class="muted mono" style="font-size:12px">${esc(u.email)}</div></div>${u.role === "ADMIN" ? '<span class="pill info">ADMIN</span>' : '<span class="pill">ENGINEER</span>'}${u.status === "ACTIVE" ? '<span class="pill ok">ACTIVE</span>' : `<span class="pill warn">${esc(u.status)}</span>`}</div>
+      <div class="meta"><span class="pill">${approved.length} proyecto(s)</span><span class="pill">${u.active_sessions || 0} sesión(es)</span></div>
+      <div>${membershipRows}</div>
+      <div class="row" style="margin-top:auto">
+        <button class="btn sm primary" data-assign-user="${esc(u.id)}" data-assign-email="${esc(u.email)}" type="button">Asignar proyecto</button>
+        <button class="btn sm" data-reset-user="${esc(u.id)}" data-reset-email="${esc(u.email)}" type="button">Reset password</button>
+      </div>
+    </article>`;
+  }).join("");
+  box.querySelectorAll("[data-assign-user]").forEach(btn => {
+    btn.onclick = () => openAssignProjectModal(btn.dataset.assignUser, btn.dataset.assignEmail);
   });
-  const q = ($("engSearch").value || "").toLowerCase();
-  const rows = [];
-  state.projects.forEach(p => (p.members || []).forEach(m => rows.push({ project:p, member:m })));
-  const filtered = rows.filter(r => !q || (r.member.email || "").toLowerCase().includes(q) || r.project.project_slug.toLowerCase().includes(q));
-  tbody.innerHTML = filtered.length ? filtered.map(r => `<tr>
-    <td><b>${esc(r.member.email)}</b><div class="muted" style="font-size:11px">${esc(r.member.full_name || "")}</div></td>
-    <td><span class="mono" style="font-size:12px">${esc(r.project.project_slug)}</span></td>
-    <td>${(r.member.allowed_skills || []).map(s => `<span class="pill">${esc(s)}</span>`).join(" ") || '<span class="muted">—</span>'}</td>
-    <td>${sessionPill(r.member.status || "APPROVED")}</td>
-    <td><div class="row" style="gap:5px;flex-wrap:nowrap"><button class="btn sm" data-reset-user="${esc(r.member.user_id)}" data-reset-email="${esc(r.member.email)}" type="button">Reset password</button><button class="btn sm danger" data-revoke-project="${esc(r.project.id)}" data-revoke-user="${esc(r.member.user_id)}" type="button">Revocar</button></div></td>
-  </tr>`).join("") : `<tr><td colspan="5" class="muted">Sin accesos registrados.</td></tr>`;
-  tbody.querySelectorAll("[data-reset-user]").forEach(btn => {
+  box.querySelectorAll("[data-reset-user]").forEach(btn => {
     btn.onclick = () => openAdminResetModal(btn.dataset.resetUser, btn.dataset.resetEmail);
   });
-  tbody.querySelectorAll("[data-revoke-project]").forEach(btn => {
+  box.querySelectorAll("[data-revoke-project]").forEach(btn => {
     btn.onclick = async () => {
-      const projectId = btn.dataset.revokeProject, userId = btn.dataset.revokeUser;
-      if (!confirm("¿Revocar el acceso y cerrar sus sesiones en este proyecto?")) return;
+      if (!confirm("¿Revocar este proyecto y cerrar las sesiones del usuario en él?")) return;
       try {
-        const data = await api(`/api/v1/projects/${projectId}/members/${userId}`, { method:"DELETE" });
+        const data = await api(`/api/v1/projects/${btn.dataset.revokeProject}/members/${btn.dataset.revokeUser}`, { method:"DELETE" });
         toast(`Acceso revocado · ${data.revoked_sessions.length} sesión(es) cerrada(s)`, "ok");
+        await loadAdminUsers();
         await refreshProjects();
-        renderEngineers();
       } catch (err) { toast(err.message, "bad"); }
     };
   });
 }
 
-async function createEngineer() {
-  const email = $("eEmail").value.trim();
-  const fullName = $("eName").value.trim();
-  const password = $("ePassword").value;
-  const invite = $("eInvite").value.trim();
-  if (!email) { toast("Ingresa el correo del ingeniero", "bad"); return; }
-  const selected = [];
-  document.querySelectorAll("[data-eng-project]").forEach(row => {
-    const chk = row.querySelector(".eng-project-check");
-    if (!chk.checked) return;
-    const skills = row.querySelector(".skills-input").value.split(",").map(s => s.trim()).filter(Boolean);
-    selected.push({ id: row.dataset.engProject, skills });
-  });
-  if (!selected.length) { toast("Selecciona al menos un proyecto aprobado", "bad"); return; }
-  const resultBox = $("engineerResult");
-  resultBox.classList.remove("hidden");
-  resultBox.textContent = "Procesando…";
-  let firstPassword = null;
+function showNewUserMsg(text, ok) {
+  const box = $("newUserMsg");
+  box.classList.remove("hidden");
+  box.textContent = text;
+  box.style.borderColor = ok ? "rgba(52,211,153,.45)" : "rgba(248,113,113,.45)";
+}
+
+function openCreateUserModal() {
+  $("modalTitle").textContent = "Crear usuario";
+  $("modalBody").innerHTML = `<div class="stack" style="gap:12px">
+    <div class="result-box">Paso 1: crea la cuenta. Paso 2: usa “Asignar proyecto” en su tarjeta. El usuario no se asigna automáticamente a ningún proyecto.</div>
+    <div class="form-grid">
+      <div class="field"><label for="newUserEmail">Email</label><input id="newUserEmail" type="email" placeholder="dev1@empresa.com"></div>
+      <div class="field"><label for="newUserName">Nombre completo</label><input id="newUserName" placeholder="Dev Uno"></div>
+      <div class="field"><label for="newUserPassword">Contraseña inicial (opcional)</label><input id="newUserPassword" type="password" autocomplete="new-password" placeholder="Si se omite, se genera"></div>
+      <div class="field"><label for="newUserInvite">Invite token (opcional)</label><input id="newUserInvite" placeholder="token de invitación"></div>
+    </div>
+    <div class="login-note">Si dejas contraseña e invite token vacíos, se genera una temporal y se envía por correo. La política exige 8+ caracteres, mayúscula, minúscula, número y símbolo.</div>
+    <div id="newUserMsg" class="result-box hidden"></div>
+  </div>`;
+  $("modalActions").innerHTML = `<button id="modalCancel" class="btn ghost" type="button">Cancelar</button><button id="newUserSave" class="btn primary" type="button">Crear usuario</button>`;
+  $("modal").classList.remove("hidden");
+  $("modalCancel").onclick = closeModal;
+  $("newUserSave").onclick = submitCreateUser;
+  $("newUserEmail").focus();
+}
+
+async function submitCreateUser() {
+  const email = $("newUserEmail").value.trim();
+  const fullName = $("newUserName").value.trim();
+  const password = $("newUserPassword").value;
+  const invite = $("newUserInvite").value.trim();
+  if (!email || !fullName) { showNewUserMsg("Completa email y nombre", false); return; }
+  if (password && invite) { showNewUserMsg("Usa contraseña o invite token, no ambos", false); return; }
+  const body = { email, full_name: fullName };
+  if (password) body.password = password;
+  if (invite) body.invite_token = invite;
+  $("newUserSave").disabled = true;
   try {
-    for (const item of selected) {
-      const body = { email, full_name: fullName || null, allowed_skills: item.skills };
-      if (password) body.password = password;
-      if (invite) body.invite_token = invite;
-      const data = await api(`/api/v1/projects/${item.id}/members`, { method:"POST", body:JSON.stringify(body) });
-      if (data.initial_password && !firstPassword) firstPassword = data.initial_password;
-    }
-    resultBox.innerHTML = `<b>Ingeniero aprobado en ${selected.length} proyecto(s).</b>` + (firstPassword ? `\nContraseña inicial generada: <span class="mono">${esc(firstPassword)}</span>\nGuárdala y compártela por un canal seguro.` : `\n${password || invite ? "Se usó la contraseña o invite token indicado." : "El usuario ya existía y conserva su credencial actual."}`);
-    toast("Ingeniero creado / actualizado", "ok");
-    await refreshProjects();
-    renderEngineers();
+    const data = await api("/api/v1/admin/users", { method:"POST", body:JSON.stringify(body) });
+    const detail = data.generated
+      ? "Contraseña temporal generada y enviada por correo."
+      : "Credencial configurada.";
+    showNewUserMsg(`Usuario creado sin proyectos. ${detail} Correo: ${data.email_sent ? "SENT" : "FAILED"}.`, data.email_sent);
+    toast(data.email_sent ? "Usuario creado y correo de bienvenida enviado" : "Usuario creado; el correo fallo", data.email_sent ? "ok" : "bad");
+    await loadAdminUsers();
+    if (data.email_sent) setTimeout(closeModal, 1200);
   } catch (err) {
-    resultBox.textContent = "Error: " + err.message;
-    toast(err.message, "bad");
+    showNewUserMsg("Error: " + err.message, false);
+  } finally {
+    $("newUserSave").disabled = false;
+  }
+}
+
+function openAssignProjectModal(userId, email) {
+  if (!state.projects.length) {
+    toast("Primero crea un proyecto en la pestaña Proyectos", "bad");
+    return;
+  }
+  $("modalTitle").textContent = "Asignar proyecto";
+  $("modalBody").innerHTML = `<div class="stack" style="gap:12px">
+    <div class="result-box">Usuario: <b>${esc(email)}</b><br>Selecciona el proyecto y las skills aprobadas para esta membresía.</div>
+    <div class="field"><label for="assignProject">Proyecto</label><select id="assignProject">${state.projects.map(p => `<option value="${esc(p.id)}">${esc(p.display_name)} · ${esc(p.project_slug)}</option>`).join("")}</select></div>
+    <div class="field"><label for="assignSkills">Skills permitidas</label><input id="assignSkills" placeholder="python, fastapi"></div>
+    <div class="login-note">Si el proyecto ya estaba asignado, se actualizarán sus skills. Se enviará un correo con el enlace al portal.</div>
+    <div id="assignMsg" class="result-box hidden"></div>
+  </div>`;
+  $("modalActions").innerHTML = `<button id="modalCancel" class="btn ghost" type="button">Cancelar</button><button id="assignSave" class="btn primary" type="button">Asignar proyecto</button>`;
+  $("modal").classList.remove("hidden");
+  $("modalCancel").onclick = closeModal;
+  $("assignSave").onclick = () => submitAssignProject(userId);
+  $("assignProject").focus();
+}
+
+async function submitAssignProject(userId) {
+  const projectId = $("assignProject").value;
+  const skills = $("assignSkills").value.split(",").map(s => s.trim()).filter(Boolean);
+  $("assignSave").disabled = true;
+  try {
+    await api(`/api/v1/projects/${projectId}/members`, {
+      method:"POST", body:JSON.stringify({ user_id: userId, allowed_skills: skills }),
+    });
+    toast("Proyecto asignado. Correo de acceso en cola.", "ok");
+    await loadAdminUsers();
+    await refreshProjects();
+    closeModal();
+  } catch (err) {
+    const box = $("assignMsg");
+    box.classList.remove("hidden");
+    box.textContent = "Error: " + err.message;
+    box.style.borderColor = "rgba(248,113,113,.45)";
+  } finally {
+    $("assignSave").disabled = false;
   }
 }
 
@@ -1530,8 +1604,9 @@ function bindStaticEvents() {
   $("drawerBackdrop").onclick = closeDrawer;
   $("modalClose").onclick = closeModal;
   $("newProjectBtn").onclick = openProjectModal;
-  $("createEngineerBtn").onclick = createEngineer;
-  $("engSearch").oninput = renderEngineers;
+  $("newUserBtn").onclick = openCreateUserModal;
+  $("usersRefresh").onclick = () => loadAdminUsers();
+  $("userSearch").oninput = renderAdminUsers;
   $("myRefresh").onclick = () => refreshProjects().catch(err => toast(err.message, "bad"));
   $("smtpSave").onclick = () => saveSmtp(false);
   $("smtpSaveTest").onclick = () => saveSmtp(true);

@@ -81,8 +81,9 @@ pre-rellenados con `HARNESS_URL`, `HARNESS_SESSION_ID`, `HARNESS_SESSION_KEY` y
 - **Login** por correo/contraseña y pestaña alternativa para `X-Harness-Admin-Key`.
 - **ADMIN**
   - Proyectos: alta con inicialización Git + indexación automática.
-  - Ingenieros y Accesos: invitación por correo, selección de proyectos y skills,
-    revocación inmediata.
+  - Usuarios y Accesos: alta de usuario sin proyecto, asignación explícita de
+    proyectos/skills, revocación inmediata y reseteo de contraseña. Ver
+    [`STAGE7-USERS-UX.md`](./STAGE7-USERS-UX.md).
   - Sala de Control: filtro global o por proyecto, grafo SVG en vivo, barras de
     contexto, enlaces, inyección de skills/reglas, purge, kill switch,
     Dual Plan + Dispatch y consola de eventos.

@@ -329,8 +329,9 @@ async def main():
     print("war-room:", page.status, page.headers.get("content-type"), "bytes:", len(body))
     assert page.status == 200 and "text/html" in (page.headers.get("content-type") or "")
     st, topo = http("GET", "/api/v1/war-room/topology", admin=True)
-    print("topology:", st, "nodes:", len(topo["nodes"]), "links:", len(topo["links"]), "tasks:", len(topo["tasks"]), "locks:", len(topo["locks"]), "events:", len(topo["events"]))
-    assert st == 200 and len(topo["nodes"]) == 3 and len(topo["links"]) >= 1 and len(topo["events"]) >= 1
+    test_nodes = [n for n in topo["nodes"] if str(n.get("engineer_username", "")).startswith("e2e-stage5-")]
+    print("topology:", st, "nodes:", len(topo["nodes"]), "test_nodes:", len(test_nodes), "links:", len(topo["links"]), "tasks:", len(topo["tasks"]), "locks:", len(topo["locks"]), "events:", len(topo["events"]))
+    assert st == 200 and len(test_nodes) == 3 and len(topo["links"]) >= 1 and len(topo["events"]) >= 1
 
     print("\n--- 10. Cleanup ---")
     st, failed = http("POST", f"/api/v1/tasks/{task_index['task_id']}/fail-checkpoint", {

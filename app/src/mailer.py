@@ -235,3 +235,38 @@ def render_admin_password_reset(portal_url: str, recipient: str, temporary_passw
       <p style="margin:18px 0 0;"><a href="{html.escape(portal_url)}" style="color:#0284c7;">{html.escape(portal_url)}</a></p>
     """
     return _layout("Contrasena restablecida", body)
+
+
+def render_user_welcome(
+    portal_url: str,
+    recipient: str,
+    temporary_password: Optional[str] = None,
+    invite_token: Optional[str] = None,
+) -> str:
+    credential_block = ""
+    if temporary_password:
+        credential_block += (
+            '<div style="margin:14px 0;padding:12px 14px;border:1px solid #bae6fd;'
+            'border-radius:10px;background:#f0f9ff;">'
+            '<div style="font-size:12px;color:#0369a1;font-weight:700;">Contrasena inicial</div>'
+            f'<div style="font-family:monospace;font-size:16px;color:#0c4a6e;">{html.escape(temporary_password)}</div>'
+            '<div style="font-size:12px;color:#475569;margin-top:4px;">Cambiala en tu primer acceso.</div>'
+            '</div>'
+        )
+    if invite_token:
+        credential_block += (
+            '<div style="margin:14px 0;padding:12px 14px;border:1px solid #ddd6fe;'
+            'border-radius:10px;background:#f5f3ff;">'
+            '<div style="font-size:12px;color:#6d28d9;font-weight:700;">Token de invitacion</div>'
+            f'<div style="font-family:monospace;font-size:13px;color:#4c1d95;word-break:break-all;">{html.escape(invite_token)}</div>'
+            '<div style="font-size:12px;color:#475569;margin-top:4px;">Usalo en el registro del portal.</div>'
+            '</div>'
+        )
+    body = f"""
+      <p style="margin:0 0 12px;">Hola,</p>
+      <p style="margin:0 0 12px;">El administrador creo una cuenta de Harness Control Plane para <b>{html.escape(recipient)}</b>.</p>
+      {credential_block}
+      <p style="margin:0 0 12px;">Tu cuenta aun no tiene proyectos asignados. Cuando el administrador te asigne uno, recibiras otro correo con el detalle.</p>
+      <p style="margin:18px 0 0;"><a href="{html.escape(portal_url)}" style="color:#0284c7;">{html.escape(portal_url)}</a></p>
+    """
+    return _layout("Tu cuenta fue creada", body)

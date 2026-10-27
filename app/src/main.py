@@ -30,6 +30,7 @@ from src.mailer import (
     render_admin_password_reset,
     render_password_changed,
     render_project_invite,
+    render_user_welcome,
     send_transactional_email,
 )
 from src.git_guardian import (
@@ -2590,6 +2591,149 @@ async def admin_reset_user_password(
         "status": "PASSWORD_RESET",
         "user_id": user["id"],
         "email": user["email"],
+        "generated": generated,
+        "email_sent": email_sent,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Etapa 7 UX - alta de usuarios independiente de proyectos y asignacion posterior
+# ---------------------------------------------------------------------------
+class AdminUserCreateRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=255)
+    full_name: str = Field(..., min_length=2, max_length=150)
+    password: Optional[str] = Field(default=None, min_length=8, max_length=128)
+    invite_token: Optional[str] = Field(default=None, max_length=128)
+
+
+@app.get("/api/v1/admin/users")
+def list_admin_users(
+    search: Optional[str] = Query(default=None, max_length=200),
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    where = ""
+    params: Dict[str, Any] = {}
+    if search and search.strip():
+        where = "WHERE u.email ILIKE :like OR u.full_name ILIKE :like"
+        params["like"] = f"%{search.strip()}%"
+    with engine.connect() as conn:
+        users = conn.execute(
+            sa.text(f"""
+                SELECT u.id::text, u.email, u.full_name, u.role, u.status, u.created_at
+                FROM harness_users u
+                {where}
+                ORDER BY u.email
+            """),
+            params
+        ).mappings().all()
+        memberships = conn.execute(
+            sa.text("""
+                SELECT m.user_id::text, m.project_id::text, p.project_slug,
+                       p.display_name, m.status, m.allowed_skills
+                FROM project_memberships m
+                JOIN harness_projects p ON p.id = m.project_id
+                ORDER BY p.project_slug
+            """)
+        ).mappings().all()
+        sessions = conn.execute(
+            sa.text("""
+                SELECT user_id::text, count(*) AS active_sessions
+                FROM agent_sessions
+                WHERE user_id IS NOT NULL AND status IN ('ONLINE', 'BUSY')
+                GROUP BY user_id
+            """)
+        ).mappings().all()
+
+    memberships_by_user: Dict[str, List[Dict[str, Any]]] = {}
+    for membership in memberships:
+        memberships_by_user.setdefault(membership["user_id"], []).append(dict(membership))
+    sessions_by_user = {row["user_id"]: row["active_sessions"] for row in sessions}
+
+    result = []
+    for user in users:
+        item = dict(user)
+        item["memberships"] = memberships_by_user.get(user["id"], [])
+        item["active_sessions"] = sessions_by_user.get(user["id"], 0)
+        result.append(item)
+    return {"users": result}
+
+
+@app.post("/api/v1/admin/users")
+async def create_admin_user(
+    payload: AdminUserCreateRequest,
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    email = payload.email.strip().lower()
+    if not _valid_email(email):
+        raise HTTPException(status_code=400, detail="Invalid email")
+    if payload.password and payload.invite_token:
+        raise HTTPException(status_code=400, detail="Provide password or invite_token, not both")
+
+    with engine.connect() as conn:
+        existing = conn.execute(
+            sa.text("SELECT id::text FROM harness_users WHERE email = :email"),
+            {"email": email}
+        ).fetchone()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail="User already exists; assign projects from Usuarios y Accesos",
+        )
+
+    generated = False
+    invite_token = payload.invite_token
+    temporary_password = payload.password
+    if payload.password:
+        policy_error = _password_policy_error(payload.password)
+        if policy_error:
+            raise HTTPException(status_code=400, detail=policy_error)
+        password_hash = hash_password(payload.password)
+        status = "ACTIVE"
+    elif payload.invite_token:
+        password_hash = hash_password(secrets.token_urlsafe(32))
+        status = "INVITED"
+    else:
+        temporary_password = _generate_temporary_password()
+        generated = True
+        password_hash = hash_password(temporary_password)
+        status = "ACTIVE"
+
+    user_id = str(uuid.uuid4())
+    with engine.begin() as conn:
+        user = conn.execute(
+            sa.text("""
+                INSERT INTO harness_users
+                    (id, email, full_name, password_hash, role, status, invite_token, default_skills)
+                VALUES
+                    (CAST(:id AS UUID), :email, :name, :ph, 'ENGINEER', :status, :invite,
+                     CAST('[]' AS JSONB))
+                RETURNING id::text, email, full_name, role, status, created_at
+            """),
+            {
+                "id": user_id,
+                "email": email,
+                "name": payload.full_name.strip(),
+                "ph": password_hash,
+                "status": status,
+                "invite": invite_token,
+            }
+        ).mappings().fetchone()
+
+    email_sent = await asyncio.to_thread(
+        send_transactional_email,
+        engine,
+        email,
+        "Tu cuenta Harness fue creada - Harness Control Plane",
+        render_user_welcome(
+            f"{HARNESS_PUBLIC_URL}/portal",
+            email,
+            temporary_password=None if invite_token else temporary_password,
+            invite_token=invite_token,
+        ),
+        "user_welcome",
+    )
+    return {
+        "user": dict(user),
         "generated": generated,
         "email_sent": email_sent,
     }

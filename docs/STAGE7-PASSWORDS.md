@@ -89,8 +89,9 @@ Solo Admin.
 
 - Botón **Mi clave** en la barra superior para cualquier usuario con JWT de
   portal: contraseña actual, nueva y confirmación.
-- En **Ingenieros y Accesos**, cada membresía tiene **Reset password**:
-  contraseña manual o generación aleatoria, con resultado de envío SMTP.
+- En **Usuarios y Accesos**, cada usuario tiene **Reset password** y
+  **Asignar proyecto**: contraseña manual o generación aleatoria, con resultado
+  de envío SMTP.
 - La auditoría de correos muestra `password_changed` y
   `admin_password_reset`.
 

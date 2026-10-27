@@ -88,9 +88,9 @@ Regresiones: Stage 1, 3, 4, 5 y 6 siguen pasando con el esquema nuevo.
 ## Estado final
 
 ```text
-users 2 | projects 1 | memberships 2
-sessions 0 | tasks 0 | plans 0
-files 7
+users 2 admins + cuentas creadas por el Admin | projects 1
+memberships 2 + membresías aprobadas
+tasks 0 | plans 0 | files 7
 alembic 0008 (head)
 ```
 
