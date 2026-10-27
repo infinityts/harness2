@@ -420,6 +420,7 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
             "plan_id": task["plan_id"],
             "project_id": task["project_id"],
             "title": task["title"],
+            "required_skills": task["required_skills"] or [],
             "git_branch": task["git_branch"],
             "allowed_files": allowed_files,
             "repo_name": repo_name,

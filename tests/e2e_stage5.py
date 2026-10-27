@@ -135,7 +135,7 @@ async def main():
     version = db_rows("SELECT version_num FROM alembic_version")[0]["version_num"]
     tables = db_rows("SELECT to_regclass('public.agent_links') AS links, to_regclass('public.war_room_events') AS events")[0]
     print("alembic:", version, "tables:", dict(tables))
-    assert version in ("0003", "0004", "0005", "0006", "0007", "0008") and tables["links"] and tables["events"]
+    assert version in ("0003", "0004", "0005", "0006", "0007", "0008", "0009") and tables["links"] and tables["events"]
 
     print("\n--- 2. Tres agentes + War Room WS ---")
     s1 = register("e2e-stage5-opencode", "opencode", ["python"])

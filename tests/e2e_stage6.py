@@ -154,7 +154,7 @@ async def main():
         WHERE table_name='agent_sessions' AND column_name='system_contract_rules'
     """)
     print("alembic:", version, "column:", [x["column_name"] for x in col])
-    assert version in ("0004", "0005", "0006", "0007", "0008") and col
+    assert version in ("0004", "0005", "0006", "0007", "0008", "0009") and col
 
     s = register("e2e-stage6-bridge", "opencode", ["python"])
     ws = await websockets.connect(f"{WS}/ws/agent/{s['session_id']}", additional_headers={"Authorization": f"Bearer {s['session_key']}"})
@@ -218,7 +218,8 @@ async def main():
         tools = mcp_read(proc)
         names = [t["name"] for t in tools["result"]["tools"]]
         print("tools:", names)
-        assert len(names) == 6 and "harness_submit_task_changes" in names
+        assert len(names) == 7 and "harness_submit_task_changes" in names
+        assert "harness_get_skill_manual" in names
 
         st, plan = http("POST", "/api/v1/plans/propose", {
             "requested_by": "e2e-stage6",
@@ -241,8 +242,10 @@ async def main():
         active, is_err = mcp_call(proc, 3, "harness_get_active_contract_and_task", {})
         print("get_active:", is_err, {k: active.get(k) for k in ("session_id", "status", "system_contract_rules")})
         print("task:", {k: (active.get("task") or {}).get(k) for k in ("id", "status", "allowed_files", "git_branch")})
+        print("active skill manuals:", list((active.get("active_task_skill_manuals") or {}).keys()))
         assert not is_err
         assert active["system_contract_rules"] == ["NEVER_TOUCH_ENV", "STRICT_TYPING"]
+        assert "python" in (active.get("active_task_skill_manuals") or {})
         assert active["task"] and active["task"]["id"] == task["task_id"]
         assert active["task"]["allowed_files"] == ["src/main.py"]
 
@@ -294,6 +297,12 @@ async def main():
         })
         print("relay bridge:", is_err, relayed)
         assert not is_err and "delivered" in relayed
+
+        manual, is_err = mcp_call(proc, 8, "harness_get_skill_manual", {"skill_slug": "python"})
+        print("skill manual:", is_err, manual.get("slug"), manual.get("compiled_tokens"))
+        assert not is_err and manual.get("slug") == "python"
+        assert "Mandatory Steps" in (manual.get("compiled_skill_md") or "")
+        assert "NEVER:" in (manual.get("compiled_skill_md") or "")
     finally:
         proc.terminate()
         try:

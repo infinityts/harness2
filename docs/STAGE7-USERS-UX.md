@@ -46,9 +46,11 @@ No hay cambios de esquema: se reutilizan `harness_users`,
   - acciones **Asignar proyecto**, **Reset password** y **Revocar** por
     membresía.
 - Modal **Crear Usuario** sin pedir proyecto.
-- Modal **Asignar proyecto** con selector de proyecto y skills.
+- Modal **Asignar proyecto** con buscador de proyectos y selector de skills del
+  catálogo (no texto libre).
 - Después de crear el usuario, la tarjeta queda visible con “Sin proyectos
   asignados” y el botón **Asignar proyecto**.
+- La pestaña **Proyectos** también tiene filtro por nombre/slug.
 
 ## Pruebas
 

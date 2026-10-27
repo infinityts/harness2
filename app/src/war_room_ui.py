@@ -312,7 +312,37 @@ WAR_ROOM_HTML = r"""<!doctype html>
             <div class="spacer"></div>
             <button id="newProjectBtn" class="btn primary" type="button">+ Crear Nuevo Proyecto</button>
           </div>
+          <div class="row"><input id="projectSearch" class="grow" placeholder="Filtrar proyectos por nombre o slug"></div>
           <div id="projectsGrid" class="project-grid"></div>
+        </section>
+
+        <section id="viewSkills" class="view hidden">
+          <div class="view-head">
+            <div><h1>Skill Studio</h1><p>Habilidades con objetivo, pasos obligatorios, prohibiciones y criterio de éxito. El manual se carga solo cuando hace falta.</p></div>
+            <div class="spacer"></div>
+            <button id="newSkillBtn" class="btn primary hidden" type="button">+ Nueva Skill</button>
+          </div>
+          <div class="card stack">
+            <div class="row">
+              <input id="skillSearch" class="grow" placeholder="Buscar por nombre, slug o cuándo usarla">
+              <select id="skillCategoryFilter" style="max-width:230px">
+                <option value="all">Todas las áreas</option>
+                <option value="backend">Backend / APIs</option>
+                <option value="frontend">Frontend / UI</option>
+                <option value="database">Base de datos</option>
+                <option value="documents">Lectura de documentos</option>
+                <option value="writing">Redacción / Documentación</option>
+                <option value="qa">QA / Testing</option>
+                <option value="devops">DevOps / Infraestructura</option>
+                <option value="security">Seguridad</option>
+                <option value="general">General</option>
+              </select>
+              <button id="skillsRefresh" class="btn sm" type="button">Refrescar</button>
+              <span id="skillsCount" class="muted" style="font-size:12px"></span>
+            </div>
+            <div class="login-note">Revelación progresiva: el agente recibe solo el catálogo. El manual completo se inyecta para la tarea activa o se consulta con <span class="mono">harness_get_skill_manual</span>.</div>
+            <div id="skillsGrid" class="project-grid"></div>
+          </div>
         </section>
 
         <section id="viewEngineers" class="view hidden">
@@ -494,10 +524,14 @@ const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const STATUS_COLORS = { ONLINE:"#34d399", BUSY:"#fbbf24", OFFLINE:"#8fa3c4", REVOKED:"#f87171" };
 const TOOL_LABELS = { opencode:"OpenCode", claudecode:"Claude Code", cursor:"Cursor", hermes:"Hermes", pi:"Pi", custom:"Custom" };
+const SKILL_CATEGORY_LABELS = { backend:"Backend / APIs", frontend:"Frontend / UI", database:"Base de datos", documents:"Documentos", writing:"Redacción", qa:"QA / Testing", devops:"DevOps", security:"Seguridad", general:"General" };
 const state = {
   token: null, adminKey: null, user: null, role: null,
   projects: [], topology: null, activeView: "projects",
-  adminUsers: [], projectFilter: "all", selectedSession: null, ws: null,
+  adminUsers: [], skills: [], skillViewer: null, skillFilter: "",
+  editingSkillSlug: null, skillPreviewTimer: null,
+  assignProjectId: null, assignUserId: null, assignSelectedSkills: new Set(),
+  projectFilter: "all", selectedSession: null, ws: null,
   sessionsByProject: {}, bundles: {}, consoleLines: 0,
 };
 let refreshTimer = null;
@@ -553,12 +587,16 @@ function navItems() {
   if (state.role === "ADMIN") {
     return [
       { id:"projects", icon:"▦", label:"Proyectos", bottom:"Proyectos" },
+      { id:"skills", icon:"✦", label:"Skill Studio", bottom:"Skills" },
       { id:"engineers", icon:"☺", label:"Usuarios y Accesos", bottom:"Usuarios" },
       { id:"warroom", icon:"◎", label:"Sala de Control", bottom:"War Room" },
       { id:"smtp", icon:"✉", label:"SMTP y Correos", bottom:"SMTP" },
     ];
   }
-  return [{ id:"myprojects", icon:"▤", label:"Mis Proyectos", bottom:"Proyectos" }];
+  return [
+    { id:"myprojects", icon:"▤", label:"Mis Proyectos", bottom:"Proyectos" },
+    { id:"skills", icon:"✦", label:"Skill Studio", bottom:"Skills" },
+  ];
 }
 
 function buildNav() {
@@ -572,13 +610,14 @@ function buildNav() {
 
 function setView(name) {
   state.activeView = name;
-  const views = { projects:"viewProjects", engineers:"viewEngineers", warroom:"viewWarRoom", smtp:"viewSmtp", myprojects:"viewMyProjects" };
+  const views = { projects:"viewProjects", skills:"viewSkills", engineers:"viewEngineers", warroom:"viewWarRoom", smtp:"viewSmtp", myprojects:"viewMyProjects" };
   Object.values(views).forEach(id => $(id).classList.add("hidden"));
   if (views[name]) $(views[name]).classList.remove("hidden");
   document.querySelectorAll("[data-view]").forEach(btn => btn.classList.toggle("active", btn.dataset.view === name));
-  $("topTitle").textContent = ({projects:"Proyectos", engineers:"Usuarios y Accesos", warroom:"Sala de Control", smtp:"SMTP y Correos", myprojects:"Mis Proyectos"})[name] || "Harness";
+  $("topTitle").textContent = ({projects:"Proyectos", skills:"Skill Studio", engineers:"Usuarios y Accesos", warroom:"Sala de Control", smtp:"SMTP y Correos", myprojects:"Mis Proyectos"})[name] || "Harness";
   closeDrawer();
   if (name === "warroom") { if (state.role === "ADMIN") { ensureWarRoom(); } }
+  if (name === "skills") loadSkills();
   if (name === "engineers") loadAdminUsers();
   if (name === "projects") renderProjects();
   if (name === "smtp") { loadSmtpConfig(); loadEmailLogs(); }
@@ -709,11 +748,17 @@ function sessionPill(status) {
 function renderProjects() {
   const grid = $("projectsGrid");
   if (!grid) return;
-  if (!state.projects.length) {
-    grid.innerHTML = '<div class="card"><div class="muted">Aún no hay proyectos. Crea el primero para inicializar git, el README base y el índice AST.</div></div>';
+  const q = ($("projectSearch") ? $("projectSearch").value : "").toLowerCase();
+  const projects = state.projects.filter(p =>
+    !q || p.display_name.toLowerCase().includes(q) || p.project_slug.toLowerCase().includes(q)
+  );
+  if (!projects.length) {
+    grid.innerHTML = state.projects.length
+      ? '<div class="card"><div class="muted">Ningún proyecto coincide con el filtro.</div></div>'
+      : '<div class="card"><div class="muted">Aún no hay proyectos. Crea el primero para inicializar git, el README base y el índice AST.</div></div>';
     return;
   }
-  grid.innerHTML = state.projects.map(p => {
+  grid.innerHTML = projects.map(p => {
     const members = p.members || [];
     const sessions = p.active_sessions || [];
     return `<article class="card project-card">
@@ -782,12 +827,16 @@ function renderAdminUsers() {
       <div>${membershipRows}</div>
       <div class="row" style="margin-top:auto">
         <button class="btn sm primary" data-assign-user="${esc(u.id)}" data-assign-email="${esc(u.email)}" type="button">Asignar proyecto</button>
+        <button class="btn sm" data-caps-user="${esc(u.id)}" data-caps-email="${esc(u.email)}" type="button">Permisos skills</button>
         <button class="btn sm" data-reset-user="${esc(u.id)}" data-reset-email="${esc(u.email)}" type="button">Reset password</button>
       </div>
     </article>`;
   }).join("");
   box.querySelectorAll("[data-assign-user]").forEach(btn => {
     btn.onclick = () => openAssignProjectModal(btn.dataset.assignUser, btn.dataset.assignEmail);
+  });
+  box.querySelectorAll("[data-caps-user]").forEach(btn => {
+    btn.onclick = () => openUserCapabilitiesModal(btn.dataset.capsUser, btn.dataset.capsEmail);
   });
   box.querySelectorAll("[data-reset-user]").forEach(btn => {
     btn.onclick = () => openAdminResetModal(btn.dataset.resetUser, btn.dataset.resetEmail);
@@ -859,35 +908,105 @@ async function submitCreateUser() {
   }
 }
 
-function openAssignProjectModal(userId, email) {
+async function openAssignProjectModal(userId, email) {
   if (!state.projects.length) {
     toast("Primero crea un proyecto en la pestaña Proyectos", "bad");
     return;
   }
+  if (!state.skills.length) {
+    try { await loadSkills(); } catch (err) { toast(err.message, "bad"); }
+  }
+  state.assignUserId = userId;
+  state.assignProjectId = null;
+  state.assignSelectedSkills = new Set();
   $("modalTitle").textContent = "Asignar proyecto";
   $("modalBody").innerHTML = `<div class="stack" style="gap:12px">
-    <div class="result-box">Usuario: <b>${esc(email)}</b><br>Selecciona el proyecto y las skills aprobadas para esta membresía.</div>
-    <div class="field"><label for="assignProject">Proyecto</label><select id="assignProject">${state.projects.map(p => `<option value="${esc(p.id)}">${esc(p.display_name)} · ${esc(p.project_slug)}</option>`).join("")}</select></div>
-    <div class="field"><label for="assignSkills">Skills permitidas</label><input id="assignSkills" placeholder="python, fastapi"></div>
-    <div class="login-note">Si el proyecto ya estaba asignado, se actualizarán sus skills. Se enviará un correo con el enlace al portal.</div>
+    <div class="result-box">Usuario: <b>${esc(email)}</b><br>Primero elige el proyecto. Después marca las skills que puede usar en ese proyecto.</div>
+    <div class="field">
+      <label for="assignProjectSearch">Buscar proyecto</label>
+      <input id="assignProjectSearch" placeholder="Filtra por nombre o slug..." autocomplete="off">
+      <div id="assignProjectList" class="stack" style="gap:6px;max-height:210px;overflow:auto;margin-top:4px"></div>
+    </div>
+    <div class="field">
+      <label for="assignSkillSearch">Skills permitidas en este proyecto</label>
+      <input id="assignSkillSearch" placeholder="Buscar skill por nombre, categoría o slug..." autocomplete="off">
+      <div id="assignSkillList" class="stack" style="gap:6px;max-height:230px;overflow:auto;margin-top:4px"></div>
+    </div>
+    <div class="login-note">Solo lectura = skill oficial que no se puede modificar. El agente recibirá el manual únicamente cuando la tarea lo requiera.</div>
     <div id="assignMsg" class="result-box hidden"></div>
   </div>`;
   $("modalActions").innerHTML = `<button id="modalCancel" class="btn ghost" type="button">Cancelar</button><button id="assignSave" class="btn primary" type="button">Asignar proyecto</button>`;
   $("modal").classList.remove("hidden");
   $("modalCancel").onclick = closeModal;
   $("assignSave").onclick = () => submitAssignProject(userId);
-  $("assignProject").focus();
+  $("assignProjectSearch").oninput = renderAssignProjects;
+  $("assignSkillSearch").oninput = renderAssignSkills;
+  renderAssignProjects();
+  renderAssignSkills();
+  $("assignProjectSearch").focus();
+}
+
+function renderAssignProjects() {
+  const box = $("assignProjectList");
+  if (!box) return;
+  const q = ($("assignProjectSearch").value || "").toLowerCase();
+  const projects = state.projects.filter(p =>
+    !q || p.display_name.toLowerCase().includes(q) || p.project_slug.toLowerCase().includes(q)
+  );
+  box.innerHTML = projects.length ? projects.map(p => `<label class="check-row" style="cursor:pointer">
+    <input type="radio" name="assignProject" value="${esc(p.id)}" ${state.assignProjectId === p.id ? "checked" : ""}>
+    <div class="grow"><b>${esc(p.display_name)}</b><div class="muted mono" style="font-size:11px">${esc(p.project_slug)}</div></div>
+  </label>`).join("") : '<div class="muted" style="font-size:12px">Ningún proyecto coincide con el filtro.</div>';
+  box.querySelectorAll('input[name="assignProject"]').forEach(radio => {
+    radio.onchange = () => {
+      state.assignProjectId = radio.value;
+      const user = (state.adminUsers || []).find(u => u.id === state.assignUserId);
+      const membership = ((user && user.memberships) || []).find(m => m.project_id === radio.value && m.status === "APPROVED");
+      state.assignSelectedSkills = new Set((membership && membership.allowed_skills) || []);
+      renderAssignSkills();
+    };
+  });
+}
+
+function renderAssignSkills() {
+  const box = $("assignSkillList");
+  if (!box) return;
+  if (!state.assignProjectId) {
+    box.innerHTML = '<div class="muted" style="font-size:12px">Selecciona un proyecto para ver y asignar skills.</div>';
+    return;
+  }
+  const q = ($("assignSkillSearch").value || "").toLowerCase();
+  const skills = (state.skills || []).filter(s => {
+    const hay = `${s.display_name} ${s.slug} ${s.category} ${s.trigger_description}`.toLowerCase();
+    return !q || hay.includes(q);
+  });
+  box.innerHTML = skills.length ? skills.map(s => `<label class="check-row" style="cursor:pointer">
+    <input type="checkbox" class="assign-skill-check" value="${esc(s.slug)}" ${state.assignSelectedSkills.has(s.slug) ? "checked" : ""}>
+    <div class="grow">
+      <div class="row" style="gap:6px"><b>${esc(s.display_name)}</b><span class="pill">${esc(SKILL_CATEGORY_LABELS[s.category] || s.category)}</span>${s.is_official ? '<span class="pill info">Oficial · solo lectura</span>' : ""}</div>
+      <div class="muted" style="font-size:11px">${esc(s.trigger_description)}</div>
+    </div>
+  </label>`).join("") : '<div class="muted" style="font-size:12px">No hay skills en el catálogo. Crea una en Skill Studio.</div>';
+  box.querySelectorAll(".assign-skill-check").forEach(chk => {
+    chk.onchange = () => {
+      if (chk.checked) state.assignSelectedSkills.add(chk.value);
+      else state.assignSelectedSkills.delete(chk.value);
+    };
+  });
 }
 
 async function submitAssignProject(userId) {
-  const projectId = $("assignProject").value;
-  const skills = $("assignSkills").value.split(",").map(s => s.trim()).filter(Boolean);
+  if (!state.assignProjectId) {
+    toast("Selecciona un proyecto de la lista", "bad");
+    return;
+  }
+  const skills = Array.from(state.assignSelectedSkills);
   $("assignSave").disabled = true;
   try {
-    await api(`/api/v1/projects/${projectId}/members`, {
+    await api(`/api/v1/projects/${state.assignProjectId}/members`, {
       method:"POST", body:JSON.stringify({ user_id: userId, allowed_skills: skills }),
     });
-    toast("Proyecto asignado. Correo de acceso en cola.", "ok");
+    toast(`Proyecto asignado con ${skills.length} skill(s). Correo en cola.`, "ok");
     await loadAdminUsers();
     await refreshProjects();
     closeModal();
@@ -1593,6 +1712,300 @@ async function submitAdminReset(userId) {
   }
 }
 
+async function loadSkills() {
+  try {
+    const data = await api("/api/v1/skills");
+    state.skills = data.skills || [];
+    state.skillViewer = data.viewer_capabilities || {};
+    const canCreate = !!data.can_create || state.role === "ADMIN";
+    $("newSkillBtn").classList.toggle("hidden", !canCreate);
+    renderSkills();
+  } catch (err) {
+    toast(err.message, "bad");
+  }
+}
+
+function renderSkills() {
+  const grid = $("skillsGrid");
+  if (!grid) return;
+  const q = ($("skillSearch").value || "").toLowerCase();
+  const category = $("skillCategoryFilter").value;
+  const skills = (state.skills || []).filter(s => {
+    const hay = `${s.display_name} ${s.slug} ${s.trigger_description} ${s.category}`.toLowerCase();
+    return (category === "all" || s.category === category) && (!q || hay.includes(q));
+  });
+  $("skillsCount").textContent = `${skills.length} skill(s)`;
+  if (!skills.length) {
+    grid.innerHTML = '<div class="card"><div class="muted">No hay skills para este filtro. Crea una con “+ Nueva Skill” o revisa el área seleccionada.</div></div>';
+    return;
+  }
+  grid.innerHTML = skills.map(s => `<article class="card project-card">
+    <div class="row">
+      <div style="flex:1;min-width:0"><h2>${esc(s.display_name)}</h2><div class="muted mono" style="font-size:12px">${esc(s.slug)}</div></div>
+      ${s.is_official ? '<span class="pill info">OFICIAL</span>' : '<span class="pill">PRIVADA</span>'}
+      ${s.is_read_only ? '<span class="pill warn">SOLO LECTURA</span>' : ""}
+    </div>
+    <div class="meta"><span class="pill">${esc(SKILL_CATEGORY_LABELS[s.category] || s.category)}</span><span class="pill">${esc(s.compiled_tokens)} tokens</span><span class="pill">v${esc(s.version)}</span></div>
+    <div class="muted" style="font-size:12.5px">${esc(s.trigger_description)}</div>
+    <div class="row" style="margin-top:auto">
+      <button class="btn sm" data-view-skill="${esc(s.slug)}" type="button">Ver manual</button>
+      ${s.can_edit ? `<button class="btn sm" data-edit-skill="${esc(s.slug)}" type="button">Editar</button>` : ""}
+      ${s.can_clone ? `<button class="btn sm" data-clone-skill="${esc(s.slug)}" type="button">Clonar</button>` : ""}
+      ${s.can_grant ? `<button class="btn sm" data-grant-skill="${esc(s.slug)}" type="button">Permisos</button>` : ""}
+    </div>
+  </article>`).join("");
+  grid.querySelectorAll("[data-view-skill]").forEach(btn => { btn.onclick = () => openSkillManual(btn.dataset.viewSkill); });
+  grid.querySelectorAll("[data-edit-skill]").forEach(btn => { btn.onclick = () => openSkillEditor(btn.dataset.editSkill); });
+  grid.querySelectorAll("[data-clone-skill]").forEach(btn => { btn.onclick = () => cloneSkill(btn.dataset.cloneSkill); });
+  grid.querySelectorAll("[data-grant-skill]").forEach(btn => { btn.onclick = () => openSkillAclModal(btn.dataset.grantSkill); });
+}
+
+async function openSkillManual(slug) {
+  try {
+    const skill = await api(`/api/v1/skills/${slug}`);
+    $("modalTitle").textContent = `Manual · ${skill.display_name}`;
+    $("modalBody").innerHTML = `<div class="stack" style="gap:10px">
+      <div class="row"><span class="pill info">${esc(SKILL_CATEGORY_LABELS[skill.category] || skill.category)}</span>${skill.is_official ? '<span class="pill info">Oficial</span>' : ""}<span class="pill">${esc(skill.compiled_tokens)} tokens</span></div>
+      <div class="muted" style="font-size:12px">${esc(skill.trigger_description)}</div>
+      <pre class="result-box" style="white-space:pre-wrap;max-height:52dvh;overflow:auto">${esc(skill.compiled_skill_md)}</pre>
+    </div>`;
+    $("modalActions").innerHTML = `<button id="modalCancel" class="btn ghost" type="button">Cerrar</button><button id="copySkillBtn" class="btn primary" type="button">Copiar SKILL.md</button>`;
+    $("modal").classList.remove("hidden");
+    $("modalCancel").onclick = closeModal;
+    $("copySkillBtn").onclick = () => copyText(skill.compiled_skill_md, "SKILL.md");
+  } catch (err) { toast(err.message, "bad"); }
+}
+
+async function cloneSkill(slug) {
+  if (!confirm(`¿Clonar ${slug} como una skill privada editable?`)) return;
+  try {
+    const data = await api(`/api/v1/skills/${slug}/clone`, { method:"POST" });
+    toast(`Skill clonada: ${data.slug}`, "ok");
+    await loadSkills();
+  } catch (err) { toast(err.message, "bad"); }
+}
+
+function skillEditorFields() {
+  return {
+    display_name: $("skName").value.trim(),
+    slug: $("skSlug").value.trim() || null,
+    category: $("skCategory").value,
+    trigger_description: $("skTrigger").value.trim(),
+    objective: $("skObjective").value.trim(),
+    workflow_steps: $("skSteps").value.split(/\r?\n/).map(s => s.trim()).filter(Boolean),
+    guardrails_forbidden: $("skGuardrails").value.split(/\r?\n/).map(s => s.trim()).filter(Boolean),
+    output_criteria: $("skOutput").value.trim(),
+    is_official: $("skOfficial") ? $("skOfficial").checked : false,
+    visibility: $("skVisibility") ? $("skVisibility").value : "PRIVATE",
+    status: "PUBLISHED",
+  };
+}
+
+function showSkillMsg(text, ok) {
+  const box = $("skMsg");
+  box.classList.remove("hidden");
+  box.textContent = text;
+  box.style.borderColor = ok ? "rgba(52,211,153,.45)" : "rgba(248,113,113,.45)";
+}
+
+function scheduleSkillPreview() {
+  if (state.skillPreviewTimer) clearTimeout(state.skillPreviewTimer);
+  state.skillPreviewTimer = setTimeout(updateSkillPreview, 450);
+}
+
+async function updateSkillPreview() {
+  const preview = $("skPreview");
+  if (!preview) return;
+  const body = skillEditorFields();
+  try {
+    const data = await api("/api/v1/skills/preview", { method:"POST", body:JSON.stringify(body) });
+    preview.textContent = data.compiled_skill_md;
+    $("skTokens").textContent = `${data.compiled_tokens} tokens estimados`;
+  } catch (err) {
+    preview.textContent = "Completa los campos para ver la vista previa.\n\n" + err.message;
+    $("skTokens").textContent = "";
+  }
+}
+
+function renderCategoryOptions(selected) {
+  return Object.entries(SKILL_CATEGORY_LABELS).map(([value, label]) =>
+    `<option value="${value}" ${value === selected ? "selected" : ""}>${esc(label)}</option>`
+  ).join("");
+}
+
+async function openSkillEditor(slug) {
+  let skill = null;
+  if (slug) {
+    try { skill = await api(`/api/v1/skills/${slug}`); }
+    catch (err) { toast(err.message, "bad"); return; }
+  }
+  const isAdmin = state.role === "ADMIN";
+  state.editingSkillSlug = slug || null;
+  $("modalTitle").textContent = slug ? `Editar · ${skill.display_name}` : "Nueva Skill";
+  $("modalBody").innerHTML = `<div class="stack" style="gap:12px">
+    <div class="result-box">El servidor compila el estándar SKILL.md por ti. Tú solo describes la habilidad en lenguaje natural.</div>
+    <div class="form-grid">
+      <div class="field"><label for="skName">Nombre de la habilidad</label><input id="skName" value="${esc(skill ? skill.display_name : "")}" placeholder="Ej. Resumen de actas"></div>
+      <div class="field"><label for="skSlug">Slug (opcional)</label><input id="skSlug" value="${esc(skill ? skill.slug : "")}" ${slug ? "disabled" : ""} placeholder="resumen-actas"></div>
+      <div class="field"><label for="skCategory">Área</label><select id="skCategory">${renderCategoryOptions(skill ? skill.category : "general")}</select></div>
+      <div class="field"><label for="skTrigger">¿Cuándo debe usarla?</label><input id="skTrigger" value="${esc(skill ? skill.trigger_description : "")}" placeholder="Cuando la tarea requiera..."></div>
+    </div>
+    <div class="field"><label for="skObjective">Objetivo (una frase)</label><textarea id="skObjective" rows="2" placeholder="Qué logra esta habilidad">${esc(skill ? skill.objective : "")}</textarea></div>
+    <div class="field"><label for="skSteps">Pasos obligatorios (uno por línea, 3 a 5)</label><textarea id="skSteps" rows="5" placeholder="1. Lee el documento&#10;2. Extrae...">${esc(skill ? (skill.workflow_steps || []).join("\n") : "")}</textarea></div>
+    <div class="field"><label for="skGuardrails">Prohibiciones (una por línea)</label><textarea id="skGuardrails" rows="3" placeholder="No inventar fechas&#10;No omitir la fuente">${esc(skill ? (skill.guardrails_forbidden || []).join("\n") : "")}</textarea></div>
+    <div class="field"><label for="skOutput">¿Cómo entrega el resultado?</label><textarea id="skOutput" rows="2" placeholder="Tabla Markdown con campo, valor y fuente">${esc(skill ? skill.output_criteria : "")}</textarea></div>
+    ${isAdmin ? `<div class="row"><label class="check-row" style="flex:1"><input id="skOfficial" type="checkbox" ${skill && skill.is_official ? "checked" : ""}><span>Skill oficial (solo Admin edita)</span></label><select id="skVisibility" style="max-width:180px"><option value="PRIVATE" ${skill && skill.visibility === "PRIVATE" ? "selected" : ""}>Privada</option><option value="SHARED" ${skill && skill.visibility === "SHARED" ? "selected" : ""}>Compartida</option></select></div>` : ""}
+    <div class="card" style="background:#08111f">
+      <div class="row"><label class="muted" style="font-size:12px">Autocompletar desde una idea simple</label></div>
+      <div class="row"><input id="skIdea" class="grow" placeholder="Quiero que el agente revise facturas y saque el total sin inventar datos"><button id="skDraftBtn" class="btn sm" type="button">Generar borrador</button></div>
+    </div>
+    <div class="row"><span class="muted" style="font-size:12px">Vista previa del estándar</span><span id="skTokens" class="pill"></span></div>
+    <pre id="skPreview" class="result-box" style="white-space:pre-wrap;max-height:36dvh;overflow:auto"></pre>
+    <div id="skMsg" class="result-box hidden"></div>
+  </div>`;
+  $("modalActions").innerHTML = `<button id="modalCancel" class="btn ghost" type="button">Cancelar</button><button id="skPreviewBtn" class="btn" type="button">Actualizar vista previa</button><button id="skSaveBtn" class="btn primary" type="button">${slug ? "Guardar cambios" : "Guardar Skill"}</button>`;
+  $("modal").classList.remove("hidden");
+  $("modalCancel").onclick = closeModal;
+  $("skPreviewBtn").onclick = updateSkillPreview;
+  $("skSaveBtn").onclick = submitSkill;
+  $("skDraftBtn").onclick = draftSkillFromIdea;
+  ["skName", "skTrigger", "skObjective", "skSteps", "skGuardrails", "skOutput"].forEach(id => {
+    const el = $(id); if (el) el.oninput = scheduleSkillPreview;
+  });
+  updateSkillPreview();
+}
+
+async function draftSkillFromIdea() {
+  const raw = $("skIdea").value.trim();
+  if (raw.length < 10) { showSkillMsg("Escribe una idea un poco más descriptiva", false); return; }
+  $("skDraftBtn").disabled = true;
+  try {
+    const data = await api("/api/v1/skills/draft-from-idea", {
+      method:"POST", body:JSON.stringify({ raw_idea: raw, category: $("skCategory").value }),
+    });
+    $("skName").value = data.display_name;
+    if (!$("skSlug").disabled) $("skSlug").value = data.slug;
+    $("skCategory").value = data.category;
+    $("skTrigger").value = data.trigger_description;
+    $("skObjective").value = data.objective;
+    $("skSteps").value = (data.workflow_steps || []).join("\n");
+    $("skGuardrails").value = (data.guardrails_forbidden || []).join("\n");
+    $("skOutput").value = data.output_criteria;
+    $("skPreview").textContent = data.compiled_skill_md;
+    $("skTokens").textContent = `${data.compiled_tokens} tokens · ${data.provider}`;
+    showSkillMsg("Borrador listo. Revísalo y guarda.", true);
+  } catch (err) {
+    showSkillMsg("Error: " + err.message, false);
+  } finally {
+    $("skDraftBtn").disabled = false;
+  }
+}
+
+async function submitSkill() {
+  const body = skillEditorFields();
+  $("skSaveBtn").disabled = true;
+  try {
+    const data = state.editingSkillSlug
+      ? await api(`/api/v1/skills/${state.editingSkillSlug}`, { method:"PUT", body:JSON.stringify(body) })
+      : await api("/api/v1/skills", { method:"POST", body:JSON.stringify(body) });
+    toast(`Skill ${data.slug} guardada`, "ok");
+    await loadSkills();
+    closeModal();
+  } catch (err) {
+    showSkillMsg("Error: " + err.message, false);
+  } finally {
+    $("skSaveBtn").disabled = false;
+  }
+}
+
+async function openUserCapabilitiesModal(userId, email) {
+  const user = (state.adminUsers || []).find(u => u.id === userId);
+  const caps = (user && user.skill_capabilities) || {};
+  $("modalTitle").textContent = "Permisos de skills";
+  $("modalBody").innerHTML = `<div class="stack" style="gap:12px">
+    <div class="result-box">Usuario: <b>${esc(email)}</b>${user && user.role === "ADMIN" ? "<br>Los ADMIN tienen bypass total; estos flags aplican a ingenieros." : ""}</div>
+    <label class="check-row"><input id="capCreate" type="checkbox" ${caps.can_create_skills ? "checked" : ""}><span>Puede crear skills privadas</span></label>
+    <label class="check-row"><input id="capClone" type="checkbox" ${caps.can_clone_skills ? "checked" : ""}><span>Puede clonar skills oficiales o compartidas</span></label>
+    <label class="check-row"><input id="capEditOwn" type="checkbox" ${caps.can_edit_own_skills ? "checked" : ""}><span>Puede editar sus propias skills</span></label>
+    <label class="check-row"><input id="capGrant" type="checkbox" ${caps.can_grant_skills ? "checked" : ""}><span>Puede otorgar/permisos sobre sus skills</span></label>
+    <div class="login-note">Las skills oficiales siempre son de solo lectura para ingenieros; solo el Admin puede editarlas.</div>
+    <div id="capMsg" class="result-box hidden"></div>
+  </div>`;
+  $("modalActions").innerHTML = `<button id="modalCancel" class="btn ghost" type="button">Cancelar</button><button id="capSave" class="btn primary" type="button">Guardar permisos</button>`;
+  $("modal").classList.remove("hidden");
+  $("modalCancel").onclick = closeModal;
+  $("capSave").onclick = async () => {
+    $("capSave").disabled = true;
+    try {
+      await api(`/api/v1/admin/users/${userId}/skill-capabilities`, {
+        method:"PUT",
+        body:JSON.stringify({
+          can_create_skills: $("capCreate").checked,
+          can_clone_skills: $("capClone").checked,
+          can_edit_own_skills: $("capEditOwn").checked,
+          can_grant_skills: $("capGrant").checked,
+        }),
+      });
+      toast("Permisos de skills actualizados", "ok");
+      await loadAdminUsers();
+      closeModal();
+    } catch (err) {
+      const box = $("capMsg");
+      box.classList.remove("hidden");
+      box.textContent = "Error: " + err.message;
+      box.style.borderColor = "rgba(248,113,113,.45)";
+    } finally {
+      $("capSave").disabled = false;
+    }
+  };
+}
+
+async function openSkillAclModal(slug) {
+  try {
+    if (!state.adminUsers.length) await loadAdminUsers();
+    const [detail, perms] = await Promise.all([
+      api(`/api/v1/skills/${slug}`),
+      api(`/api/v1/skills/${slug}/permissions`),
+    ]);
+    const users = state.adminUsers || [];
+    const assigned = new Map((perms.permissions || []).map(p => [p.user_id, p]));
+    $("modalTitle").textContent = `Permisos · ${detail.display_name}`;
+    $("modalBody").innerHTML = `<div class="stack" style="gap:8px">
+      <div class="result-box">Marca quién puede usar, editar, clonar u otorgar esta skill. Solo el Admin o el dueño con permiso de otorgar puede administrar esto.</div>
+      <div id="aclList" class="stack" style="gap:6px;max-height:50dvh;overflow:auto">
+        ${users.map(u => {
+          const p = assigned.get(u.id) || {can_use:false, can_edit:false, can_clone:false, can_grant:false};
+          return `<div class="check-row" data-acl-user="${esc(u.id)}"><div class="grow"><b>${esc(u.email)}</b><div class="muted" style="font-size:11px">${esc(u.full_name || "")}</div></div><div class="row" style="gap:5px"><label class="muted" style="font-size:10px"><input type="checkbox" class="acl-use" ${p.can_use ? "checked" : ""}> usar</label><label class="muted" style="font-size:10px"><input type="checkbox" class="acl-edit" ${p.can_edit ? "checked" : ""}> editar</label><label class="muted" style="font-size:10px"><input type="checkbox" class="acl-clone" ${p.can_clone ? "checked" : ""}> clonar</label><label class="muted" style="font-size:10px"><input type="checkbox" class="acl-grant" ${p.can_grant ? "checked" : ""}> otorgar</label></div></div>`;
+        }).join("")}
+      </div>
+      <div id="aclMsg" class="result-box hidden"></div>
+    </div>`;
+    $("modalActions").innerHTML = `<button id="modalCancel" class="btn ghost" type="button">Cerrar</button><button id="aclSave" class="btn primary" type="button">Guardar permisos</button>`;
+    $("modal").classList.remove("hidden");
+    $("modalCancel").onclick = closeModal;
+    $("aclSave").onclick = async () => {
+      $("aclSave").disabled = true;
+      try {
+        for (const row of document.querySelectorAll("[data-acl-user]")) {
+          await api(`/api/v1/skills/${slug}/permissions`, {
+            method:"PUT",
+            body:JSON.stringify({
+              user_id: row.dataset.aclUser,
+              can_use: row.querySelector(".acl-use").checked,
+              can_edit: row.querySelector(".acl-edit").checked,
+              can_clone: row.querySelector(".acl-clone").checked,
+              can_grant: row.querySelector(".acl-grant").checked,
+            }),
+          });
+        }
+        toast("Permisos de la skill actualizados", "ok");
+        closeModal();
+      } catch (err) { toast(err.message, "bad"); }
+      finally { $("aclSave").disabled = false; }
+    };
+  } catch (err) { toast(err.message, "bad"); }
+}
+
 function bindStaticEvents() {
   $("loginForm").addEventListener("submit", doEmailLogin);
   $("loginTabEmail").onclick = () => setLoginTab("email");
@@ -1604,6 +2017,11 @@ function bindStaticEvents() {
   $("drawerBackdrop").onclick = closeDrawer;
   $("modalClose").onclick = closeModal;
   $("newProjectBtn").onclick = openProjectModal;
+  $("newSkillBtn").onclick = () => openSkillEditor(null);
+  $("skillsRefresh").onclick = () => loadSkills();
+  $("skillSearch").oninput = renderSkills;
+  $("skillCategoryFilter").onchange = renderSkills;
+  $("projectSearch").oninput = renderProjects;
   $("newUserBtn").onclick = openCreateUserModal;
   $("usersRefresh").onclick = () => loadAdminUsers();
   $("userSearch").oninput = renderAdminUsers;

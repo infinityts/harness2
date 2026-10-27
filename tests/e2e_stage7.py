@@ -117,7 +117,7 @@ async def main():
     tables = {r["tablename"] for r in db_rows("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")}
     required = {"harness_users", "harness_projects", "project_memberships", "agent_sessions", "feature_consensus_plans"}
     print("alembic_version:", version, "| tablas IAM:", sorted(required & tables))
-    assert version in ("0005", "0006", "0007", "0008"), f"head inesperado: {version}"
+    assert version in ("0005", "0006", "0007", "0008", "0009"), f"head inesperado: {version}"
     assert required.issubset(tables)
 
     st, admin_login = await api("POST", "/api/v1/auth/login", {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})

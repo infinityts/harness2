@@ -33,6 +33,14 @@ from src.mailer import (
     render_user_welcome,
     send_transactional_email,
 )
+from src.skill_compiler import (
+    SKILL_CATEGORIES,
+    compile_standard_skill_md,
+    draft_skill,
+    estimate_tokens,
+    slugify,
+    validate_skill_fields,
+)
 from src.git_guardian import (
     GitBarrierError,
     GitTaskPermissionError,
@@ -981,6 +989,11 @@ async def dispatch_tasks():
             failed.append({"task_id": item["task_id"], "error": str(exc)})
 
     dispatched = prepared
+    with engine.connect() as conn:
+        for item in dispatched:
+            item["active_task_skill_manuals"] = _skill_manuals(
+                conn, item.get("required_skills") or []
+            )
     for item in dispatched:
         ws = active_connections.get(item["assigned_to"]["session_id"])
         if ws:
@@ -993,6 +1006,8 @@ async def dispatch_tasks():
             {
                 "task_id": item["task_id"],
                 "title": item["title"],
+                "required_skills": item.get("required_skills") or [],
+                "active_task_skill_manuals": item.get("active_task_skill_manuals") or {},
                 "git_branch": item["git_branch"],
                 "allowed_files": item["allowed_files"],
                 "worktree": item["worktree"],
@@ -1037,8 +1052,13 @@ def list_tasks(
             """),
             params
         ).mappings().all()
+        tasks = []
+        for row in rows:
+            item = dict(row)
+            item["skill_manuals"] = _skill_manuals(conn, item.get("required_skills") or [])
+            tasks.append(item)
 
-    return {"tasks": [dict(r) for r in rows]}
+    return {"tasks": tasks}
 
 
 @app.post("/api/v1/tasks/{task_id}/fail-checkpoint")
@@ -1654,6 +1674,260 @@ def _generate_temporary_password(length: int = 16) -> str:
             return candidate
 
 
+def _skill_capabilities(conn, user_id: Optional[str]) -> Dict[str, bool]:
+    defaults = {
+        "can_create_skills": False,
+        "can_clone_skills": False,
+        "can_edit_own_skills": True,
+        "can_grant_skills": False,
+    }
+    if not user_id:
+        return defaults
+    row = conn.execute(
+        sa.text("""
+            SELECT can_create_skills, can_clone_skills, can_edit_own_skills, can_grant_skills
+            FROM user_skill_capabilities WHERE user_id = CAST(:uid AS UUID)
+        """),
+        {"uid": user_id}
+    ).mappings().fetchone()
+    return dict(row) if row else defaults
+
+
+def _skill_acl_row(conn, skill_id: str, user_id: Optional[str]):
+    if not user_id:
+        return None
+    return conn.execute(
+        sa.text("""
+            SELECT can_use, can_edit, can_clone, can_grant
+            FROM skill_permissions
+            WHERE skill_id = CAST(:sid AS UUID) AND user_id = CAST(:uid AS UUID)
+        """),
+        {"sid": skill_id, "uid": user_id}
+    ).mappings().fetchone()
+
+
+def _skill_flags(conn, skill, auth: Dict[str, Any]) -> Dict[str, bool]:
+    is_admin = auth.get("role_name") == "ADMIN"
+    uid = auth.get("user_id")
+    caps = _skill_capabilities(conn, uid)
+    acl = _skill_acl_row(conn, skill["id"], uid)
+    owner = bool(uid and skill.get("owner_user_id") == uid)
+    acl_edit = bool(acl and acl["can_edit"])
+    acl_clone = bool(acl and acl["can_clone"])
+    acl_grant = bool(acl and acl["can_grant"])
+    acl_use = bool(acl and acl["can_use"])
+    can_edit = is_admin or (
+        not skill["is_official"] and (
+            (owner and caps["can_edit_own_skills"]) or acl_edit
+        )
+    )
+    can_clone = is_admin or caps["can_clone_skills"] or acl_clone
+    can_grant = is_admin or (
+        not skill["is_official"] and (
+            (owner and caps["can_grant_skills"]) or acl_grant
+        )
+    )
+    assigned = False
+    if uid:
+        assigned = bool(conn.execute(
+            sa.text("""
+                SELECT 1 FROM membership_skills
+                WHERE skill_id = CAST(:sid AS UUID) AND user_id = CAST(:uid AS UUID)
+                LIMIT 1
+            """),
+            {"sid": skill["id"], "uid": uid}
+        ).fetchone())
+    can_use = bool(
+        is_admin or skill["is_official"] or skill["visibility"] == "SHARED"
+        or owner or acl_use or assigned
+    )
+    return {
+        "can_use": can_use,
+        "can_edit": can_edit,
+        "can_clone": can_clone,
+        "can_grant": can_grant,
+        "is_owner": owner,
+    }
+
+
+def _can_view_skill(conn, skill, auth: Dict[str, Any]) -> bool:
+    flags = _skill_flags(conn, skill, auth)
+    if flags["can_use"] or flags["can_edit"] or flags["can_clone"] or flags["can_grant"]:
+        return True
+    uid = auth.get("user_id")
+    if uid:
+        assigned = conn.execute(
+            sa.text("""
+                SELECT 1 FROM membership_skills
+                WHERE skill_id = CAST(:sid AS UUID) AND user_id = CAST(:uid AS UUID)
+                LIMIT 1
+            """),
+            {"sid": skill["id"], "uid": uid}
+        ).fetchone()
+        if assigned:
+            return True
+    return False
+
+
+def _skill_summary(conn, skill, auth: Dict[str, Any]) -> Dict[str, Any]:
+    flags = _skill_flags(conn, skill, auth)
+    return {
+        "id": skill["id"],
+        "slug": skill["slug"],
+        "display_name": skill["display_name"],
+        "category": skill["category"],
+        "trigger_description": skill["trigger_description"],
+        "is_official": skill["is_official"],
+        "status": skill["status"],
+        "visibility": skill["visibility"],
+        "owner_user_id": skill["owner_user_id"],
+        "version": skill["version"],
+        "compiled_tokens": skill["compiled_tokens"],
+        "updated_at": skill["updated_at"],
+        **flags,
+        "is_read_only": not flags["can_edit"],
+    }
+
+
+def _unique_skill_slug(conn, base: str) -> str:
+    base = slugify(base, 90)
+    candidate = base
+    suffix = 2
+    while conn.execute(
+        sa.text("SELECT 1 FROM harness_skills WHERE slug = :slug"),
+        {"slug": candidate}
+    ).fetchone():
+        candidate = f"{base[:85]}-{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _ensure_skill_exists(conn, slug: str, user_id: Optional[str]) -> str:
+    slug = slugify(slug, 100)
+    existing = conn.execute(
+        sa.text("SELECT id::text FROM harness_skills WHERE slug = :slug"),
+        {"slug": slug}
+    ).fetchone()
+    if existing:
+        return existing[0]
+    compiled = compile_standard_skill_md(
+        slug,
+        slug.replace("-", " ").title(),
+        "general",
+        f"Usa esta habilidad cuando la tarea requiera {slug.replace('-', ' ')}.",
+        f"Ejecutar de forma verificable la habilidad {slug}.",
+        [
+            "Aclara el objetivo y el resultado esperado.",
+            "Ejecuta el trabajo siguiendo las convenciones del proyecto.",
+            "Verifica el resultado antes de declararlo completado.",
+        ],
+        ["No inventes informacion.", "No declares completado algo que no verificaste."],
+        "Entrega el resultado y la evidencia de verificacion.",
+    )
+    skill_id = str(uuid.uuid4())
+    conn.execute(
+        sa.text("""
+            INSERT INTO harness_skills
+                (id, slug, display_name, category, trigger_description, objective,
+                 workflow_steps, guardrails_forbidden, output_criteria, compiled_skill_md,
+                 created_by_user_id, owner_user_id, is_official, status, visibility,
+                 version, compiled_tokens)
+            VALUES
+                (CAST(:id AS UUID), :slug, :name, 'general', :trigger, :objective,
+                 CAST(:steps AS JSONB), CAST(:guardrails AS JSONB), :output, :compiled,
+                 CAST(:created_by AS UUID), NULL, false, 'PUBLISHED', 'PRIVATE', 1, :tokens)
+        """),
+        {
+            "id": skill_id, "slug": slug, "name": slug.replace("-", " ").title(),
+            "trigger": f"Usa esta habilidad cuando la tarea requiera {slug.replace('-', ' ')}.",
+            "objective": f"Ejecutar de forma verificable la habilidad {slug}.",
+            "steps": json.dumps([
+                "Aclara el objetivo y el resultado esperado.",
+                "Ejecuta el trabajo siguiendo las convenciones del proyecto.",
+                "Verifica el resultado antes de declararlo completado.",
+            ]),
+            "guardrails": json.dumps(["No inventes informacion.", "No declares completado algo que no verificaste."]),
+            "output": "Entrega el resultado y la evidencia de verificacion.",
+            "compiled": compiled,
+            "created_by": user_id,
+            "tokens": estimate_tokens(compiled),
+        }
+    )
+    return skill_id
+
+
+def _sync_membership_skills(
+    conn,
+    project_id: str,
+    user_id: str,
+    skill_slugs: List[str],
+    assigned_by: Optional[str],
+    replace: bool = True,
+) -> List[str]:
+    normalized = []
+    for raw in skill_slugs or []:
+        slug = slugify(str(raw), 100)
+        if slug and slug not in normalized:
+            normalized.append(slug)
+    if replace:
+        conn.execute(
+            sa.text("""
+                DELETE FROM membership_skills
+                WHERE project_id = CAST(:pid AS UUID) AND user_id = CAST(:uid AS UUID)
+            """),
+            {"pid": project_id, "uid": user_id}
+        )
+    for slug in normalized:
+        skill_id = _ensure_skill_exists(conn, slug, assigned_by)
+        conn.execute(
+            sa.text("""
+                INSERT INTO project_skills (id, project_id, skill_id, assigned_by_user_id)
+                VALUES (CAST(:id AS UUID), CAST(:pid AS UUID), CAST(:sid AS UUID),
+                        CAST(:by AS UUID))
+                ON CONFLICT (project_id, skill_id) DO NOTHING
+            """),
+            {"id": str(uuid.uuid4()), "pid": project_id, "sid": skill_id, "by": assigned_by}
+        )
+        conn.execute(
+            sa.text("""
+                INSERT INTO membership_skills (id, project_id, user_id, skill_id, assigned_by_user_id)
+                VALUES (CAST(:id AS UUID), CAST(:pid AS UUID), CAST(:uid AS UUID),
+                        CAST(:sid AS UUID), CAST(:by AS UUID))
+                ON CONFLICT (project_id, user_id, skill_id) DO NOTHING
+            """),
+            {
+                "id": str(uuid.uuid4()), "pid": project_id, "uid": user_id,
+                "sid": skill_id, "by": assigned_by,
+            }
+        )
+    conn.execute(
+        sa.text("""
+            UPDATE project_memberships
+            SET allowed_skills = CAST(:skills AS JSONB)
+            WHERE project_id = CAST(:pid AS UUID) AND user_id = CAST(:uid AS UUID)
+        """),
+        {"skills": json.dumps(normalized), "pid": project_id, "uid": user_id}
+    )
+    return normalized
+
+
+def _skill_manuals(conn, slugs: List[str]) -> Dict[str, Dict[str, Any]]:
+    unique = list(dict.fromkeys(str(s) for s in (slugs or []) if str(s).strip()))
+    if not unique:
+        return {}
+    params = {f"s{idx}": slug for idx, slug in enumerate(unique)}
+    placeholders = ", ".join(f":s{idx}" for idx in range(len(unique)))
+    rows = conn.execute(
+        sa.text(f"""
+            SELECT slug, display_name, category, compiled_skill_md, compiled_tokens
+            FROM harness_skills
+            WHERE slug IN ({placeholders}) AND status = 'PUBLISHED'
+        """),
+        params
+    ).mappings().all()
+    return {row["slug"]: dict(row) for row in rows}
+
+
 def _public_user(user) -> Dict[str, Any]:
     item = dict(user)
     item.pop("password_hash", None)
@@ -2075,6 +2349,10 @@ def add_project_member(project_id: str, payload: ProjectMemberRequest, backgroun
                 "approved_by": auth.get("user_id"), "skills": json.dumps(payload.allowed_skills),
             }
         ).mappings().fetchone()
+        _sync_membership_skills(
+            conn, project_id, user["id"], payload.allowed_skills,
+            auth.get("user_id"), replace=True,
+        )
         user = conn.execute(
             sa.text("""
                 SELECT id::text, email, full_name, role, status, default_skills
@@ -2184,7 +2462,20 @@ async def create_portal_session(payload: PortalSessionRequest, auth: Dict[str, A
     if not membership or membership["status"] != "APPROVED":
         raise HTTPException(status_code=403, detail="Project Access Not Approved by Administrator")
 
-    skills = membership["allowed_skills"] or auth["user"].get("default_skills") or []
+    with engine.connect() as conn:
+        skill_rows = conn.execute(
+            sa.text("""
+                SELECT s.slug
+                FROM membership_skills ms
+                JOIN harness_skills s ON s.id = ms.skill_id
+                WHERE ms.user_id = CAST(:uid AS UUID)
+                  AND ms.project_id = CAST(:pid AS UUID)
+                  AND s.status = 'PUBLISHED'
+                ORDER BY s.slug
+            """),
+            {"uid": uid, "pid": payload.project_id}
+        ).fetchall()
+    skills = [row[0] for row in skill_rows] or membership["allowed_skills"] or auth["user"].get("default_skills") or []
     old_sessions = []
     with engine.begin() as conn:
         rows = conn.execute(
@@ -2643,17 +2934,40 @@ def list_admin_users(
                 GROUP BY user_id
             """)
         ).mappings().all()
+        capabilities = conn.execute(
+            sa.text("""
+                SELECT user_id::text, can_create_skills, can_clone_skills,
+                       can_edit_own_skills, can_grant_skills
+                FROM user_skill_capabilities
+            """)
+        ).mappings().all()
 
     memberships_by_user: Dict[str, List[Dict[str, Any]]] = {}
     for membership in memberships:
         memberships_by_user.setdefault(membership["user_id"], []).append(dict(membership))
     sessions_by_user = {row["user_id"]: row["active_sessions"] for row in sessions}
+    capabilities_by_user = {
+        row["user_id"]: {
+            "can_create_skills": row["can_create_skills"],
+            "can_clone_skills": row["can_clone_skills"],
+            "can_edit_own_skills": row["can_edit_own_skills"],
+            "can_grant_skills": row["can_grant_skills"],
+        }
+        for row in capabilities
+    }
 
     result = []
     for user in users:
         item = dict(user)
         item["memberships"] = memberships_by_user.get(user["id"], [])
         item["active_sessions"] = sessions_by_user.get(user["id"], 0)
+        item["skill_capabilities"] = capabilities_by_user.get(user["id"], {
+            "can_create_skills": False,
+            "can_clone_skills": False,
+            "can_edit_own_skills": True,
+            "can_grant_skills": False,
+        })
+        item["is_admin"] = user["role"] == "ADMIN"
         result.append(item)
     return {"users": result}
 
@@ -2737,3 +3051,707 @@ async def create_admin_user(
         "generated": generated,
         "email_sent": email_sent,
     }
+
+
+# ---------------------------------------------------------------------------
+# Etapa 8 - Catalogo estandar de skills, permisos y revelacion progresiva
+# ---------------------------------------------------------------------------
+class SkillDraftRequest(BaseModel):
+    raw_idea: str = Field(..., min_length=10, max_length=2000)
+    category: str = Field(default="general", max_length=50)
+
+
+class SkillWriteRequest(BaseModel):
+    slug: Optional[str] = Field(default=None, max_length=100)
+    display_name: str = Field(..., min_length=2, max_length=150)
+    category: str = Field(..., max_length=50)
+    trigger_description: str = Field(..., min_length=10, max_length=300)
+    objective: str = Field(..., min_length=10, max_length=1000)
+    workflow_steps: List[str] = Field(default_factory=list)
+    guardrails_forbidden: List[str] = Field(default_factory=list)
+    output_criteria: str = Field(..., min_length=10, max_length=1000)
+    is_official: bool = False
+    visibility: Optional[str] = Field(default=None, max_length=20)
+    status: str = Field(default="PUBLISHED", max_length=20)
+
+
+class SkillCapabilitiesRequest(BaseModel):
+    can_create_skills: bool = False
+    can_clone_skills: bool = False
+    can_edit_own_skills: bool = True
+    can_grant_skills: bool = False
+
+
+class SkillPermissionRequest(BaseModel):
+    user_id: str
+    can_use: bool = True
+    can_edit: bool = False
+    can_clone: bool = False
+    can_grant: bool = False
+
+
+class SkillAssignRequest(BaseModel):
+    skill_slugs: List[str] = Field(default_factory=list)
+
+
+def _skill_row(conn, slug: str):
+    return conn.execute(
+        sa.text("""
+            SELECT id::text, slug, display_name, category, trigger_description,
+                   objective, workflow_steps, guardrails_forbidden, output_criteria,
+                   compiled_skill_md, created_by_user_id::text AS created_by_user_id,
+                   owner_user_id::text AS owner_user_id, is_official, status,
+                   visibility, version, compiled_tokens, created_at, updated_at
+            FROM harness_skills
+            WHERE slug = :slug
+        """),
+        {"slug": slug}
+    ).mappings().fetchone()
+
+
+def _skill_full_response(conn, skill, auth: Dict[str, Any]) -> Dict[str, Any]:
+    response = _skill_summary(conn, skill, auth)
+    response.update({
+        "objective": skill["objective"],
+        "workflow_steps": skill["workflow_steps"] or [],
+        "guardrails_forbidden": skill["guardrails_forbidden"] or [],
+        "output_criteria": skill["output_criteria"],
+        "compiled_skill_md": skill["compiled_skill_md"],
+        "created_by_user_id": skill["created_by_user_id"],
+        "created_at": skill["created_at"],
+    })
+    return response
+
+
+def _validate_skill_write(payload: SkillWriteRequest) -> Optional[str]:
+    if payload.status not in ("DRAFT", "PUBLISHED"):
+        return "status debe ser DRAFT o PUBLISHED"
+    return validate_skill_fields(
+        payload.display_name, payload.category, payload.trigger_description,
+        payload.objective, payload.workflow_steps, payload.guardrails_forbidden,
+        payload.output_criteria,
+    )
+
+
+@app.get("/api/v1/skills")
+def list_skills(
+    category: Optional[str] = Query(default=None, max_length=50),
+    search: Optional[str] = Query(default=None, max_length=200),
+    status: Optional[str] = Query(default=None, max_length=20),
+    auth: Dict[str, Any] = Depends(verify_portal_or_admin),
+):
+    is_admin = auth.get("role_name") == "ADMIN"
+    clauses = ["s.status <> 'ARCHIVED'"]
+    params: Dict[str, Any] = {}
+    if category and category != "all":
+        if category not in SKILL_CATEGORIES:
+            raise HTTPException(status_code=400, detail="category invalida")
+        clauses.append("s.category = :category")
+        params["category"] = category
+    if search and search.strip():
+        clauses.append("(s.display_name ILIKE :like OR s.slug ILIKE :like OR s.trigger_description ILIKE :like)")
+        params["like"] = f"%{search.strip()}%"
+    if status and status != "all":
+        if status not in ("DRAFT", "PUBLISHED", "ARCHIVED"):
+            raise HTTPException(status_code=400, detail="status invalido")
+        clauses = [c for c in clauses if c != "s.status <> 'ARCHIVED'"]
+        clauses.append("s.status = :status")
+        params["status"] = status
+    if not is_admin:
+        uid = auth.get("user_id")
+        if not uid:
+            raise HTTPException(status_code=403, detail="Portal user required")
+        clauses.append("""
+            (
+                s.is_official = true
+                OR s.visibility = 'SHARED'
+                OR s.owner_user_id = CAST(:uid AS UUID)
+                OR EXISTS (
+                    SELECT 1 FROM skill_permissions p
+                    WHERE p.skill_id = s.id AND p.user_id = CAST(:uid AS UUID)
+                      AND (p.can_use = true OR p.can_edit = true OR p.can_clone = true OR p.can_grant = true)
+                )
+                OR EXISTS (
+                    SELECT 1 FROM membership_skills ms
+                    WHERE ms.skill_id = s.id AND ms.user_id = CAST(:uid AS UUID)
+                )
+            )
+        """)
+        params["uid"] = uid
+    where = " AND ".join(clauses)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.text(f"""
+                SELECT s.id::text, s.slug, s.display_name, s.category, s.trigger_description,
+                       s.objective, s.workflow_steps, s.guardrails_forbidden, s.output_criteria,
+                       s.compiled_skill_md, s.created_by_user_id::text AS created_by_user_id,
+                       s.owner_user_id::text AS owner_user_id, s.is_official, s.status,
+                       s.visibility, s.version, s.compiled_tokens, s.created_at, s.updated_at
+                FROM harness_skills s
+                WHERE {where}
+                ORDER BY s.is_official DESC, s.category ASC, s.display_name ASC
+            """),
+            params
+        ).mappings().all()
+        skills = [_skill_summary(conn, row, auth) for row in rows]
+        if is_admin:
+            viewer_caps = {
+                "can_create_skills": True,
+                "can_clone_skills": True,
+                "can_edit_own_skills": True,
+                "can_grant_skills": True,
+            }
+        else:
+            viewer_caps = _skill_capabilities(conn, auth.get("user_id"))
+    return {
+        "skills": skills,
+        "categories": SKILL_CATEGORIES,
+        "viewer_capabilities": viewer_caps,
+        "can_create": viewer_caps["can_create_skills"],
+    }
+
+
+@app.get("/api/v1/skills/{slug}")
+def get_skill(slug: str, auth: Dict[str, Any] = Depends(verify_portal_or_admin)):
+    with engine.connect() as conn:
+        skill = _skill_row(conn, slug)
+        if not skill:
+            raise HTTPException(status_code=404, detail="Skill not found")
+        if not _can_view_skill(conn, skill, auth):
+            raise HTTPException(status_code=403, detail="Skill not authorized")
+        return _skill_full_response(conn, skill, auth)
+
+
+@app.get("/api/v1/skills/{slug}/manual")
+def get_skill_manual(slug: str, auth: Dict[str, Any] = Depends(verify_auth)):
+    with engine.connect() as conn:
+        skill = _skill_row(conn, slug)
+        if not skill or skill["status"] != "PUBLISHED":
+            raise HTTPException(status_code=404, detail="Skill not found")
+        if auth.get("role") != "admin":
+            allowed = False
+            if auth.get("user_id") and auth.get("project_id"):
+                allowed = bool(conn.execute(
+                    sa.text("""
+                        SELECT 1 FROM membership_skills
+                        WHERE skill_id = CAST(:sid AS UUID)
+                          AND user_id = CAST(:uid AS UUID)
+                          AND project_id = CAST(:pid AS UUID)
+                        LIMIT 1
+                    """),
+                    {"sid": skill["id"], "uid": auth["user_id"], "pid": auth["project_id"]}
+                ).fetchone())
+            if not allowed and auth.get("session_id"):
+                session = conn.execute(
+                    sa.text("""
+                        SELECT skills FROM agent_sessions WHERE id = CAST(:sid AS UUID)
+                    """),
+                    {"sid": auth["session_id"]}
+                ).fetchone()
+                if session and slug in (session[0] or []):
+                    allowed = True
+            if not allowed:
+                raise HTTPException(status_code=403, detail="Skill not assigned to this session")
+        return {
+            "slug": skill["slug"],
+            "display_name": skill["display_name"],
+            "category": skill["category"],
+            "trigger_description": skill["trigger_description"],
+            "compiled_skill_md": skill["compiled_skill_md"],
+            "compiled_tokens": skill["compiled_tokens"],
+        }
+
+
+@app.post("/api/v1/skills/preview")
+def preview_skill(payload: SkillWriteRequest, auth: Dict[str, Any] = Depends(verify_portal)):
+    error = _validate_skill_write(payload)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    compiled = compile_standard_skill_md(
+        slugify(payload.slug or payload.display_name, 100),
+        payload.display_name, payload.category, payload.trigger_description,
+        payload.objective, payload.workflow_steps, payload.guardrails_forbidden,
+        payload.output_criteria,
+    )
+    return {
+        "compiled_skill_md": compiled,
+        "compiled_tokens": estimate_tokens(compiled),
+        "valid": True,
+    }
+
+
+@app.post("/api/v1/skills/draft-from-idea")
+def draft_skill_from_idea(payload: SkillDraftRequest, auth: Dict[str, Any] = Depends(verify_portal)):
+    category = payload.category if payload.category in SKILL_CATEGORIES else "general"
+    draft = draft_skill(payload.raw_idea, category)
+    with engine.connect() as conn:
+        unique_slug = _unique_skill_slug(conn, draft["slug"])
+    if unique_slug != draft["slug"]:
+        draft["slug"] = unique_slug
+        draft["compiled_skill_md"] = compile_standard_skill_md(
+            unique_slug, draft["display_name"], draft["category"],
+            draft["trigger_description"], draft["objective"],
+            draft["workflow_steps"], draft["guardrails_forbidden"],
+            draft["output_criteria"],
+        )
+        draft["compiled_tokens"] = estimate_tokens(draft["compiled_skill_md"])
+    return draft
+
+
+@app.post("/api/v1/skills")
+def create_skill(payload: SkillWriteRequest, auth: Dict[str, Any] = Depends(verify_portal)):
+    is_admin = auth.get("role_name") == "ADMIN"
+    uid = auth.get("user_id")
+    error = _validate_skill_write(payload)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    if payload.is_official and not is_admin:
+        raise HTTPException(status_code=403, detail="Only Admin can create official skills")
+    with engine.begin() as conn:
+        if not is_admin:
+            caps = _skill_capabilities(conn, uid)
+            if not caps["can_create_skills"]:
+                raise HTTPException(status_code=403, detail="Skill creation not authorized")
+        if payload.slug:
+            slug = slugify(payload.slug, 100)
+            if conn.execute(sa.text("SELECT 1 FROM harness_skills WHERE slug = :slug"), {"slug": slug}).fetchone():
+                raise HTTPException(status_code=409, detail="Skill slug already exists")
+        else:
+            slug = _unique_skill_slug(conn, payload.display_name)
+        compiled = compile_standard_skill_md(
+            slug, payload.display_name, payload.category, payload.trigger_description,
+            payload.objective, payload.workflow_steps, payload.guardrails_forbidden,
+            payload.output_criteria,
+        )
+        visibility = "OFFICIAL" if payload.is_official else (
+            payload.visibility if is_admin and payload.visibility in ("PRIVATE", "SHARED") else "PRIVATE"
+        )
+        owner_id = None if payload.is_official else uid
+        row = conn.execute(
+            sa.text("""
+                INSERT INTO harness_skills
+                    (id, slug, display_name, category, trigger_description, objective,
+                     workflow_steps, guardrails_forbidden, output_criteria, compiled_skill_md,
+                     created_by_user_id, owner_user_id, is_official, status, visibility,
+                     version, compiled_tokens)
+                VALUES
+                    (CAST(:id AS UUID), :slug, :display_name, :category, :trigger, :objective,
+                     CAST(:steps AS JSONB), CAST(:guardrails AS JSONB), :output, :compiled,
+                     CAST(:created_by AS UUID), CAST(:owner AS UUID), :official, :status,
+                     :visibility, 1, :tokens)
+                RETURNING id::text, slug, display_name, category, trigger_description,
+                          objective, workflow_steps, guardrails_forbidden, output_criteria,
+                          compiled_skill_md, created_by_user_id::text AS created_by_user_id,
+                          owner_user_id::text AS owner_user_id, is_official, status,
+                          visibility, version, compiled_tokens, created_at, updated_at
+            """),
+            {
+                "id": str(uuid.uuid4()), "slug": slug, "display_name": payload.display_name,
+                "category": payload.category, "trigger": payload.trigger_description,
+                "objective": payload.objective, "steps": json.dumps(payload.workflow_steps),
+                "guardrails": json.dumps(payload.guardrails_forbidden),
+                "output": payload.output_criteria, "compiled": compiled,
+                "created_by": uid, "owner": owner_id, "official": payload.is_official,
+                "status": payload.status, "visibility": visibility,
+                "tokens": estimate_tokens(compiled),
+            }
+        ).mappings().fetchone()
+        if owner_id:
+            conn.execute(
+                sa.text("""
+                    INSERT INTO skill_permissions
+                        (id, skill_id, user_id, can_use, can_edit, can_clone, can_grant, granted_by_user_id)
+                    VALUES
+                        (CAST(:id AS UUID), CAST(:sid AS UUID), CAST(:uid AS UUID),
+                         true, true, true, true, CAST(:uid AS UUID))
+                    ON CONFLICT (skill_id, user_id) DO UPDATE SET
+                        can_use = true, can_edit = true, can_clone = true, can_grant = true
+                """),
+                {"id": str(uuid.uuid4()), "sid": row["id"], "uid": owner_id}
+            )
+        return _skill_full_response(conn, row, auth)
+
+
+@app.put("/api/v1/skills/{slug}")
+def update_skill(slug: str, payload: SkillWriteRequest, auth: Dict[str, Any] = Depends(verify_portal)):
+    error = _validate_skill_write(payload)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    with engine.begin() as conn:
+        skill = _skill_row(conn, slug)
+        if not skill:
+            raise HTTPException(status_code=404, detail="Skill not found")
+        if not _skill_flags(conn, skill, auth)["can_edit"]:
+            raise HTTPException(status_code=403, detail="Skill edit not authorized")
+        compiled = compile_standard_skill_md(
+            slug, payload.display_name, payload.category, payload.trigger_description,
+            payload.objective, payload.workflow_steps, payload.guardrails_forbidden,
+            payload.output_criteria,
+        )
+        row = conn.execute(
+            sa.text("""
+                UPDATE harness_skills SET
+                    display_name = :display_name,
+                    category = :category,
+                    trigger_description = :trigger,
+                    objective = :objective,
+                    workflow_steps = CAST(:steps AS JSONB),
+                    guardrails_forbidden = CAST(:guardrails AS JSONB),
+                    output_criteria = :output,
+                    compiled_skill_md = :compiled,
+                    compiled_tokens = :tokens,
+                    version = version + 1,
+                    updated_at = NOW()
+                WHERE slug = :slug
+                RETURNING id::text, slug, display_name, category, trigger_description,
+                          objective, workflow_steps, guardrails_forbidden, output_criteria,
+                          compiled_skill_md, created_by_user_id::text AS created_by_user_id,
+                          owner_user_id::text AS owner_user_id, is_official, status,
+                          visibility, version, compiled_tokens, created_at, updated_at
+            """),
+            {
+                "display_name": payload.display_name, "category": payload.category,
+                "trigger": payload.trigger_description, "objective": payload.objective,
+                "steps": json.dumps(payload.workflow_steps),
+                "guardrails": json.dumps(payload.guardrails_forbidden),
+                "output": payload.output_criteria, "compiled": compiled,
+                "tokens": estimate_tokens(compiled), "slug": slug,
+            }
+        ).mappings().fetchone()
+        return _skill_full_response(conn, row, auth)
+
+
+@app.post("/api/v1/skills/{slug}/clone")
+def clone_skill(slug: str, auth: Dict[str, Any] = Depends(verify_portal)):
+    uid = auth.get("user_id")
+    with engine.begin() as conn:
+        skill = _skill_row(conn, slug)
+        if not skill:
+            raise HTTPException(status_code=404, detail="Skill not found")
+        if not _skill_flags(conn, skill, auth)["can_clone"]:
+            raise HTTPException(status_code=403, detail="Skill clone not authorized")
+        if not uid:
+            raise HTTPException(status_code=401, detail="Portal user required")
+        new_slug = _unique_skill_slug(conn, f"{slug}-copy")
+        display = f"Copia de {skill['display_name']}"[:150]
+        compiled = compile_standard_skill_md(
+            new_slug, display, skill["category"], skill["trigger_description"],
+            skill["objective"], skill["workflow_steps"] or [],
+            skill["guardrails_forbidden"] or [], skill["output_criteria"],
+        )
+        row = conn.execute(
+            sa.text("""
+                INSERT INTO harness_skills
+                    (id, slug, display_name, category, trigger_description, objective,
+                     workflow_steps, guardrails_forbidden, output_criteria, compiled_skill_md,
+                     created_by_user_id, owner_user_id, is_official, status, visibility,
+                     version, compiled_tokens)
+                VALUES
+                    (CAST(:id AS UUID), :slug, :display_name, :category, :trigger, :objective,
+                     CAST(:steps AS JSONB), CAST(:guardrails AS JSONB), :output, :compiled,
+                     CAST(:uid AS UUID), CAST(:uid AS UUID), false, 'PUBLISHED', 'PRIVATE',
+                     1, :tokens)
+                RETURNING id::text, slug, display_name, category, trigger_description,
+                          objective, workflow_steps, guardrails_forbidden, output_criteria,
+                          compiled_skill_md, created_by_user_id::text AS created_by_user_id,
+                          owner_user_id::text AS owner_user_id, is_official, status,
+                          visibility, version, compiled_tokens, created_at, updated_at
+            """),
+            {
+                "id": str(uuid.uuid4()), "slug": new_slug, "display_name": display,
+                "category": skill["category"], "trigger": skill["trigger_description"],
+                "objective": skill["objective"], "steps": json.dumps(skill["workflow_steps"] or []),
+                "guardrails": json.dumps(skill["guardrails_forbidden"] or []),
+                "output": skill["output_criteria"], "compiled": compiled,
+                "uid": uid, "tokens": estimate_tokens(compiled),
+            }
+        ).mappings().fetchone()
+        conn.execute(
+            sa.text("""
+                INSERT INTO skill_permissions
+                    (id, skill_id, user_id, can_use, can_edit, can_clone, can_grant, granted_by_user_id)
+                VALUES
+                    (CAST(:id AS UUID), CAST(:sid AS UUID), CAST(:uid AS UUID),
+                     true, true, true, true, CAST(:uid AS UUID))
+                ON CONFLICT (skill_id, user_id) DO NOTHING
+            """),
+            {"id": str(uuid.uuid4()), "sid": row["id"], "uid": uid}
+        )
+        return _skill_full_response(conn, row, auth)
+
+
+@app.get("/api/v1/skills/{slug}/permissions")
+def list_skill_permissions(slug: str, auth: Dict[str, Any] = Depends(verify_portal)):
+    with engine.connect() as conn:
+        skill = _skill_row(conn, slug)
+        if not skill:
+            raise HTTPException(status_code=404, detail="Skill not found")
+        if not _skill_flags(conn, skill, auth)["can_grant"]:
+            raise HTTPException(status_code=403, detail="Skill grant not authorized")
+        rows = conn.execute(
+            sa.text("""
+                SELECT p.user_id::text, u.email, u.full_name, p.can_use, p.can_edit,
+                       p.can_clone, p.can_grant
+                FROM skill_permissions p
+                JOIN harness_users u ON u.id = p.user_id
+                WHERE p.skill_id = CAST(:sid AS UUID)
+                ORDER BY u.email
+            """),
+            {"sid": skill["id"]}
+        ).mappings().all()
+    return {"permissions": [dict(row) for row in rows]}
+
+
+@app.put("/api/v1/skills/{slug}/permissions")
+def set_skill_permission(slug: str, payload: SkillPermissionRequest, auth: Dict[str, Any] = Depends(verify_portal)):
+    with engine.begin() as conn:
+        skill = _skill_row(conn, slug)
+        if not skill:
+            raise HTTPException(status_code=404, detail="Skill not found")
+        if not _skill_flags(conn, skill, auth)["can_grant"]:
+            raise HTTPException(status_code=403, detail="Skill grant not authorized")
+        user = conn.execute(
+            sa.text("SELECT id::text, email FROM harness_users WHERE id = CAST(:uid AS UUID)"),
+            {"uid": payload.user_id}
+        ).mappings().fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        conn.execute(
+            sa.text("""
+                INSERT INTO skill_permissions
+                    (id, skill_id, user_id, can_use, can_edit, can_clone, can_grant, granted_by_user_id)
+                VALUES
+                    (CAST(:id AS UUID), CAST(:sid AS UUID), CAST(:uid AS UUID),
+                     :can_use, :can_edit, :can_clone, :can_grant, CAST(:by AS UUID))
+                ON CONFLICT (skill_id, user_id) DO UPDATE SET
+                    can_use = EXCLUDED.can_use,
+                    can_edit = EXCLUDED.can_edit,
+                    can_clone = EXCLUDED.can_clone,
+                    can_grant = EXCLUDED.can_grant,
+                    granted_by_user_id = EXCLUDED.granted_by_user_id
+            """),
+            {
+                "id": str(uuid.uuid4()), "sid": skill["id"], "uid": payload.user_id,
+                "can_use": payload.can_use, "can_edit": payload.can_edit,
+                "can_clone": payload.can_clone, "can_grant": payload.can_grant,
+                "by": auth.get("user_id"),
+            }
+        )
+    return {"skill": slug, "user": user["email"], "updated": True}
+
+
+@app.delete("/api/v1/skills/{slug}/permissions/{user_id}")
+def delete_skill_permission(slug: str, user_id: str, auth: Dict[str, Any] = Depends(verify_portal)):
+    with engine.begin() as conn:
+        skill = _skill_row(conn, slug)
+        if not skill:
+            raise HTTPException(status_code=404, detail="Skill not found")
+        if not _skill_flags(conn, skill, auth)["can_grant"]:
+            raise HTTPException(status_code=403, detail="Skill grant not authorized")
+        conn.execute(
+            sa.text("""
+                DELETE FROM skill_permissions
+                WHERE skill_id = CAST(:sid AS UUID) AND user_id = CAST(:uid AS UUID)
+            """),
+            {"sid": skill["id"], "uid": user_id}
+        )
+    return {"skill": slug, "user_id": user_id, "deleted": True}
+
+
+@app.get("/api/v1/admin/users/{user_id}/skill-capabilities")
+def get_user_skill_capabilities(user_id: str, auth: Dict[str, Any] = Depends(verify_portal_admin)):
+    with engine.connect() as conn:
+        user = conn.execute(
+            sa.text("SELECT id::text, email, role FROM harness_users WHERE id = CAST(:uid AS UUID)"),
+            {"uid": user_id}
+        ).mappings().fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        caps = _skill_capabilities(conn, user_id)
+    return {"user": dict(user), "capabilities": caps, "admin_bypass": user["role"] == "ADMIN"}
+
+
+@app.put("/api/v1/admin/users/{user_id}/skill-capabilities")
+def set_user_skill_capabilities(
+    user_id: str,
+    payload: SkillCapabilitiesRequest,
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    with engine.begin() as conn:
+        user = conn.execute(
+            sa.text("SELECT id::text, email, role FROM harness_users WHERE id = CAST(:uid AS UUID)"),
+            {"uid": user_id}
+        ).mappings().fetchone()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        row = conn.execute(
+            sa.text("""
+                INSERT INTO user_skill_capabilities
+                    (id, user_id, can_create_skills, can_clone_skills,
+                     can_edit_own_skills, can_grant_skills)
+                VALUES
+                    (CAST(:id AS UUID), CAST(:uid AS UUID), :create, :clone, :edit_own, :grant)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    can_create_skills = EXCLUDED.can_create_skills,
+                    can_clone_skills = EXCLUDED.can_clone_skills,
+                    can_edit_own_skills = EXCLUDED.can_edit_own_skills,
+                    can_grant_skills = EXCLUDED.can_grant_skills,
+                    updated_at = NOW()
+                RETURNING can_create_skills, can_clone_skills,
+                          can_edit_own_skills, can_grant_skills
+            """),
+            {
+                "id": str(uuid.uuid4()), "uid": user_id,
+                "create": payload.can_create_skills,
+                "clone": payload.can_clone_skills,
+                "edit_own": payload.can_edit_own_skills,
+                "grant": payload.can_grant_skills,
+            }
+        ).mappings().fetchone()
+    return {"user": dict(user), "capabilities": dict(row), "admin_bypass": user["role"] == "ADMIN"}
+
+
+@app.get("/api/v1/projects/{project_id}/skills")
+def list_project_skills(project_id: str, auth: Dict[str, Any] = Depends(verify_portal_or_admin)):
+    with engine.connect() as conn:
+        project = conn.execute(
+            sa.text("SELECT id::text, project_slug FROM harness_projects WHERE id = CAST(:pid AS UUID)"),
+            {"pid": project_id}
+        ).mappings().fetchone()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if auth.get("role_name") != "ADMIN":
+            member = conn.execute(
+                sa.text("""
+                    SELECT 1 FROM project_memberships
+                    WHERE project_id = CAST(:pid AS UUID) AND user_id = CAST(:uid AS UUID)
+                      AND status = 'APPROVED'
+                """),
+                {"pid": project_id, "uid": auth.get("user_id")}
+            ).fetchone()
+            if not member:
+                raise HTTPException(status_code=403, detail="Project access not approved")
+        rows = conn.execute(
+            sa.text("""
+                SELECT s.id::text, s.slug, s.display_name, s.category,
+                       s.trigger_description, s.is_official, s.compiled_tokens
+                FROM project_skills ps
+                JOIN harness_skills s ON s.id = ps.skill_id
+                WHERE ps.project_id = CAST(:pid AS UUID)
+                ORDER BY s.category, s.display_name
+            """),
+            {"pid": project_id}
+        ).mappings().all()
+    return {"project": dict(project), "skills": [dict(row) for row in rows]}
+
+
+@app.put("/api/v1/projects/{project_id}/skills")
+def set_project_skills(project_id: str, payload: SkillAssignRequest, auth: Dict[str, Any] = Depends(verify_portal_admin)):
+    with engine.begin() as conn:
+        project = conn.execute(
+            sa.text("SELECT id::text, project_slug FROM harness_projects WHERE id = CAST(:pid AS UUID)"),
+            {"pid": project_id}
+        ).mappings().fetchone()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        slugs = list(dict.fromkeys(slugify(s, 100) for s in payload.skill_slugs if str(s).strip()))
+        skill_ids = {}
+        for slug in slugs:
+            row = conn.execute(
+                sa.text("SELECT id::text FROM harness_skills WHERE slug = :slug"),
+                {"slug": slug}
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=400, detail=f"Skill not found: {slug}")
+            skill_ids[slug] = row[0]
+        conn.execute(
+            sa.text("DELETE FROM project_skills WHERE project_id = CAST(:pid AS UUID)"),
+            {"pid": project_id}
+        )
+        for slug, skill_id in skill_ids.items():
+            conn.execute(
+                sa.text("""
+                    INSERT INTO project_skills (id, project_id, skill_id, assigned_by_user_id)
+                    VALUES (CAST(:id AS UUID), CAST(:pid AS UUID), CAST(:sid AS UUID),
+                            CAST(:by AS UUID))
+                """),
+                {"id": str(uuid.uuid4()), "pid": project_id, "sid": skill_id, "by": auth.get("user_id")}
+            )
+        conn.execute(
+            sa.text("""
+                DELETE FROM membership_skills
+                WHERE project_id = CAST(:pid AS UUID)
+                  AND skill_id NOT IN (
+                      SELECT skill_id FROM project_skills WHERE project_id = CAST(:pid AS UUID)
+                  )
+            """),
+            {"pid": project_id}
+        )
+        conn.execute(
+            sa.text("""
+                UPDATE project_memberships m
+                SET allowed_skills = COALESCE((
+                    SELECT jsonb_agg(s.slug ORDER BY s.slug)
+                    FROM membership_skills ms
+                    JOIN harness_skills s ON s.id = ms.skill_id
+                    WHERE ms.project_id = m.project_id AND ms.user_id = m.user_id
+                ), '[]'::jsonb)
+                WHERE m.project_id = CAST(:pid AS UUID)
+            """),
+            {"pid": project_id}
+        )
+    return {"project": dict(project), "skill_slugs": slugs}
+
+
+@app.get("/api/v1/projects/{project_id}/members/{user_id}/skills")
+def list_membership_skills(
+    project_id: str,
+    user_id: str,
+    auth: Dict[str, Any] = Depends(verify_portal_or_admin),
+):
+    if auth.get("role_name") != "ADMIN" and auth.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="Skill assignment not authorized")
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.text("""
+                SELECT s.id::text, s.slug, s.display_name, s.category,
+                       s.trigger_description, s.is_official, s.compiled_tokens
+                FROM membership_skills ms
+                JOIN harness_skills s ON s.id = ms.skill_id
+                WHERE ms.project_id = CAST(:pid AS UUID) AND ms.user_id = CAST(:uid AS UUID)
+                ORDER BY s.category, s.display_name
+            """),
+            {"pid": project_id, "uid": user_id}
+        ).mappings().all()
+    return {"skills": [dict(row) for row in rows]}
+
+
+@app.put("/api/v1/projects/{project_id}/members/{user_id}/skills")
+def set_membership_skills(
+    project_id: str,
+    user_id: str,
+    payload: SkillAssignRequest,
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    with engine.begin() as conn:
+        membership = conn.execute(
+            sa.text("""
+                SELECT 1 FROM project_memberships
+                WHERE project_id = CAST(:pid AS UUID) AND user_id = CAST(:uid AS UUID)
+            """),
+            {"pid": project_id, "uid": user_id}
+        ).fetchone()
+        if not membership:
+            raise HTTPException(status_code=404, detail="Membership not found")
+        slugs = list(dict.fromkeys(slugify(s, 100) for s in payload.skill_slugs if str(s).strip()))
+        for slug in slugs:
+            row = conn.execute(
+                sa.text("SELECT 1 FROM harness_skills WHERE slug = :slug"),
+                {"slug": slug}
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=400, detail=f"Skill not found: {slug}")
+        result = _sync_membership_skills(
+            conn, project_id, user_id, slugs, auth.get("user_id"), replace=True
+        )
+    return {"project_id": project_id, "user_id": user_id, "skill_slugs": result}

@@ -340,6 +340,7 @@ def tool_get_active_contract_and_task(args=None):
         "system_contract_rules": rules,
         "purge_requested": snap["purge_requested"],
         "task": active,
+        "active_task_skill_manuals": (active or {}).get("skill_manuals") or {},
         "pending_tasks": [t for t in tasks if t.get("status") == "PENDING"],
         "messages": snap["messages"][-10:],
     }
@@ -437,6 +438,16 @@ def tool_send_peer_message(args):
     return data
 
 
+def tool_get_skill_manual(args):
+    slug = (args or {}).get("skill_slug")
+    if not slug:
+        raise ValueError("skill_slug es obligatorio")
+    status, data = api("GET", f"/api/v1/skills/{slug}/manual")
+    if status != 200:
+        raise RuntimeError(f"skill manual HTTP {status}: {data}")
+    return data
+
+
 TOOL_FUNCS = {
     "harness_get_active_contract_and_task": tool_get_active_contract_and_task,
     "harness_request_context_pack": tool_request_context_pack,
@@ -444,6 +455,7 @@ TOOL_FUNCS = {
     "harness_submit_task_changes": tool_submit_task_changes,
     "harness_report_checkpoint_failure": tool_report_checkpoint_failure,
     "harness_send_peer_message": tool_send_peer_message,
+    "harness_get_skill_manual": tool_get_skill_manual,
 }
 
 TOOLS = [
@@ -518,6 +530,17 @@ TOOLS = [
                 "task_id": {"type": "string"},
             },
             "required": ["target_session_id", "content"],
+        },
+    },
+    {
+        "name": "harness_get_skill_manual",
+        "description": "Obtiene bajo demanda el manual SKILL.md de una skill asignada a esta sesion.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "skill_slug": {"type": "string"},
+            },
+            "required": ["skill_slug"],
         },
     },
 ]

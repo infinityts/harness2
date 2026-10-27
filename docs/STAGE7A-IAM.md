@@ -91,12 +91,14 @@ Regresiones: Stage 1, 3, 4, 5 y 6 siguen pasando con el esquema nuevo.
 users 2 admins + cuentas creadas por el Admin | projects 1
 memberships 2 + membresías aprobadas
 tasks 0 | plans 0 | files 7
-alembic 0008 (head)
+alembic 0009 (head)
 ```
 
 La revisión `0007` agrega SMTP y auditoría de correos; ver
 [`STAGE7-SMTP.md`](./STAGE7-SMTP.md). La `0008` agrega el seed legacy
-`admin@local`; ver [`STAGE7-PASSWORDS.md`](./STAGE7-PASSWORDS.md).
+`admin@local`; ver [`STAGE7-PASSWORDS.md`](./STAGE7-PASSWORDS.md). La `0009`
+agrega el catálogo estándar de skills; ver
+[`STAGE8-SKILLS.md`](./STAGE8-SKILLS.md).
 
 Commit Parte A: `ca68e8d` (`feat: stage 7a IAM/projects governance migration and seeds`).
 
