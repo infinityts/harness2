@@ -154,7 +154,7 @@ async def main():
         WHERE table_name='agent_sessions' AND column_name='system_contract_rules'
     """)
     print("alembic:", version, "column:", [x["column_name"] for x in col])
-    assert version in ("0004", "0005") and col
+    assert version in ("0004", "0005", "0006") and col
 
     s = register("e2e-stage6-bridge", "opencode", ["python"])
     ws = await websockets.connect(f"{WS}/ws/agent/{s['session_id']}", additional_headers={"Authorization": f"Bearer {s['session_key']}"})

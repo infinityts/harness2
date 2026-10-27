@@ -2,11 +2,11 @@
 
 ## Alcance
 
-Esta entrega implementa **solo la Parte A** de la Etapa 7: el modelo de datos de
+Esta entrega implementa la **Parte A** de la Etapa 7: el modelo de datos de
 gobierno (usuarios, proyectos, membresías), el aislamiento sesión→proyecto y los
-seeds iniciales. La Parte B (portal web, login por correo, endpoints de
-invitación/aprobación y aislamiento estricto en runtime) no venía incluida en la
-especificación recibida.
+seeds iniciales. Las Partes B (auth de portal, endpoints admin, sesiones 1:1 y
+aislamiento runtime) y C (portal responsive `/portal` + `/war-room`) se documentan
+en [`STAGE7-IAM-PORTAL.md`](./STAGE7-IAM-PORTAL.md).
 
 ## Migración
 
@@ -76,34 +76,32 @@ HARNESS_INITIAL_ADMIN_PASSWORD=AdminHarness2026!
 PBKDF2_ITERATIONS=260000            # opcional
 ```
 
-## Verificación (E2E 7A)
+## Verificación (E2E 7A/B/C)
 
-`tests/e2e_stage7.py` comprueba:
+`tests/e2e_stage7.py` comprueba la migración 0005/0006, las tablas IAM, login de
+admin, alta automática de `proj-alpha`/`proj-beta`, membresías selectivas,
+sesiones 1:1, config-bundle, aislamiento cross-project, dispatch por proyecto y
+los breakpoints del portal responsive.
 
-- `alembic_version = 0005` y las tres tablas nuevas.
-- Columnas de aislamiento y los seis constraints.
-- Admin `ACTIVE/ADMIN`, hash PBKDF2 y `verify_password` correcto/incorrecto.
-- Proyecto `harness-self` con `created_by_user_id` del admin.
-- Membership `APPROVED`, `allowed_skills=[]`, aprobada por el admin.
-- Health 200 y `harness-self` indexado.
-
-Regresiones: Stage 1, Stage 5 y Stage 6 siguen pasando con el esquema nuevo.
+Regresiones: Stage 1, 3, 4, 5 y 6 siguen pasando con el esquema nuevo.
 
 ## Estado final
 
 ```text
 users 1 | projects 1 | memberships 1
 sessions 0 | tasks 0 | plans 0
-events 171 | files 7
-alembic 0005 (head)
+files 7
+alembic 0006 (head)
 ```
 
-Commit: `ca68e8d` (`feat: stage 7a IAM/projects governance migration and seeds`).
+Commit Parte A: `ca68e8d` (`feat: stage 7a IAM/projects governance migration and seeds`).
 
-## Pendiente para la Parte B
+## Partes B y C implementadas
 
 - Login por correo, activación por invitación y sesiones de portal.
 - Endpoints admin de usuarios/proyectos/membresías.
 - Registro de sesiones con `user_id/project_id` y validación de membresía.
 - Filtros estrictos por proyecto en planes/tareas/context packs.
-- Portal responsive Admin/Ingeniero.
+- Portal responsive Admin/Ingeniero en `/portal` y `/war-room`.
+
+Ver [`STAGE7-IAM-PORTAL.md`](./STAGE7-IAM-PORTAL.md).

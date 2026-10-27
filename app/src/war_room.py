@@ -36,11 +36,13 @@ def record_event(
 def get_topology(engine: sa.Engine) -> Dict[str, Any]:
     with engine.connect() as conn:
         nodes = conn.execute(sa.text("""
-            SELECT id::text AS session_id, engineer_username, agent_tool, llm_provider,
-                   skills, status, current_context_tokens, max_context_tokens,
-                   system_contract_rules, last_heartbeat, connected_at
-            FROM agent_sessions
-            ORDER BY connected_at DESC
+            SELECT s.id::text AS session_id, s.engineer_username, s.agent_tool, s.llm_provider,
+                   s.skills, s.status, s.current_context_tokens, s.max_context_tokens,
+                   s.system_contract_rules, s.last_heartbeat, s.connected_at,
+                   s.project_id::text AS project_id, p.project_slug
+            FROM agent_sessions s
+            LEFT JOIN harness_projects p ON p.id = s.project_id
+            ORDER BY s.connected_at DESC
         """)).mappings().all()
 
         links = conn.execute(sa.text("""
@@ -52,11 +54,14 @@ def get_topology(engine: sa.Engine) -> Dict[str, Any]:
         """)).mappings().all()
 
         tasks = conn.execute(sa.text("""
-            SELECT id::text, plan_id::text, title, status, assigned_session_id::text,
-                   git_branch, allowed_files, required_skills, created_at
-            FROM harness_tasks
-            WHERE status IN ('PENDING', 'IN_PROGRESS', 'VALIDATING', 'CONFLICT')
-            ORDER BY created_at ASC
+            SELECT t.id::text, t.plan_id::text, t.title, t.status, t.assigned_session_id::text,
+                   t.git_branch, t.allowed_files, t.required_skills, t.created_at,
+                   p.project_id::text AS project_id, pr.project_slug
+            FROM harness_tasks t
+            LEFT JOIN feature_consensus_plans p ON p.id = t.plan_id
+            LEFT JOIN harness_projects pr ON pr.id = p.project_id
+            WHERE t.status IN ('PENDING', 'IN_PROGRESS', 'VALIDATING', 'CONFLICT')
+            ORDER BY t.created_at ASC
         """)).mappings().all()
 
         locks = conn.execute(sa.text("""

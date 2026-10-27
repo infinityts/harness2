@@ -111,6 +111,7 @@ def generate_dual_plans_and_synthesize(
     required_skills_hint: Optional[List[str]] = None,
     plan_a_override: Optional[Dict[str, Any]] = None,
     plan_b_override: Optional[Dict[str, Any]] = None,
+    project_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Genera obligatoriamente Plan A y Plan B sobre el mapa real del repositorio,
@@ -231,6 +232,7 @@ def generate_dual_plans_and_synthesize(
     master_plan_c = {
         "synthesis_strategy": "HYBRID_CONSERVATIVE_MODULAR",
         "repo_name": repo_name,
+        "project_id": project_id,
         "scores": {
             "plan_a": score_a,
             "plan_b": score_b,
@@ -245,10 +247,10 @@ def generate_dual_plans_and_synthesize(
         sa.text("""
             INSERT INTO feature_consensus_plans (
                 id, requested_by, requirement_prompt, plan_a_json, plan_b_json,
-                arbiter_justification, master_plan_c_json, status
+                arbiter_justification, master_plan_c_json, status, project_id
             ) VALUES (
                 CAST(:pid AS UUID), :req_by, :prompt, CAST(:pa AS JSONB), CAST(:pb AS JSONB),
-                :just, CAST(:pc AS JSONB), 'APPROVED'
+                :just, CAST(:pc AS JSONB), 'APPROVED', CAST(:project_id AS UUID)
             )
         """),
         {
@@ -258,7 +260,8 @@ def generate_dual_plans_and_synthesize(
             "pa": json.dumps(plan_a),
             "pb": json.dumps(plan_b),
             "just": justification,
-            "pc": json.dumps(master_plan_c)
+            "pc": json.dumps(master_plan_c),
+            "project_id": project_id
         }
     )
 
@@ -318,7 +321,8 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
         sa.text("""
             SELECT t.id::text AS task_id, t.plan_id::text AS plan_id, t.title,
                    t.required_skills, t.git_branch, t.allowed_files,
-                   p.master_plan_c_json->>'repo_name' AS repo_name
+                   p.master_plan_c_json->>'repo_name' AS repo_name,
+                   p.project_id::text AS project_id
             FROM harness_tasks t
             JOIN feature_consensus_plans p ON p.id = t.plan_id
             WHERE t.status = 'PENDING'
@@ -360,6 +364,10 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
                   AND last_heartbeat >= NOW() - make_interval(secs => :timeout)
                   AND skills @> CAST(:req_skills AS JSONB)
                   AND (current_context_tokens::float / NULLIF(max_context_tokens, 0)) < :max_ratio
+                  AND (
+                        (CAST(:project_id AS UUID) IS NULL AND project_id IS NULL)
+                        OR project_id = CAST(:project_id AS UUID)
+                  )
                 ORDER BY current_context_tokens ASC, last_heartbeat DESC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -367,7 +375,8 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
             {
                 "timeout": heartbeat_timeout,
                 "req_skills": json.dumps(task["required_skills"] or []),
-                "max_ratio": max_context_ratio
+                "max_ratio": max_context_ratio,
+                "project_id": task["project_id"],
             }
         ).mappings().fetchone()
 
@@ -408,6 +417,7 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
         dispatched.append({
             "task_id": task["task_id"],
             "plan_id": task["plan_id"],
+            "project_id": task["project_id"],
             "title": task["title"],
             "git_branch": task["git_branch"],
             "allowed_files": allowed_files,

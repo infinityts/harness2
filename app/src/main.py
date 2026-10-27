@@ -1,5 +1,7 @@
 import os
 import json
+import re
+import secrets
 import uuid
 import hashlib
 import hmac
@@ -15,7 +17,14 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from pathlib import Path
 
-from src.indexer import index_repository, compute_embedding_768
+from src.indexer import (
+    compute_embedding_768,
+    ensure_project_repo,
+    index_repository,
+    validate_repo_name,
+    validate_repo_url,
+)
+from src.security import hash_password, open_secret, seal_secret, verify_password
 from src.git_guardian import (
     GitBarrierError,
     GitTaskPermissionError,
@@ -68,6 +77,8 @@ JWT_SECRET = os.getenv("HARNESS_JWT_SECRET", "change-me-secret")
 HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT_SECONDS", "10"))
 MAX_CONTEXT_RATIO = float(os.getenv("MAX_CONTEXT_RATIO", "0.65"))
 SESSION_JWT_TTL_HOURS = int(os.getenv("SESSION_JWT_TTL_HOURS", "12"))
+PORTAL_JWT_TTL_HOURS = int(os.getenv("PORTAL_JWT_TTL_HOURS", "12"))
+HARNESS_PUBLIC_URL = os.getenv("HARNESS_PUBLIC_URL", "http://11.0.0.3:8444").rstrip("/")
 
 engine = sa.create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10, max_overflow=20)
 
@@ -93,7 +104,7 @@ def verify_auth(
 ) -> Dict[str, Any]:
     """Admin por X-Harness-Admin-Key o agente por Authorization: Bearer <session_key>."""
     if ADMIN_API_KEY and x_harness_admin_key and hmac.compare_digest(x_harness_admin_key, ADMIN_API_KEY):
-        return {"role": "admin", "session_id": None}
+        return {"role": "admin", "session_id": None, "user_id": None, "project_id": None, "project_slug": None}
 
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization.split(" ", 1)[1].strip()
@@ -106,22 +117,54 @@ def verify_auth(
             )
         except Exception:
             raise HTTPException(status_code=401, detail="Invalid bearer token")
+        if decoded.get("typ") == "portal":
+            uid = decoded.get("sub")
+            with engine.connect() as conn:
+                portal_user = conn.execute(
+                    sa.text("""
+                        SELECT id::text, email, full_name, role, status, default_skills
+                        FROM harness_users
+                        WHERE id = CAST(:uid AS UUID)
+                    """),
+                    {"uid": uid}
+                ).mappings().fetchone()
+            if not portal_user or portal_user["status"] != "ACTIVE" or portal_user["role"] != "ADMIN":
+                raise HTTPException(status_code=403, detail="Admin role required")
+            return {
+                "role": "admin",
+                "session_id": None,
+                "user_id": portal_user["id"],
+                "email": portal_user["email"],
+                "project_id": None,
+                "project_slug": None,
+                "user": dict(portal_user),
+            }
+
         session_id = decoded.get("sub")
         if not session_id:
             raise HTTPException(status_code=401, detail="Invalid bearer token")
         with engine.connect() as conn:
             row = conn.execute(
                 sa.text("""
-                    SELECT id::text, status FROM agent_sessions
-                    WHERE id = CAST(:sid AS UUID)
-                      AND session_key_hash = :khash
-                      AND status IN ('ONLINE', 'BUSY')
+                    SELECT s.id::text, s.status, s.user_id::text, s.project_id::text, p.project_slug
+                    FROM agent_sessions s
+                    LEFT JOIN harness_projects p ON p.id = s.project_id
+                    WHERE s.id = CAST(:sid AS UUID)
+                      AND s.session_key_hash = :khash
+                      AND s.status IN ('ONLINE', 'BUSY')
                 """),
                 {"sid": session_id, "khash": hash_token(token)}
             ).fetchone()
         if not row:
             raise HTTPException(status_code=401, detail="Session not active")
-        return {"role": "agent", "session_id": row[0], "status": row[1]}
+        return {
+            "role": "agent",
+            "session_id": row[0],
+            "status": row[1],
+            "user_id": row[2],
+            "project_id": row[3],
+            "project_slug": row[4],
+        }
 
     raise HTTPException(
         status_code=401,
@@ -134,6 +177,97 @@ def require_admin(auth: Dict[str, Any] = Depends(verify_auth)) -> Dict[str, Any]
     if auth.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin key required")
     return auth
+
+
+def _portal_auth_from_header(authorization: Optional[str]) -> Dict[str, Any]:
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Portal bearer token required")
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        decoded = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"],
+            options={"require": ["exp", "jti", "sub"]},
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid portal token")
+    if decoded.get("typ") != "portal":
+        raise HTTPException(status_code=401, detail="Invalid portal token")
+    with engine.connect() as conn:
+        user = conn.execute(
+            sa.text("""
+                SELECT id::text, email, full_name, role, status, default_skills
+                FROM harness_users
+                WHERE id = CAST(:uid AS UUID)
+            """),
+            {"uid": decoded.get("sub")}
+        ).mappings().fetchone()
+    if not user or user["status"] != "ACTIVE":
+        raise HTTPException(status_code=401, detail="User not active")
+    return {
+        "role": "admin" if user["role"] == "ADMIN" else "engineer",
+        "role_name": user["role"],
+        "user_id": user["id"],
+        "email": user["email"],
+        "user": dict(user),
+    }
+
+
+def verify_portal(authorization: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    return _portal_auth_from_header(authorization)
+
+
+def verify_portal_or_admin(
+    x_harness_admin_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    if ADMIN_API_KEY and x_harness_admin_key and hmac.compare_digest(x_harness_admin_key, ADMIN_API_KEY):
+        return {"role": "admin", "role_name": "ADMIN", "user_id": None, "email": None, "user": None}
+    return _portal_auth_from_header(authorization)
+
+
+def verify_portal_admin(
+    x_harness_admin_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    if ADMIN_API_KEY and x_harness_admin_key and hmac.compare_digest(x_harness_admin_key, ADMIN_API_KEY):
+        return {"role": "admin", "role_name": "ADMIN", "user_id": None, "email": None, "user": None}
+    auth = _portal_auth_from_header(authorization)
+    if auth["role_name"] != "ADMIN":
+        raise HTTPException(status_code=403, detail="Admin role required")
+    return auth
+
+
+def assert_repo_access(auth: Dict[str, Any], repo_name: str) -> None:
+    if auth.get("role") != "agent":
+        return
+    project_slug = auth.get("project_slug")
+    if project_slug and project_slug != repo_name:
+        raise HTTPException(status_code=403, detail="Cross-Project Isolation Violation")
+
+
+def assert_task_project_access(auth: Dict[str, Any], task_id: str) -> None:
+    if auth.get("role") != "agent":
+        return
+    project_id = auth.get("project_id")
+    if not project_id:
+        return
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.text("""
+                SELECT p.project_id::text
+                FROM harness_tasks t
+                JOIN feature_consensus_plans p ON p.id = t.plan_id
+                WHERE t.id = CAST(:tid AS UUID)
+            """),
+            {"tid": task_id}
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="task not found")
+    task_project = row[0]
+    if task_project and task_project != project_id:
+        raise HTTPException(status_code=403, detail="Cross-Project Isolation Violation")
 
 
 def cleanup_disconnected_sessions(conn, session_ids: List[str], target_status: str = "OFFLINE"):
@@ -577,7 +711,8 @@ def trigger_repo_index(payload: RepoIndexRequest):
 
 
 @app.get("/api/v1/repos/{repo_name}/map", dependencies=[Depends(verify_auth)])
-def get_repository_quick_map(repo_name: str):
+def get_repository_quick_map(repo_name: str, auth: Dict[str, Any] = Depends(verify_auth)):
+    assert_repo_access(auth, repo_name)
     with engine.connect() as conn:
         rows = conn.execute(
             sa.text("""
@@ -597,7 +732,8 @@ def get_repository_quick_map(repo_name: str):
 
 
 @app.post("/api/v1/context/pack", dependencies=[Depends(verify_auth)])
-def build_surgical_context_pack(payload: ContextPackRequest):
+def build_surgical_context_pack(payload: ContextPackRequest, auth: Dict[str, Any] = Depends(verify_auth)):
+    assert_repo_access(auth, payload.repo_name)
     """
     Construye un Context Pack quirurgico (< token_budget) combinando:
     1. El Mapa Rapido de archivos relevantes.
@@ -692,7 +828,8 @@ def build_surgical_context_pack(payload: ContextPackRequest):
 
 
 @app.post("/api/v1/guardrails/validate-symbols", dependencies=[Depends(verify_auth)])
-def validate_symbols_against_hallucination(payload: SymbolValidationRequest):
+def validate_symbols_against_hallucination(payload: SymbolValidationRequest, auth: Dict[str, Any] = Depends(verify_auth)):
+    assert_repo_access(auth, payload.repo_name)
     """Verifica si los metodos/clases que el agente intenta usar existen realmente en el AST del repositorio."""
     with engine.connect() as conn:
         rows = conn.execute(
@@ -763,6 +900,7 @@ class PlanProposeRequest(BaseModel):
     required_skills_hint: Optional[List[str]] = None
     plan_a_override: Optional[Dict[str, Any]] = None
     plan_b_override: Optional[Dict[str, Any]] = None
+    project_id: Optional[str] = None
 
 
 class TaskFailRequest(BaseModel):
@@ -779,6 +917,17 @@ class TaskSubmitRequest(BaseModel):
 
 @app.post("/api/v1/plans/propose", dependencies=[Depends(require_admin)])
 async def propose_dual_plan(payload: PlanProposeRequest):
+    project_id = payload.project_id
+    if project_id:
+        with engine.connect() as conn:
+            project = conn.execute(
+                sa.text("SELECT id::text, project_slug FROM harness_projects WHERE id = CAST(:pid AS UUID)"),
+                {"pid": project_id}
+            ).mappings().fetchone()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if project["project_slug"] != payload.repo_name:
+            raise HTTPException(status_code=400, detail="repo_name no coincide con el project_slug")
     try:
         with engine.begin() as conn:
             result = generate_dual_plans_and_synthesize(
@@ -789,6 +938,7 @@ async def propose_dual_plan(payload: PlanProposeRequest):
                 required_skills_hint=payload.required_skills_hint,
                 plan_a_override=payload.plan_a_override,
                 plan_b_override=payload.plan_b_override,
+                project_id=project_id,
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -953,6 +1103,7 @@ async def submit_task_endpoint(
     auth: Dict[str, Any] = Depends(verify_auth),
 ):
     session_id = auth.get("session_id") if auth["role"] == "agent" else None
+    assert_task_project_access(auth, task_id)
     try:
         result = await asyncio.to_thread(
             submit_task_changes,
@@ -1212,7 +1363,7 @@ async def relay_agent_message(payload: WarRoomRelayRequest, auth: Dict[str, Any]
     source_id = auth["session_id"]
     with engine.connect() as conn:
         target = conn.execute(
-            sa.text("SELECT id::text, status FROM agent_sessions WHERE id = CAST(:tid AS UUID)"),
+            sa.text("SELECT id::text, status, project_id::text AS project_id FROM agent_sessions WHERE id = CAST(:tid AS UUID)"),
             {"tid": payload.target_session_id}
         ).mappings().fetchone()
         link = conn.execute(
@@ -1226,6 +1377,8 @@ async def relay_agent_message(payload: WarRoomRelayRequest, auth: Dict[str, Any]
         ).fetchone()
     if not target or target["status"] not in ("ONLINE", "BUSY") or not link:
         raise HTTPException(status_code=403, detail="Link Not Authorized in War Room Topology")
+    if auth.get("project_id") and target.get("project_id") and auth["project_id"] != target["project_id"]:
+        raise HTTPException(status_code=403, detail="Cross-Project Isolation Violation")
 
     ws = active_connections.get(payload.target_session_id)
     delivered = False
@@ -1261,6 +1414,23 @@ async def relay_agent_message(payload: WarRoomRelayRequest, auth: Dict[str, Any]
     }
 
 
+def _is_portal_admin_token(token: str) -> bool:
+    try:
+        decoded = jwt.decode(
+            token, JWT_SECRET, algorithms=["HS256"], options={"require": ["exp", "jti", "sub"]}
+        )
+    except Exception:
+        return False
+    if decoded.get("typ") != "portal":
+        return False
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.text("SELECT role, status FROM harness_users WHERE id = CAST(:uid AS UUID)"),
+            {"uid": decoded.get("sub")}
+        ).fetchone()
+    return bool(row and row[0] == "ADMIN" and row[1] == "ACTIVE")
+
+
 @app.websocket("/ws/war-room")
 async def war_room_socket(websocket: WebSocket):
     header_key = websocket.headers.get("x-harness-admin-key") or ""
@@ -1270,11 +1440,17 @@ async def war_room_socket(websocket: WebSocket):
         try:
             first = await asyncio.wait_for(websocket.receive_json(), timeout=5)
         except Exception:
-            await websocket.close(code=4003, reason="Missing admin key")
+            await websocket.close(code=4003, reason="Missing admin credentials")
             return
-        candidate = first.get("admin_key") if isinstance(first, dict) and first.get("type") == "AUTH" else None
-        if not (candidate and ADMIN_API_KEY and hmac.compare_digest(str(candidate), ADMIN_API_KEY)):
-            await websocket.close(code=4003, reason="Invalid admin key")
+        if isinstance(first, dict) and first.get("type") == "AUTH":
+            candidate = first.get("admin_key")
+            portal_token = first.get("portal_token")
+            if candidate and ADMIN_API_KEY and hmac.compare_digest(str(candidate), ADMIN_API_KEY):
+                authorized = True
+            elif portal_token and _is_portal_admin_token(str(portal_token)):
+                authorized = True
+        if not authorized:
+            await websocket.close(code=4003, reason="Invalid admin credentials")
             return
     else:
         await websocket.accept()
@@ -1296,6 +1472,8 @@ async def war_room_socket(websocket: WebSocket):
 
 
 @app.get("/war-room", response_class=HTMLResponse)
+@app.get("/portal", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
 def war_room_page():
     return WAR_ROOM_HTML
 
@@ -1431,4 +1609,656 @@ async def reopen_task_from_main(task_id: str, auth: Dict[str, Any] = Depends(ver
         "allowed_files": allowed,
         "assigned_session_id": session_id,
         "reacquired_files": allowed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Etapa 7B - Portal: auth por correo, proyectos, membresias y sesiones 1:1
+# ---------------------------------------------------------------------------
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _valid_email(email: str) -> bool:
+    return bool(EMAIL_RE.fullmatch((email or "").strip().lower()))
+
+
+def _public_user(user) -> Dict[str, Any]:
+    item = dict(user)
+    item.pop("password_hash", None)
+    item.pop("invite_token", None)
+    return item
+
+
+def _issue_portal_token(user) -> str:
+    now = int(datetime.now(timezone.utc).timestamp())
+    payload = {
+        "sub": str(user["id"]),
+        "email": user["email"],
+        "role": user["role"],
+        "typ": "portal",
+        "iat": now,
+        "jti": str(uuid.uuid4()),
+        "exp": now + PORTAL_JWT_TTL_HOURS * 3600,
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+class PortalLoginRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=255)
+    password: str = Field(..., min_length=8, max_length=200)
+
+
+class PortalRegisterRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=255)
+    password: str = Field(..., min_length=8, max_length=200)
+    full_name: str = Field(..., min_length=2, max_length=150)
+    invite_token: Optional[str] = Field(default=None, max_length=128)
+
+
+class PortalSessionRequest(BaseModel):
+    project_id: str
+    agent_tool: str = Field(..., pattern="^(opencode|claudecode|cursor|hermes|pi|custom)$")
+    llm_provider: str = Field(..., min_length=2, max_length=100)
+    max_context_tokens: int = Field(default=32000, gt=1024)
+
+
+class ProjectCreateRequest(BaseModel):
+    project_slug: str = Field(..., min_length=2, max_length=150)
+    display_name: str = Field(..., min_length=2, max_length=200)
+    description: Optional[str] = None
+    repo_url: Optional[str] = None
+    default_branch: str = Field(default="main", max_length=80)
+
+
+class ProjectMemberRequest(BaseModel):
+    user_id: Optional[str] = None
+    email: Optional[str] = None
+    full_name: Optional[str] = Field(default=None, max_length=150)
+    password: Optional[str] = Field(default=None, min_length=8, max_length=200)
+    invite_token: Optional[str] = Field(default=None, max_length=128)
+    allowed_skills: List[str] = Field(default_factory=list)
+
+
+@app.post("/api/v1/auth/login")
+def portal_login(payload: PortalLoginRequest):
+    email = payload.email.strip().lower()
+    with engine.connect() as conn:
+        user = conn.execute(
+            sa.text("""
+                SELECT id::text, email, full_name, role, status, password_hash, default_skills
+                FROM harness_users WHERE email = :email
+            """),
+            {"email": email}
+        ).mappings().fetchone()
+    if not user or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if user["status"] != "ACTIVE":
+        raise HTTPException(status_code=403, detail="User not active")
+    token = _issue_portal_token(user)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in_hours": PORTAL_JWT_TTL_HOURS,
+        "user": _public_user(user),
+    }
+
+
+@app.post("/api/v1/auth/register-invite")
+def portal_register_invite(payload: PortalRegisterRequest):
+    email = payload.email.strip().lower()
+    if not _valid_email(email):
+        raise HTTPException(status_code=400, detail="Invalid email")
+    activated = False
+    with engine.begin() as conn:
+        user = conn.execute(
+            sa.text("""
+                SELECT id::text, email, full_name, role, status, invite_token, default_skills
+                FROM harness_users WHERE email = :email FOR UPDATE
+            """),
+            {"email": email}
+        ).mappings().fetchone()
+        if user:
+            if user["status"] == "ACTIVE":
+                raise HTTPException(status_code=409, detail="User already active")
+            if user["status"] == "DISABLED":
+                raise HTTPException(status_code=403, detail="User disabled")
+            if user["status"] == "INVITED":
+                if not payload.invite_token or not user["invite_token"] or not hmac.compare_digest(payload.invite_token, user["invite_token"]):
+                    raise HTTPException(status_code=403, detail="Invalid invite token")
+                conn.execute(
+                    sa.text("""
+                        UPDATE harness_users
+                        SET password_hash = :ph, full_name = :name, status = 'ACTIVE', invite_token = NULL
+                        WHERE id = CAST(:uid AS UUID)
+                    """),
+                    {"ph": hash_password(payload.password), "name": payload.full_name, "uid": user["id"]}
+                )
+                activated = True
+            elif user["status"] == "PENDING":
+                raise HTTPException(status_code=409, detail="Registration pending administrator approval")
+        else:
+            if payload.invite_token:
+                raise HTTPException(status_code=403, detail="Invalid invite token")
+            conn.execute(
+                sa.text("""
+                    INSERT INTO harness_users
+                        (id, email, full_name, password_hash, role, status, default_skills)
+                    VALUES
+                        (CAST(:id AS UUID), :email, :name, :ph, 'ENGINEER', 'PENDING', CAST('[]' AS JSONB))
+                """),
+                {
+                    "id": str(uuid.uuid4()),
+                    "email": email,
+                    "name": payload.full_name,
+                    "ph": hash_password(payload.password),
+                }
+            )
+
+    with engine.connect() as conn:
+        user = conn.execute(
+            sa.text("""
+                SELECT id::text, email, full_name, role, status, default_skills
+                FROM harness_users WHERE email = :email
+            """),
+            {"email": email}
+        ).mappings().fetchone()
+    if activated:
+        return {"status": "ACTIVE", "access_token": _issue_portal_token(user), "token_type": "bearer", "user": _public_user(user)}
+    return {"status": "PENDING", "user": _public_user(user), "message": "Awaiting administrator approval"}
+
+
+@app.get("/api/v1/auth/me")
+def portal_me(auth: Dict[str, Any] = Depends(verify_portal)):
+    uid = auth["user_id"]
+    with engine.connect() as conn:
+        projects = conn.execute(
+            sa.text("""
+                SELECT p.id::text, p.project_slug, p.display_name, p.description,
+                       p.default_branch, m.allowed_skills, m.status AS membership_status,
+                       m.created_at AS membership_created_at
+                FROM project_memberships m
+                JOIN harness_projects p ON p.id = m.project_id
+                WHERE m.user_id = CAST(:uid AS UUID) AND m.status = 'APPROVED'
+                ORDER BY p.project_slug
+            """),
+            {"uid": uid}
+        ).mappings().all()
+        sessions = conn.execute(
+            sa.text("""
+                SELECT s.id::text, s.project_id::text, p.project_slug, s.agent_tool,
+                       s.status, s.current_context_tokens, s.max_context_tokens, s.last_heartbeat
+                FROM agent_sessions s
+                JOIN harness_projects p ON p.id = s.project_id
+                WHERE s.user_id = CAST(:uid AS UUID) AND s.status IN ('ONLINE', 'BUSY')
+                ORDER BY p.project_slug, s.agent_tool
+            """),
+            {"uid": uid}
+        ).mappings().all()
+    return {
+        "user": auth["user"],
+        "projects": [dict(x) for x in projects],
+        "sessions": [dict(x) for x in sessions],
+    }
+
+
+@app.post("/api/v1/projects")
+def create_project(payload: ProjectCreateRequest, auth: Dict[str, Any] = Depends(verify_portal_admin)):
+    try:
+        slug = validate_repo_name(payload.project_slug)
+        repo_url = validate_repo_url(payload.repo_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", payload.default_branch):
+        raise HTTPException(status_code=400, detail="Invalid default_branch")
+    with engine.connect() as conn:
+        exists = conn.execute(sa.text("SELECT id FROM harness_projects WHERE project_slug = :slug"), {"slug": slug}).fetchone()
+    if exists:
+        raise HTTPException(status_code=409, detail="Project already exists")
+    try:
+        ensure_project_repo(slug, repo_url, payload.default_branch)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Repository setup failed: {exc}")
+    try:
+        index_result = index_repository(engine, slug)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Initial index failed: {exc}")
+
+    with engine.begin() as conn:
+        project = conn.execute(
+            sa.text("""
+                INSERT INTO harness_projects
+                    (id, project_slug, display_name, description, repo_url, default_branch, created_by_user_id)
+                VALUES
+                    (CAST(:id AS UUID), :slug, :display_name, :description, :repo_url, :branch, CAST(:created_by AS UUID))
+                RETURNING id::text, project_slug, display_name, description, repo_url, default_branch,
+                          created_by_user_id::text, created_at
+            """),
+            {
+                "id": str(uuid.uuid4()),
+                "slug": slug,
+                "display_name": payload.display_name,
+                "description": payload.description,
+                "repo_url": repo_url,
+                "branch": payload.default_branch,
+                "created_by": auth.get("user_id"),
+            }
+        ).mappings().fetchone()
+        if auth.get("user_id"):
+            conn.execute(
+                sa.text("""
+                    INSERT INTO project_memberships
+                        (id, project_id, user_id, approved_by_admin_id, allowed_skills, status)
+                    VALUES
+                        (CAST(:id AS UUID), CAST(:pid AS UUID), CAST(:uid AS UUID), CAST(:uid AS UUID),
+                         CAST('[]' AS JSONB), 'APPROVED')
+                    ON CONFLICT (project_id, user_id) DO NOTHING
+                """),
+                {"id": str(uuid.uuid4()), "pid": project["id"], "uid": auth["user_id"]}
+            )
+    return {"project": dict(project), "index": index_result}
+
+
+@app.get("/api/v1/projects")
+def list_projects(auth: Dict[str, Any] = Depends(verify_portal_or_admin)):
+    is_admin = auth["role_name"] == "ADMIN"
+    uid = auth.get("user_id")
+    with engine.connect() as conn:
+        if is_admin:
+            projects = conn.execute(sa.text("""
+                SELECT id::text, project_slug, display_name, description, repo_url, default_branch,
+                       created_by_user_id::text, created_at
+                FROM harness_projects ORDER BY project_slug
+            """)).mappings().all()
+        else:
+            projects = conn.execute(sa.text("""
+                SELECT p.id::text, p.project_slug, p.display_name, p.description, p.repo_url,
+                       p.default_branch, p.created_by_user_id::text, p.created_at,
+                       m.allowed_skills, m.status AS membership_status
+                FROM harness_projects p
+                JOIN project_memberships m ON m.project_id = p.id
+                WHERE m.user_id = CAST(:uid AS UUID) AND m.status = 'APPROVED'
+                ORDER BY p.project_slug
+            """), {"uid": uid}).mappings().all()
+
+        result = []
+        for project in projects:
+            item = dict(project)
+            if is_admin:
+                members = conn.execute(sa.text("""
+                    SELECT m.user_id::text, u.email, u.full_name, m.status, m.allowed_skills,
+                           m.approved_by_admin_id::text
+                    FROM project_memberships m
+                    JOIN harness_users u ON u.id = m.user_id
+                    WHERE m.project_id = CAST(:pid AS UUID) AND m.status = 'APPROVED'
+                    ORDER BY u.email
+                """), {"pid": project["id"]}).mappings().all()
+                sessions = conn.execute(sa.text("""
+                    SELECT s.id::text, s.user_id::text, u.email, s.agent_tool, s.status,
+                           s.current_context_tokens, s.max_context_tokens, s.last_heartbeat
+                    FROM agent_sessions s
+                    JOIN harness_users u ON u.id = s.user_id
+                    WHERE s.project_id = CAST(:pid AS UUID) AND s.status IN ('ONLINE', 'BUSY')
+                    ORDER BY u.email, s.agent_tool
+                """), {"pid": project["id"]}).mappings().all()
+            else:
+                members = conn.execute(sa.text("""
+                    SELECT m.user_id::text, u.email, u.full_name, m.status, m.allowed_skills,
+                           m.approved_by_admin_id::text
+                    FROM project_memberships m
+                    JOIN harness_users u ON u.id = m.user_id
+                    WHERE m.project_id = CAST(:pid AS UUID) AND m.user_id = CAST(:uid AS UUID)
+                """), {"pid": project["id"], "uid": uid}).mappings().all()
+                sessions = conn.execute(sa.text("""
+                    SELECT s.id::text, s.user_id::text, u.email, s.agent_tool, s.status,
+                           s.current_context_tokens, s.max_context_tokens, s.last_heartbeat
+                    FROM agent_sessions s
+                    JOIN harness_users u ON u.id = s.user_id
+                    WHERE s.project_id = CAST(:pid AS UUID) AND s.user_id = CAST(:uid AS UUID)
+                      AND s.status IN ('ONLINE', 'BUSY')
+                    ORDER BY s.agent_tool
+                """), {"pid": project["id"], "uid": uid}).mappings().all()
+            item["members"] = [dict(x) for x in members]
+            item["active_sessions"] = [dict(x) for x in sessions]
+            result.append(item)
+    return {"projects": result}
+
+
+@app.post("/api/v1/projects/{project_id}/members")
+def add_project_member(project_id: str, payload: ProjectMemberRequest, auth: Dict[str, Any] = Depends(verify_portal_admin)):
+    if bool(payload.user_id) == bool(payload.email):
+        raise HTTPException(status_code=400, detail="Provide exactly one of user_id or email")
+    initial_password = None
+    invite_token = None
+    with engine.begin() as conn:
+        project = conn.execute(
+            sa.text("SELECT id::text, project_slug FROM harness_projects WHERE id = CAST(:pid AS UUID) FOR UPDATE"),
+            {"pid": project_id}
+        ).mappings().fetchone()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        if payload.user_id:
+            user = conn.execute(
+                sa.text("""
+                    SELECT id::text, email, full_name, role, status, password_hash, invite_token, default_skills
+                    FROM harness_users WHERE id = CAST(:uid AS UUID) FOR UPDATE
+                """),
+                {"uid": payload.user_id}
+            ).mappings().fetchone()
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+        else:
+            email = payload.email.strip().lower()
+            if not _valid_email(email):
+                raise HTTPException(status_code=400, detail="Invalid email")
+            user = conn.execute(
+                sa.text("""
+                    SELECT id::text, email, full_name, role, status, password_hash, invite_token, default_skills
+                    FROM harness_users WHERE email = :email FOR UPDATE
+                """),
+                {"email": email}
+            ).mappings().fetchone()
+            if not user:
+                full_name = payload.full_name or email.split("@")[0]
+                if payload.password:
+                    ph = hash_password(payload.password)
+                    status = "ACTIVE"
+                elif payload.invite_token:
+                    invite_token = payload.invite_token
+                    ph = hash_password(secrets.token_urlsafe(32))
+                    status = "INVITED"
+                else:
+                    initial_password = secrets.token_urlsafe(12)
+                    ph = hash_password(initial_password)
+                    status = "ACTIVE"
+                conn.execute(
+                    sa.text("""
+                        INSERT INTO harness_users
+                            (id, email, full_name, password_hash, role, status, invite_token, default_skills)
+                        VALUES
+                            (CAST(:id AS UUID), :email, :name, :ph, 'ENGINEER', :status, :invite,
+                             CAST('[]' AS JSONB))
+                    """),
+                    {
+                        "id": str(uuid.uuid4()), "email": email, "name": full_name,
+                        "ph": ph, "status": status, "invite": invite_token,
+                    }
+                )
+                user = conn.execute(
+                    sa.text("""
+                        SELECT id::text, email, full_name, role, status, password_hash, invite_token, default_skills
+                        FROM harness_users WHERE email = :email
+                    """),
+                    {"email": email}
+                ).mappings().fetchone()
+
+        if user["status"] == "DISABLED":
+            raise HTTPException(status_code=403, detail="User disabled")
+        if payload.password:
+            conn.execute(
+                sa.text("UPDATE harness_users SET password_hash = :ph WHERE id = CAST(:uid AS UUID)"),
+                {"ph": hash_password(payload.password), "uid": user["id"]}
+            )
+        if payload.full_name:
+            conn.execute(
+                sa.text("UPDATE harness_users SET full_name = :name WHERE id = CAST(:uid AS UUID)"),
+                {"name": payload.full_name, "uid": user["id"]}
+            )
+        # PENDING: el admin aprueba y activa. INVITED: solo se activa cuando el
+        # ingeniero define contraseña (o recibe una contraseña inicial explicita).
+        if user["status"] == "PENDING" or (payload.password and user["status"] == "INVITED"):
+            conn.execute(
+                sa.text("""
+                    UPDATE harness_users
+                    SET status = 'ACTIVE', invite_token = NULL
+                    WHERE id = CAST(:uid AS UUID)
+                """),
+                {"uid": user["id"]}
+            )
+        elif payload.invite_token and user["status"] == "INVITED":
+            conn.execute(
+                sa.text("UPDATE harness_users SET invite_token = :inv WHERE id = CAST(:uid AS UUID)"),
+                {"inv": payload.invite_token, "uid": user["id"]}
+            )
+
+        membership = conn.execute(
+            sa.text("""
+                INSERT INTO project_memberships
+                    (id, project_id, user_id, approved_by_admin_id, allowed_skills, status)
+                VALUES
+                    (CAST(:id AS UUID), CAST(:pid AS UUID), CAST(:uid AS UUID),
+                     CAST(:approved_by AS UUID), CAST(:skills AS JSONB), 'APPROVED')
+                ON CONFLICT (project_id, user_id) DO UPDATE SET
+                    status = 'APPROVED',
+                    allowed_skills = EXCLUDED.allowed_skills,
+                    approved_by_admin_id = EXCLUDED.approved_by_admin_id
+                RETURNING id::text, project_id::text, user_id::text, allowed_skills, status, created_at
+            """),
+            {
+                "id": str(uuid.uuid4()), "pid": project_id, "uid": user["id"],
+                "approved_by": auth.get("user_id"), "skills": json.dumps(payload.allowed_skills),
+            }
+        ).mappings().fetchone()
+        user = conn.execute(
+            sa.text("""
+                SELECT id::text, email, full_name, role, status, default_skills
+                FROM harness_users WHERE id = CAST(:uid AS UUID)
+            """),
+            {"uid": user["id"]}
+        ).mappings().fetchone()
+
+    return {
+        "user": _public_user(user),
+        "membership": dict(membership),
+        "initial_password": initial_password,
+        "invite_token": invite_token,
+    }
+
+
+@app.delete("/api/v1/projects/{project_id}/members/{user_id}")
+async def remove_project_member(project_id: str, user_id: str, auth: Dict[str, Any] = Depends(verify_portal_admin)):
+    revoked_sessions = []
+    with engine.begin() as conn:
+        membership = conn.execute(
+            sa.text("""
+                SELECT id::text FROM project_memberships
+                WHERE project_id = CAST(:pid AS UUID) AND user_id = CAST(:uid AS UUID)
+                FOR UPDATE
+            """),
+            {"pid": project_id, "uid": user_id}
+        ).fetchone()
+        if not membership:
+            raise HTTPException(status_code=404, detail="Membership not found")
+        conn.execute(
+            sa.text("""
+                UPDATE project_memberships SET status = 'REVOKED'
+                WHERE project_id = CAST(:pid AS UUID) AND user_id = CAST(:uid AS UUID)
+            """),
+            {"pid": project_id, "uid": user_id}
+        )
+        rows = conn.execute(
+            sa.text("""
+                SELECT id::text FROM agent_sessions
+                WHERE user_id = CAST(:uid AS UUID) AND project_id = CAST(:pid AS UUID)
+                  AND status IN ('ONLINE', 'BUSY')
+            """),
+            {"pid": project_id, "uid": user_id}
+        ).fetchall()
+        revoked_sessions = [r[0] for r in rows]
+        for sid in revoked_sessions:
+            cleanup_disconnected_sessions(conn, [sid], target_status="REVOKED")
+
+    for sid in revoked_sessions:
+        ws = active_connections.pop(sid, None)
+        if ws:
+            try:
+                await ws.close(code=4003, reason="Project access revoked")
+            except Exception:
+                pass
+        await emit_war("SESSION_REVOKED", {"session_id": sid, "reason": "membership_revoked"}, source_session_id=sid)
+
+    return {"membership": "REVOKED", "revoked_sessions": revoked_sessions}
+
+
+@app.post("/api/v1/portal/sessions")
+async def create_portal_session(payload: PortalSessionRequest, auth: Dict[str, Any] = Depends(verify_portal)):
+    uid = auth["user_id"]
+    with engine.connect() as conn:
+        membership = conn.execute(
+            sa.text("""
+                SELECT m.allowed_skills, m.status, p.id::text AS project_id, p.project_slug
+                FROM project_memberships m
+                JOIN harness_projects p ON p.id = m.project_id
+                WHERE m.user_id = CAST(:uid AS UUID) AND m.project_id = CAST(:pid AS UUID)
+            """),
+            {"uid": uid, "pid": payload.project_id}
+        ).mappings().fetchone()
+    if not membership or membership["status"] != "APPROVED":
+        raise HTTPException(status_code=403, detail="Project Access Not Approved by Administrator")
+
+    skills = membership["allowed_skills"] or auth["user"].get("default_skills") or []
+    old_sessions = []
+    with engine.begin() as conn:
+        rows = conn.execute(
+            sa.text("""
+                SELECT id::text FROM agent_sessions
+                WHERE user_id = CAST(:uid AS UUID) AND project_id = CAST(:pid AS UUID)
+                  AND agent_tool = :tool AND status IN ('ONLINE', 'BUSY')
+            """),
+            {"uid": uid, "pid": payload.project_id, "tool": payload.agent_tool}
+        ).fetchall()
+        old_sessions = [r[0] for r in rows]
+        for sid in old_sessions:
+            cleanup_disconnected_sessions(conn, [sid], target_status="REVOKED")
+
+    for sid in old_sessions:
+        ws = active_connections.pop(sid, None)
+        if ws:
+            try:
+                await ws.close(code=4003, reason="Session replaced by portal rotation")
+            except Exception:
+                pass
+        await emit_war("SESSION_REVOKED", {"session_id": sid, "reason": "portal_session_rotated"}, source_session_id=sid)
+
+    session_id = str(uuid.uuid4())
+    now = int(datetime.now(timezone.utc).timestamp())
+    jwt_payload = {
+        "sub": session_id,
+        "user_id": uid,
+        "project_id": payload.project_id,
+        "project_slug": membership["project_slug"],
+        "email": auth["email"],
+        "tool": payload.agent_tool,
+        "iat": now,
+        "jti": str(uuid.uuid4()),
+        "exp": now + SESSION_JWT_TTL_HOURS * 3600,
+    }
+    session_key = jwt.encode(jwt_payload, JWT_SECRET, algorithm="HS256")
+    key_hash = hash_token(session_key)
+    vault = seal_secret(session_key)
+
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text("""
+                INSERT INTO agent_sessions (
+                    id, engineer_username, agent_tool, llm_provider, session_key_hash,
+                    skills, status, max_context_tokens, current_context_tokens,
+                    user_id, project_id, session_key_vault
+                ) VALUES (
+                    CAST(:id AS UUID), :user, :tool, :provider, :khash,
+                    CAST(:skills AS JSONB), 'ONLINE', :max_tok, 0,
+                    CAST(:uid AS UUID), CAST(:pid AS UUID), :vault
+                )
+            """),
+            {
+                "id": session_id,
+                "user": auth["email"],
+                "tool": payload.agent_tool,
+                "provider": payload.llm_provider,
+                "khash": key_hash,
+                "skills": json.dumps(skills),
+                "max_tok": payload.max_context_tokens,
+                "uid": uid,
+                "pid": payload.project_id,
+                "vault": vault,
+            }
+        )
+
+    await emit_war(
+        "SESSION_REGISTERED",
+        {
+            "session_id": session_id,
+            "user_id": uid,
+            "project_id": payload.project_id,
+            "project_slug": membership["project_slug"],
+            "agent_tool": payload.agent_tool,
+            "skills": skills,
+        },
+        source_session_id=session_id,
+    )
+    return {
+        "session_id": session_id,
+        "session_key": session_key,
+        "status": "ONLINE",
+        "project_id": payload.project_id,
+        "project_slug": membership["project_slug"],
+        "agent_tool": payload.agent_tool,
+        "skills": skills,
+        "max_context_tokens": payload.max_context_tokens,
+        "replaced_session_ids": old_sessions,
+        "ws_url": f"/ws/agent/{session_id}",
+    }
+
+
+@app.get("/api/v1/portal/sessions/{session_id}/config-bundle")
+def portal_session_config_bundle(session_id: str, auth: Dict[str, Any] = Depends(verify_portal_or_admin)):
+    with engine.connect() as conn:
+        session = conn.execute(
+            sa.text("""
+                SELECT s.id::text, s.user_id::text, s.agent_tool, s.status, s.session_key_vault,
+                       p.project_slug
+                FROM agent_sessions s
+                JOIN harness_projects p ON p.id = s.project_id
+                WHERE s.id = CAST(:sid AS UUID)
+            """),
+            {"sid": session_id}
+        ).mappings().fetchone()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if auth["role_name"] != "ADMIN" and session["user_id"] != auth.get("user_id"):
+        raise HTTPException(status_code=403, detail="Session belongs to another user")
+    if session["status"] == "REVOKED":
+        raise HTTPException(status_code=409, detail="Session revoked; create a new session")
+    session_key = open_secret(session["session_key_vault"] or "")
+    if not session_key:
+        raise HTTPException(status_code=409, detail="Session key unavailable; recreate the session")
+
+    env = {
+        "HARNESS_URL": HARNESS_PUBLIC_URL,
+        "HARNESS_SESSION_ID": session_id,
+        "HARNESS_SESSION_KEY": session_key,
+        "HARNESS_PROJECT_SLUG": session["project_slug"],
+    }
+    cursor = {"mcpServers": {"harness": {"command": "python", "args": ["harness_mcp_bridge.py"], "env": env}}}
+    claude = {"mcpServers": {"harness": {"command": "python", "args": ["harness_mcp_bridge.py"], "env": env}}}
+    opencode = {"mcp": {"servers": {"harness": {
+        "type": "local",
+        "command": ["python", "harness_mcp_bridge.py"],
+        "environment": env,
+    }}}}
+    hermes = "\n".join(f"export {key}={value}" for key, value in env.items())
+    download = f"curl -fsSL {HARNESS_PUBLIC_URL}/api/v1/client/bridge.py -o harness_mcp_bridge.py"
+
+    return {
+        "session_id": session_id,
+        "project_slug": session["project_slug"],
+        "agent_tool": session["agent_tool"],
+        "env": env,
+        "cursor_mcp_json": json.dumps(cursor, indent=2),
+        "claudecode_mcp_json": json.dumps(claude, indent=2),
+        "opencode_json": json.dumps(opencode, indent=2),
+        "hermes_cli_env": hermes,
+        "bridge_download_command": download,
     }

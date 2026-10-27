@@ -26,7 +26,7 @@ ALLOWED_GIT_HOSTS = {
 }
 
 IGNORED_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build", "target", ".idea", ".vscode"}
-SUPPORTED_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".go", ".sql"}
+SUPPORTED_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".go", ".sql", ".md"}
 
 # El API no tiene autenticacion todavia: repo_name se usa como ruta de disco y repo_url
 # lo consume `git clone`, asi que ambos se validan antes de tocar el filesystem.
@@ -243,6 +243,53 @@ def parse_generic_code(source: str, ext: str) -> Dict[str, Any]:
                     "snippet": snippet[:4000]
                 })
     return {"imports": sorted(list(set(imports))), "symbols": symbols}
+
+
+def ensure_project_repo(repo_name: str, repo_url: Optional[str] = None, branch: str = "main") -> Path:
+    """Crea/clona el repo del proyecto y garantiza que exista un HEAD (README inicial)."""
+    with repo_lock(repo_name):
+        return _ensure_project_repo_locked(repo_name, repo_url, branch)
+
+
+def _ensure_project_repo_locked(repo_name: str, repo_url: Optional[str] = None, branch: str = "main") -> Path:
+    repo_name = validate_repo_name(repo_name)
+    repo_url = validate_repo_url(repo_url)
+
+    REPOS_BASE_DIR.mkdir(parents=True, exist_ok=True)
+    base = REPOS_BASE_DIR.resolve()
+    repo_path = (base / repo_name).resolve()
+    if repo_path.parent != base:
+        raise ValueError("repo_name fuera del directorio permitido")
+
+    if repo_url:
+        if not repo_path.exists():
+            _run_git(["git", "clone", "-b", branch, repo_url, str(repo_path)])
+        else:
+            _run_git(["git", "fetch", "--all"], cwd=str(repo_path), check=False)
+            _run_git(["git", "checkout", branch], cwd=str(repo_path), check=False)
+    else:
+        if not repo_path.exists():
+            repo_path.mkdir(parents=True, exist_ok=True)
+        if not (repo_path / ".git").exists():
+            _run_git(["git", "init", "-b", branch], cwd=str(repo_path))
+        else:
+            _run_git(["git", "checkout", branch], cwd=str(repo_path), check=False)
+
+    head = _run_git(["git", "rev-parse", "--verify", "HEAD"], cwd=str(repo_path), check=False)
+    if head.returncode != 0:
+        readme = repo_path / "README.md"
+        if not readme.exists():
+            readme.write_text(
+                f"# {repo_name}\n\nProyecto gestionado por Harness Control Plane.\n",
+                encoding="utf-8",
+            )
+        _run_git(["git", "add", "README.md"], cwd=str(repo_path))
+        _run_git(
+            ["git", "-c", "user.name=Harness Control Plane", "-c", "user.email=harness@controlplane.local",
+             "commit", "-m", "initial commit"],
+            cwd=str(repo_path),
+        )
+    return repo_path
 
 
 def ensure_git_repo(repo_name: str, repo_url: Optional[str], branch: str) -> Path:
