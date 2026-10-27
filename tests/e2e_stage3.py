@@ -202,7 +202,7 @@ async def main():
         "POST",
         f"/api/v1/tasks/{task1['task_id']}/complete",
         {"commit_sha": "deadbeef", "modified_files": ["archivo_prohibido.py"], "summary": "probe"},
-        bearer=s3["session_key"],
+        admin=True,
     )
     print("complete con archivo prohibido:", st, violation)
     assert st == 403 and "Contract" in json.dumps(violation)
@@ -212,7 +212,7 @@ async def main():
         "POST",
         f"/api/v1/tasks/{task1['task_id']}/complete",
         {"commit_sha": "cafebabe", "modified_files": task1["allowed_files"], "summary": "e2e ok"},
-        bearer=s3["session_key"],
+        admin=True,
     )
     print("complete valido:", st, completed)
     assert st == 200 and completed["status"] == "MERGED"

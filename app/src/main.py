@@ -5,15 +5,22 @@ import hashlib
 import hmac
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, List, Dict, Optional
 
 import jwt
 import sqlalchemy as sa
-from fastapi import Depends, FastAPI, Header, WebSocket, WebSocketDisconnect, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, WebSocket, WebSocketDisconnect, HTTPException
 from pydantic import BaseModel, Field
 
 from src.indexer import index_repository, compute_embedding_768
+from src.git_guardian import (
+    GitBarrierError,
+    GitTaskPermissionError,
+    cleanup_task_worktree,
+    prepare_worktree_for_task,
+    submit_task_changes,
+)
 from src.orchestrator import (
     ContractViolation,
     TaskPermissionError,
@@ -29,6 +36,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("HARNESS_JWT_SECRET", "change-me-secret")
 HEARTBEAT_TIMEOUT = int(os.getenv("HEARTBEAT_TIMEOUT_SECONDS", "10"))
 MAX_CONTEXT_RATIO = float(os.getenv("MAX_CONTEXT_RATIO", "0.65"))
+SESSION_JWT_TTL_HOURS = int(os.getenv("SESSION_JWT_TTL_HOURS", "12"))
 
 engine = sa.create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10, max_overflow=20)
 
@@ -179,6 +187,7 @@ def health_check():
         "service": "harness-control-plane",
         "heartbeat_timeout_seconds": HEARTBEAT_TIMEOUT,
         "max_context_ratio": MAX_CONTEXT_RATIO,
+        "session_jwt_ttl_hours": SESSION_JWT_TTL_HOURS,
         "active_ws_connections": len(active_connections),
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
@@ -192,7 +201,9 @@ def register_agent_session(payload: SessionRegisterRequest):
         "sub": session_id,
         "user": payload.engineer_username,
         "tool": payload.agent_tool,
-        "iat": now_ts
+        "iat": now_ts,
+        "jti": str(uuid.uuid4()),
+        "exp": now_ts + SESSION_JWT_TTL_HOURS * 3600,
     }
     session_key = jwt.encode(jwt_payload, JWT_SECRET, algorithm="HS256")
     key_hash = hash_token(session_key)
@@ -273,18 +284,16 @@ async def revoke_session(session_id: str, auth: Dict[str, Any] = Depends(verify_
 
 
 @app.websocket("/ws/agent/{session_id}")
-async def agent_heartbeat_ws(websocket: WebSocket, session_id: str, token: Optional[str] = Query(default=None)):
-    # 1. Token por query (fallback legado), header Authorization o primer mensaje AUTH.
+async def agent_heartbeat_ws(websocket: WebSocket, session_id: str):
+    # 1. Solo header Authorization o primer mensaje AUTH. Sin ?token= (evita fugas en logs).
     pre_accepted = False
-    if not token:
-        auth_header = websocket.headers.get("authorization") or ""
-        if auth_header.lower().startswith("bearer "):
-            token = auth_header.split(" ", 1)[1].strip()
+    auth_header = websocket.headers.get("authorization") or ""
+    token = auth_header.split(" ", 1)[1].strip() if auth_header.lower().startswith("bearer ") else None
     if not token:
         await websocket.accept()
         pre_accepted = True
         try:
-            first = await asyncio.wait_for(websocket.receive_json(), timeout=10)
+            first = await asyncio.wait_for(websocket.receive_json(), timeout=5)
         except Exception:
             await websocket.close(code=4003, reason="Missing session_key")
             return
@@ -628,6 +637,12 @@ class TaskFailRequest(BaseModel):
     release: bool = True
 
 
+class TaskSubmitRequest(BaseModel):
+    file_changes: Optional[Dict[str, str]] = None
+    unified_diff: Optional[str] = None
+    commit_message: str = Field(default="", max_length=500)
+
+
 @app.post("/api/v1/plans/propose", dependencies=[Depends(require_admin)])
 def propose_dual_plan(payload: PlanProposeRequest):
     try:
@@ -667,7 +682,10 @@ def list_tasks(
     status: Optional[str] = None,
     plan_id: Optional[str] = None,
     assigned_session_id: Optional[str] = None,
+    auth: Dict[str, Any] = Depends(verify_auth),
 ):
+    if auth["role"] == "agent":
+        assigned_session_id = auth["session_id"]
     clauses = []
     params: Dict[str, Any] = {}
     if status:
@@ -696,13 +714,12 @@ def list_tasks(
     return {"tasks": [dict(r) for r in rows]}
 
 
-@app.post("/api/v1/tasks/{task_id}/complete")
+@app.post("/api/v1/tasks/{task_id}/complete", dependencies=[Depends(require_admin)], deprecated=True)
 async def complete_task_endpoint(
     task_id: str,
     payload: TaskCompleteRequest,
-    auth: Dict[str, Any] = Depends(verify_auth),
 ):
-    session_id = auth.get("session_id") if auth["role"] == "agent" else None
+    session_id = None
     try:
         with engine.begin() as conn:
             result = complete_task(
@@ -726,6 +743,23 @@ async def complete_task_endpoint(
             await ws.send_json({"event": "CLEAR_LLM_CONTEXT", "task_id": task_id})
         except Exception:
             pass
+
+    # /complete es legado (solo admin): limpia el worktree efimero si existiera.
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.text("""
+                    SELECT t.git_branch, p.master_plan_c_json->>'repo_name' AS repo_name
+                    FROM harness_tasks t
+                    JOIN feature_consensus_plans p ON p.id = t.plan_id
+                    WHERE t.id = CAST(:tid AS UUID)
+                """),
+                {"tid": task_id}
+            ).mappings().fetchone()
+        if row and row["repo_name"]:
+            cleanup_task_worktree(row["repo_name"], task_id, row["git_branch"])
+    except Exception:
+        pass
 
     return result
 
@@ -752,7 +786,75 @@ async def fail_task_endpoint(
     except TaskPermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
 
+    if result["released"]:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    sa.text("""
+                        SELECT t.git_branch, p.master_plan_c_json->>'repo_name' AS repo_name
+                        FROM harness_tasks t
+                        JOIN feature_consensus_plans p ON p.id = t.plan_id
+                        WHERE t.id = CAST(:tid AS UUID)
+                    """),
+                    {"tid": task_id}
+                ).mappings().fetchone()
+            if row and row["repo_name"]:
+                cleanup_task_worktree(row["repo_name"], task_id, row["git_branch"])
+        except Exception:
+            pass
+
     if result["released"] and result["assigned_session_id"]:
+        ws = active_connections.get(result["assigned_session_id"])
+        if ws:
+            try:
+                await ws.send_json({"event": "CLEAR_LLM_CONTEXT", "task_id": task_id})
+            except Exception:
+                pass
+
+    return result
+
+
+@app.post("/api/v1/tasks/{task_id}/worktree", dependencies=[Depends(require_admin)])
+def prepare_worktree_endpoint(task_id: str):
+    try:
+        return prepare_worktree_for_task(engine, task_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except GitBarrierError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"error": exc.code, "message": exc.message, **exc.details}
+        )
+
+
+@app.post("/api/v1/tasks/{task_id}/submit")
+async def submit_task_endpoint(
+    task_id: str,
+    payload: TaskSubmitRequest,
+    auth: Dict[str, Any] = Depends(verify_auth),
+):
+    session_id = auth.get("session_id") if auth["role"] == "agent" else None
+    try:
+        result = await asyncio.to_thread(
+            submit_task_changes,
+            engine,
+            task_id,
+            session_id,
+            payload.file_changes,
+            payload.unified_diff,
+            payload.commit_message,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except GitTaskPermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except GitBarrierError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"error": exc.code, "message": exc.message, **exc.details}
+        )
+
+    if result["assigned_session_id"]:
         ws = active_connections.get(result["assigned_session_id"])
         if ws:
             try:

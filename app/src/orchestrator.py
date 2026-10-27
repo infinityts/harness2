@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional
 import sqlalchemy as sa
 
 from src.indexer import compute_embedding_768
+from src.git_guardian import cleanup_task_worktree, prepare_task_worktree
 
 
 class ContractViolation(Exception):
@@ -404,6 +405,12 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
                 {"tid": task["task_id"], "rname": repo_name, "afiles": allowed_files}
             )
 
+        try:
+            worktree_path = prepare_task_worktree(repo_name, task["task_id"], task["git_branch"])
+        except Exception:
+            cleanup_task_worktree(repo_name, task["task_id"], task["git_branch"])
+            raise
+
         dispatched.append({
             "task_id": task["task_id"],
             "plan_id": task["plan_id"],
@@ -411,6 +418,7 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
             "git_branch": task["git_branch"],
             "allowed_files": allowed_files,
             "repo_name": repo_name,
+            "worktree": str(worktree_path),
             "assigned_to": {
                 "session_id": agent["session_id"],
                 "engineer_username": agent["engineer_username"],
