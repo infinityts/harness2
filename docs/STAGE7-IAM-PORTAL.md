@@ -10,6 +10,7 @@ aislamiento estricto por proyecto y una interfaz web unificada en `/portal` y
 | --- | --- |
 | `0005` | `harness_users`, `harness_projects`, `project_memberships`; columnas `agent_sessions.user_id/project_id` y `feature_consensus_plans.project_id`; seed del admin y de `harness-self`. |
 | `0006` | `agent_sessions.session_key_vault` para poder regenerar el config-bundle de una sesión sin guardar la clave en claro. |
+| `0007` | `system_smtp_config` y `email_dispatch_logs` para correo transaccional y auditoría. Ver [`STAGE7-SMTP.md`](./STAGE7-SMTP.md). |
 
 La clave de sesión se cifra con SHA-256-CTR + HMAC-SHA256 usando
 `HARNESS_VAULT_SECRET` (o `HARNESS_JWT_SECRET` si no se define). Solo se descifra
@@ -106,10 +107,11 @@ podman cp tests/e2e_stage7.py harness-app:/tmp/e2e_stage7.py
 podman exec harness-app python /tmp/e2e_stage7.py
 ```
 
-La prueba valida migración 0005/0006, login de admin, creación de `proj-alpha` y
+La prueba valida migración 0005/0006/0007, login de admin, creación de `proj-alpha` y
 `proj-beta` con commit inicial e índice, alta de `dev1@empresa.com`, aislamiento
 403, config-bundle, segunda sesión por proyecto, dispatch 1:1 y los breakpoints
-del portal.
+del portal. `tests/e2e_stage7_smtp.py` cubre configuración SMTP, cifrado,
+correo de prueba, fallo auditado y correo de invitación.
 
 ## Operación y seguridad
 

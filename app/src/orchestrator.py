@@ -273,10 +273,11 @@ def generate_dual_plans_and_synthesize(
             sa.text("""
                 INSERT INTO harness_tasks (
                     id, plan_id, title, required_skills, git_branch,
-                    allowed_files, allow_dependency_changes, status
+                    allowed_files, allow_dependency_changes, status, created_at
                 ) VALUES (
                     CAST(:tid AS UUID), CAST(:pid AS UUID), :title,
-                    CAST(:skills AS JSONB), :branch, CAST(:afiles AS JSONB), :allow_dep, 'PENDING'
+                    CAST(:skills AS JSONB), :branch, CAST(:afiles AS JSONB), :allow_dep,
+                    'PENDING', clock_timestamp()
                 )
             """),
             {

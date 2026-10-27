@@ -91,8 +91,11 @@ Regresiones: Stage 1, 3, 4, 5 y 6 siguen pasando con el esquema nuevo.
 users 1 | projects 1 | memberships 1
 sessions 0 | tasks 0 | plans 0
 files 7
-alembic 0006 (head)
+alembic 0007 (head)
 ```
+
+La revisión `0007` agrega SMTP y auditoría de correos; ver
+[`STAGE7-SMTP.md`](./STAGE7-SMTP.md).
 
 Commit Parte A: `ca68e8d` (`feat: stage 7a IAM/projects governance migration and seeds`).
 

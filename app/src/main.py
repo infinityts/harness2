@@ -12,7 +12,7 @@ from typing import Any, List, Dict, Optional
 
 import jwt
 import sqlalchemy as sa
-from fastapi import Depends, FastAPI, Header, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, Query, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from pathlib import Path
@@ -25,6 +25,7 @@ from src.indexer import (
     validate_repo_url,
 )
 from src.security import hash_password, open_secret, seal_secret, verify_password
+from src.mailer import render_project_invite, send_transactional_email
 from src.git_guardian import (
     GitBarrierError,
     GitTaskPermissionError,
@@ -1926,7 +1927,7 @@ def list_projects(auth: Dict[str, Any] = Depends(verify_portal_or_admin)):
 
 
 @app.post("/api/v1/projects/{project_id}/members")
-def add_project_member(project_id: str, payload: ProjectMemberRequest, auth: Dict[str, Any] = Depends(verify_portal_admin)):
+def add_project_member(project_id: str, payload: ProjectMemberRequest, background: BackgroundTasks, auth: Dict[str, Any] = Depends(verify_portal_admin)):
     if bool(payload.user_id) == bool(payload.email):
         raise HTTPException(status_code=400, detail="Provide exactly one of user_id or email")
     initial_password = None
@@ -2049,11 +2050,43 @@ def add_project_member(project_id: str, payload: ProjectMemberRequest, auth: Dic
             {"uid": user["id"]}
         ).mappings().fetchone()
 
+    with engine.connect() as conn:
+        approved_projects = conn.execute(
+            sa.text("""
+                SELECT p.project_slug, p.display_name, m.allowed_skills
+                FROM project_memberships m
+                JOIN harness_projects p ON p.id = m.project_id
+                WHERE m.user_id = CAST(:uid AS UUID) AND m.status = 'APPROVED'
+                ORDER BY p.project_slug
+            """),
+            {"uid": user["id"]}
+        ).mappings().all()
+
+    recipient = user["email"]
+    subject = f"Acceso aprobado: {project['project_slug']} - Harness Control Plane"
+    html_body = render_project_invite(
+        f"{HARNESS_PUBLIC_URL}/portal",
+        recipient,
+        [dict(p) for p in approved_projects],
+        initial_password=initial_password or payload.password,
+        invite_token=invite_token,
+    )
+    background.add_task(
+        send_transactional_email,
+        engine,
+        recipient,
+        subject,
+        html_body,
+        "project_invite",
+    )
+
     return {
         "user": _public_user(user),
         "membership": dict(membership),
         "initial_password": initial_password,
         "invite_token": invite_token,
+        "email_queued": True,
+        "email_recipient": recipient,
     }
 
 
@@ -2262,3 +2295,155 @@ def portal_session_config_bundle(session_id: str, auth: Dict[str, Any] = Depends
         "hermes_cli_env": hermes,
         "bridge_download_command": download,
     }
+
+
+# ---------------------------------------------------------------------------
+# Etapa 7 SMTP - configuracion global, test y auditoria de correos
+# ---------------------------------------------------------------------------
+class SmtpConfigRequest(BaseModel):
+    host: str = Field(..., min_length=1, max_length=255)
+    port: int = Field(..., ge=1, le=65535)
+    username: Optional[str] = Field(default=None, max_length=255)
+    password: Optional[str] = Field(default=None, max_length=120)
+    from_email: str = Field(..., min_length=3, max_length=255)
+    use_tls: bool = True
+    use_ssl: bool = False
+    test_recipient: Optional[str] = Field(default=None, max_length=255)
+
+
+class SmtpTestRequest(BaseModel):
+    recipient: Optional[str] = Field(default=None, max_length=255)
+
+
+def _smtp_config_response(row) -> Dict[str, Any]:
+    return {
+        "host": row["host"],
+        "port": row["port"],
+        "username": row["username"],
+        "password_set": bool(row["password"]),
+        "from_email": row["from_email"],
+        "use_tls": row["use_tls"],
+        "use_ssl": row["use_ssl"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _smtp_test_html() -> str:
+    return f"""<!doctype html>
+<html lang="es"><body style="font-family:Segoe UI,Arial,sans-serif;background:#f1f5f9;padding:24px;">
+  <div style="max-width:560px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;padding:24px;">
+    <div style="color:#0284c7;font-size:12px;font-weight:800;letter-spacing:.10em;text-transform:uppercase;">Harness Control Plane</div>
+    <h1 style="font-size:21px;margin:8px 0 10px;">Correo de prueba SMTP</h1>
+    <p style="margin:0 0 12px;">Si recibes este mensaje, la configuracion SMTP del servidor funciona correctamente.</p>
+    <p style="margin:0;"><a href="{HARNESS_PUBLIC_URL}/portal" style="color:#0284c7;">{HARNESS_PUBLIC_URL}/portal</a></p>
+  </div>
+</body></html>"""
+
+
+@app.get("/api/v1/admin/smtp-config")
+def get_admin_smtp_config(auth: Dict[str, Any] = Depends(verify_portal_admin)):
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.text("""
+                SELECT host, port, username, password, from_email, use_tls, use_ssl, updated_at
+                FROM system_smtp_config WHERE id = 1
+            """)
+        ).mappings().fetchone()
+    if not row:
+        return {
+            "host": "smtp.gmail.com", "port": 587, "username": None, "password_set": False,
+            "from_email": "harness-bot@controlplane.local", "use_tls": True, "use_ssl": False,
+            "updated_at": None,
+        }
+    return _smtp_config_response(row)
+
+
+@app.put("/api/v1/admin/smtp-config")
+async def update_admin_smtp_config(payload: SmtpConfigRequest, auth: Dict[str, Any] = Depends(verify_portal_admin)):
+    host = payload.host.strip()
+    from_email = payload.from_email.strip().lower()
+    recipient = (payload.test_recipient or "").strip().lower()
+    if payload.use_tls and payload.use_ssl:
+        raise HTTPException(status_code=400, detail="use_tls y use_ssl son mutuamente excluyentes")
+    if not _valid_email(from_email):
+        raise HTTPException(status_code=400, detail="from_email invalido")
+    if recipient and not _valid_email(recipient):
+        raise HTTPException(status_code=400, detail="test_recipient invalido")
+    username = (payload.username or "").strip() or None
+    incoming_password = payload.password
+
+    with engine.begin() as conn:
+        existing = conn.execute(
+            sa.text("SELECT password FROM system_smtp_config WHERE id = 1 FOR UPDATE")
+        ).fetchone()
+        if incoming_password is None:
+            stored_password = existing[0] if existing else None
+        elif incoming_password == "":
+            stored_password = None
+        else:
+            stored_password = "vault:" + seal_secret(incoming_password)
+
+        row = conn.execute(
+            sa.text("""
+                INSERT INTO system_smtp_config
+                    (id, host, port, username, password, from_email, use_tls, use_ssl, updated_at)
+                VALUES
+                    (1, :host, :port, :username, :password, :from_email, :use_tls, :use_ssl, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    host = EXCLUDED.host,
+                    port = EXCLUDED.port,
+                    username = EXCLUDED.username,
+                    password = EXCLUDED.password,
+                    from_email = EXCLUDED.from_email,
+                    use_tls = EXCLUDED.use_tls,
+                    use_ssl = EXCLUDED.use_ssl,
+                    updated_at = NOW()
+                RETURNING host, port, username, password, from_email, use_tls, use_ssl, updated_at
+            """),
+            {
+                "host": host, "port": payload.port, "username": username,
+                "password": stored_password, "from_email": from_email,
+                "use_tls": payload.use_tls, "use_ssl": payload.use_ssl,
+            }
+        ).mappings().fetchone()
+
+    test_sent = None
+    if recipient:
+        test_sent = await asyncio.to_thread(
+            send_transactional_email, engine, recipient,
+            "Harness Control Plane - Correo de prueba", _smtp_test_html(), "smtp_test",
+        )
+    response = _smtp_config_response(row)
+    response["test_sent"] = test_sent
+    return response
+
+
+@app.post("/api/v1/admin/smtp-config/test")
+async def test_admin_smtp_config(payload: SmtpTestRequest, auth: Dict[str, Any] = Depends(verify_portal_admin)):
+    recipient = (payload.recipient or auth.get("email") or "").strip().lower()
+    if not recipient or not _valid_email(recipient):
+        raise HTTPException(status_code=400, detail="recipient invalido")
+    sent = await asyncio.to_thread(
+        send_transactional_email, engine, recipient,
+        "Harness Control Plane - Correo de prueba", _smtp_test_html(), "smtp_test",
+    )
+    return {"sent": sent, "recipient": recipient}
+
+
+@app.get("/api/v1/admin/email-logs")
+def list_admin_email_logs(
+    limit: int = Query(default=50, ge=1, le=200),
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.text("""
+                SELECT id::text, recipient, subject, template_name, status,
+                       error_message, sent_at
+                FROM email_dispatch_logs
+                ORDER BY sent_at DESC
+                LIMIT :limit
+            """),
+            {"limit": limit}
+        ).mappings().all()
+    return {"logs": [dict(r) for r in rows]}

@@ -431,6 +431,48 @@ WAR_ROOM_HTML = r"""<!doctype html>
           </div>
         </section>
 
+        <section id="viewSmtp" class="view hidden">
+          <div class="view-head">
+            <div><h1>SMTP y Notificaciones</h1><p>Configura el correo transaccional y verifica las credenciales antes de invitar ingenieros.</p></div>
+            <div class="spacer"></div>
+            <span id="smtpPasswordState" class="pill">Sin password</span>
+          </div>
+          <div class="grid-2" style="align-items:start">
+            <div class="card stack">
+              <h3>Configuración SMTP</h3>
+              <div class="form-grid">
+                <div class="field"><label for="smtpHost">Host</label><input id="smtpHost" placeholder="smtp.gmail.com"></div>
+                <div class="field"><label for="smtpPort">Puerto</label><input id="smtpPort" type="number" min="1" max="65535" value="587"></div>
+                <div class="field"><label for="smtpUser">Usuario</label><input id="smtpUser" autocomplete="off" placeholder="cuenta@gmail.com"></div>
+                <div class="field"><label for="smtpPass">Contraseña / App password</label><input id="smtpPass" type="password" autocomplete="new-password" placeholder="Dejar vacío para conservar"></div>
+                <div class="field"><label for="smtpFrom">From email</label><input id="smtpFrom" type="email" placeholder="harness-bot@controlplane.local"></div>
+                <div class="field"><label for="smtpTestTo">Test recipient</label><input id="smtpTestTo" type="email" placeholder="admin@empresa.com"></div>
+              </div>
+              <div class="row">
+                <label class="check-row" style="flex:1"><input id="smtpTls" type="checkbox" checked><span>TLS (587)</span></label>
+                <label class="check-row" style="flex:1"><input id="smtpSsl" type="checkbox"><span>SSL (465)</span></label>
+              </div>
+              <div class="row">
+                <button id="smtpSave" class="btn" type="button">Guardar Configuración</button>
+                <button id="smtpSaveTest" class="btn primary" type="button">Guardar y Enviar Test</button>
+                <button id="smtpTest" class="btn" type="button">Solo Enviar Test</button>
+              </div>
+              <div id="smtpStatus" class="result-box hidden"></div>
+              <div class="login-note">La contraseña se guarda cifrada en el vault del servidor y nunca se devuelve al navegador.</div>
+            </div>
+            <div class="card stack">
+              <h3>Auditoría de correos</h3>
+              <div class="row"><button id="smtpLogsRefresh" class="btn sm" type="button">Refrescar</button><span id="smtpLogsCount" class="muted" style="font-size:12px"></span></div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Destinatario</th><th>Plantilla</th><th>Asunto</th><th>Estado</th><th>Enviado</th></tr></thead>
+                  <tbody id="smtpLogsBody"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
         <section id="viewMyProjects" class="view hidden">
           <div class="view-head">
             <div><h1>Mis Proyectos Aprobados</h1><p>Una sesión independiente por proyecto. Tu configuración MCP lista para copiar.</p></div>
@@ -523,6 +565,7 @@ function navItems() {
       { id:"projects", icon:"▦", label:"Proyectos", bottom:"Proyectos" },
       { id:"engineers", icon:"☺", label:"Ingenieros y Accesos", bottom:"Equipo" },
       { id:"warroom", icon:"◎", label:"Sala de Control", bottom:"War Room" },
+      { id:"smtp", icon:"✉", label:"SMTP y Correos", bottom:"SMTP" },
     ];
   }
   return [{ id:"myprojects", icon:"▤", label:"Mis Proyectos", bottom:"Proyectos" }];
@@ -539,15 +582,16 @@ function buildNav() {
 
 function setView(name) {
   state.activeView = name;
-  const views = { projects:"viewProjects", engineers:"viewEngineers", warroom:"viewWarRoom", myprojects:"viewMyProjects" };
+  const views = { projects:"viewProjects", engineers:"viewEngineers", warroom:"viewWarRoom", smtp:"viewSmtp", myprojects:"viewMyProjects" };
   Object.values(views).forEach(id => $(id).classList.add("hidden"));
   if (views[name]) $(views[name]).classList.remove("hidden");
   document.querySelectorAll("[data-view]").forEach(btn => btn.classList.toggle("active", btn.dataset.view === name));
-  $("topTitle").textContent = ({projects:"Proyectos", engineers:"Ingenieros y Accesos", warroom:"Sala de Control", myprojects:"Mis Proyectos"})[name] || "Harness";
+  $("topTitle").textContent = ({projects:"Proyectos", engineers:"Ingenieros y Accesos", warroom:"Sala de Control", smtp:"SMTP y Correos", myprojects:"Mis Proyectos"})[name] || "Harness";
   closeDrawer();
   if (name === "warroom") { if (state.role === "ADMIN") { ensureWarRoom(); } }
   if (name === "engineers") renderEngineers();
   if (name === "projects") renderProjects();
+  if (name === "smtp") { loadSmtpConfig(); loadEmailLogs(); }
   if (name === "myprojects") renderMyProjects();
 }
 
@@ -1261,6 +1305,108 @@ async function createProject() {
   }
 }
 
+function showSmtpStatus(text, ok) {
+  const box = $("smtpStatus");
+  box.classList.remove("hidden");
+  box.textContent = text;
+  box.style.borderColor = ok ? "rgba(52,211,153,.45)" : "rgba(248,113,113,.45)";
+}
+
+function smtpFormBody(withTest) {
+  const body = {
+    host: $("smtpHost").value.trim(),
+    port: Number($("smtpPort").value || 587),
+    username: $("smtpUser").value.trim() || null,
+    from_email: $("smtpFrom").value.trim(),
+    use_tls: $("smtpTls").checked,
+    use_ssl: $("smtpSsl").checked,
+  };
+  const password = $("smtpPass").value;
+  if (password) body.password = password;
+  if (withTest) {
+    const recipient = ($("smtpTestTo").value.trim() || (state.user && state.user.email) || "").trim();
+    if (!recipient || recipient === "admin-key") throw new Error("Indica un Test recipient valido");
+    body.test_recipient = recipient;
+  }
+  return body;
+}
+
+async function loadSmtpConfig() {
+  try {
+    const cfg = await api("/api/v1/admin/smtp-config");
+    $("smtpHost").value = cfg.host || "";
+    $("smtpPort").value = cfg.port || 587;
+    $("smtpUser").value = cfg.username || "";
+    $("smtpPass").value = "";
+    $("smtpFrom").value = cfg.from_email || "";
+    $("smtpTls").checked = !!cfg.use_tls;
+    $("smtpSsl").checked = !!cfg.use_ssl;
+    $("smtpPasswordState").textContent = cfg.password_set ? "Password configurado" : "Sin password";
+    $("smtpPasswordState").className = "pill " + (cfg.password_set ? "ok" : "warn");
+  } catch (err) {
+    toast(err.message, "bad");
+  }
+}
+
+async function saveSmtp(withTest) {
+  let body;
+  try { body = smtpFormBody(withTest); } catch (err) { toast(err.message, "bad"); return; }
+  const buttons = [$("smtpSave"), $("smtpSaveTest")];
+  buttons.forEach(b => b.disabled = true);
+  try {
+    const cfg = await api("/api/v1/admin/smtp-config", { method:"PUT", body:JSON.stringify(body) });
+    if (withTest) {
+      showSmtpStatus("Configuracion guardada. Test email: " + (cfg.test_sent ? "SENT" : "FAILED (revisa la auditoria)"), !!cfg.test_sent);
+      toast(cfg.test_sent ? "Configuracion guardada y correo de prueba enviado" : "Configuracion guardada; el test fallo", cfg.test_sent ? "ok" : "bad");
+    } else {
+      showSmtpStatus("Configuracion SMTP guardada.", true);
+      toast("Configuracion SMTP guardada", "ok");
+    }
+    $("smtpPass").value = "";
+    await loadSmtpConfig();
+    await loadEmailLogs();
+  } catch (err) {
+    showSmtpStatus("Error: " + err.message, false);
+    toast(err.message, "bad");
+  } finally {
+    buttons.forEach(b => b.disabled = false);
+  }
+}
+
+async function sendSmtpTest() {
+  const recipient = ($("smtpTestTo").value.trim() || (state.user && state.user.email) || "").trim();
+  if (!recipient || recipient === "admin-key") { toast("Indica un Test recipient valido", "bad"); return; }
+  $("smtpTest").disabled = true;
+  try {
+    const data = await api("/api/v1/admin/smtp-config/test", { method:"POST", body:JSON.stringify({ recipient }) });
+    showSmtpStatus("Correo de prueba a " + data.recipient + ": " + (data.sent ? "SENT" : "FAILED"), !!data.sent);
+    toast(data.sent ? "Correo de prueba enviado" : "El correo de prueba fallo", data.sent ? "ok" : "bad");
+    await loadEmailLogs();
+  } catch (err) {
+    showSmtpStatus("Error: " + err.message, false);
+    toast(err.message, "bad");
+  } finally {
+    $("smtpTest").disabled = false;
+  }
+}
+
+async function loadEmailLogs() {
+  try {
+    const data = await api("/api/v1/admin/email-logs?limit=50");
+    const logs = data.logs || [];
+    $("smtpLogsCount").textContent = logs.length + " registro(s)";
+    $("smtpLogsBody").innerHTML = logs.length ? logs.map(l => `<tr>
+      <td><b>${esc(l.recipient)}</b></td>
+      <td><span class="pill info">${esc(l.template_name)}</span></td>
+      <td title="${esc(l.error_message || "")}">${esc(l.subject)}</td>
+      <td><span class="pill ${l.status === "SENT" ? "ok" : "bad"}">${esc(l.status)}</span></td>
+      <td class="muted" style="font-size:12px">${esc(l.sent_at ? new Date(l.sent_at).toLocaleString() : "—")}</td>
+    </tr>`).join("") : `<tr><td colspan="5" class="muted">Sin correos registrados.</td></tr>`;
+  } catch (err) {
+    toast(err.message, "bad");
+  }
+}
+
 function bindStaticEvents() {
   $("loginForm").addEventListener("submit", doEmailLogin);
   $("loginTabEmail").onclick = () => setLoginTab("email");
@@ -1274,6 +1420,12 @@ function bindStaticEvents() {
   $("createEngineerBtn").onclick = createEngineer;
   $("engSearch").oninput = renderEngineers;
   $("myRefresh").onclick = () => refreshProjects().catch(err => toast(err.message, "bad"));
+  $("smtpSave").onclick = () => saveSmtp(false);
+  $("smtpSaveTest").onclick = () => saveSmtp(true);
+  $("smtpTest").onclick = sendSmtpTest;
+  $("smtpLogsRefresh").onclick = loadEmailLogs;
+  $("smtpTls").onchange = () => { if ($("smtpTls").checked) $("smtpSsl").checked = false; };
+  $("smtpSsl").onchange = () => { if ($("smtpSsl").checked) $("smtpTls").checked = false; };
   $("warRefresh").onclick = () => refreshTopology().catch(err => toast(err.message, "bad"));
   $("warFilter").onchange = () => { state.projectFilter = $("warFilter").value; renderWarRoom(); };
   $("injectBtn").onclick = injectControl;
