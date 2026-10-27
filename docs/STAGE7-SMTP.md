@@ -81,6 +81,9 @@ Usa únicamente `smtplib` y `email` de la biblioteca estándar.
 Un fallo SMTP no revierte la membresía; queda auditado como `FAILED` con el
 error correspondiente.
 
+También se registran `password_changed` y `admin_password_reset` desde los
+endpoints de contraseñas; ver [`STAGE7-PASSWORDS.md`](./STAGE7-PASSWORDS.md).
+
 ## Portal
 
 La pestaña admin **SMTP y Correos** permite:

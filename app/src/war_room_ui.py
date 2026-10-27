@@ -301,6 +301,7 @@ WAR_ROOM_HTML = r"""<!doctype html>
         <div class="title" id="topTitle">Harness</div>
         <div class="spacer"></div>
         <div class="user-chip"><span class="avatar" id="userInitials">?</span><span class="who-text" id="userLabel">—</span></div>
+        <button id="passwordBtn" class="btn sm ghost" type="button">Mi clave</button>
         <button id="logoutBtn" class="btn sm ghost" type="button">Salir</button>
       </header>
 
@@ -657,6 +658,7 @@ async function enterApp() {
   $("appView").classList.remove("hidden");
   $("userLabel").textContent = state.user.full_name || state.user.email || "Usuario";
   $("userInitials").textContent = capital(state.user.full_name || state.user.email);
+  $("passwordBtn").classList.toggle("hidden", !state.token);
   $("logoutBtn").classList.remove("hidden");
   buildNav();
   await refreshProjects();
@@ -770,8 +772,11 @@ function renderEngineers() {
     <td><span class="mono" style="font-size:12px">${esc(r.project.project_slug)}</span></td>
     <td>${(r.member.allowed_skills || []).map(s => `<span class="pill">${esc(s)}</span>`).join(" ") || '<span class="muted">—</span>'}</td>
     <td>${sessionPill(r.member.status || "APPROVED")}</td>
-    <td><button class="btn sm danger" data-revoke-project="${esc(r.project.id)}" data-revoke-user="${esc(r.member.user_id)}" type="button">Revocar</button></td>
+    <td><div class="row" style="gap:5px;flex-wrap:nowrap"><button class="btn sm" data-reset-user="${esc(r.member.user_id)}" data-reset-email="${esc(r.member.email)}" type="button">Reset password</button><button class="btn sm danger" data-revoke-project="${esc(r.project.id)}" data-revoke-user="${esc(r.member.user_id)}" type="button">Revocar</button></div></td>
   </tr>`).join("") : `<tr><td colspan="5" class="muted">Sin accesos registrados.</td></tr>`;
+  tbody.querySelectorAll("[data-reset-user]").forEach(btn => {
+    btn.onclick = () => openAdminResetModal(btn.dataset.resetUser, btn.dataset.resetEmail);
+  });
   tbody.querySelectorAll("[data-revoke-project]").forEach(btn => {
     btn.onclick = async () => {
       const projectId = btn.dataset.revokeProject, userId = btn.dataset.revokeUser;
@@ -1407,12 +1412,120 @@ async function loadEmailLogs() {
   }
 }
 
+function passwordPolicyMessage(password) {
+  if (!password || password.length < 8) return "Minimo 8 caracteres";
+  if (!/[A-Z]/.test(password)) return "Falta una mayuscula";
+  if (!/[a-z]/.test(password)) return "Falta una minuscula";
+  if (!/[0-9]/.test(password)) return "Falta un numero";
+  if (!/[^A-Za-z0-9]/.test(password)) return "Falta un simbolo";
+  return "";
+}
+
+function openSelfPasswordModal() {
+  $("modalTitle").textContent = "Cambiar mi contrasena";
+  $("modalBody").innerHTML = `<div class="stack" style="gap:12px">
+    <div class="field"><label for="pwdCurrent">Contrasena actual</label><input id="pwdCurrent" type="password" autocomplete="current-password"></div>
+    <div class="field"><label for="pwdNew">Nueva contrasena</label><input id="pwdNew" type="password" autocomplete="new-password"></div>
+    <div class="field"><label for="pwdConfirm">Confirmar nueva contrasena</label><input id="pwdConfirm" type="password" autocomplete="new-password"></div>
+    <div class="login-note">Minimo 8 caracteres con mayuscula, minuscula, numero y simbolo.</div>
+    <div id="pwdMsg" class="result-box hidden"></div>
+  </div>`;
+  $("modalActions").innerHTML = `<button id="modalCancel" class="btn ghost" type="button">Cancelar</button><button id="pwdSave" class="btn primary" type="button">Actualizar contrasena</button>`;
+  $("modal").classList.remove("hidden");
+  $("modalCancel").onclick = closeModal;
+  $("pwdSave").onclick = submitSelfPassword;
+  $("pwdCurrent").focus();
+}
+
+function showPwdMsg(text, ok) {
+  const box = $("pwdMsg");
+  box.classList.remove("hidden");
+  box.textContent = text;
+  box.style.borderColor = ok ? "rgba(52,211,153,.45)" : "rgba(248,113,113,.45)";
+}
+
+async function submitSelfPassword() {
+  const current = $("pwdCurrent").value;
+  const next = $("pwdNew").value;
+  const confirm = $("pwdConfirm").value;
+  const problem = passwordPolicyMessage(next);
+  if (problem) { showPwdMsg(problem, false); return; }
+  if (next !== confirm) { showPwdMsg("La confirmacion no coincide", false); return; }
+  $("pwdSave").disabled = true;
+  try {
+    const data = await api("/api/v1/auth/password", {
+      method:"PUT", body:JSON.stringify({ current_password: current, new_password: next }),
+    });
+    showPwdMsg("Contrasena actualizada. Correo de confirmacion: " + (data.email_sent ? "SENT" : "FAILED"), true);
+    toast(data.email_sent ? "Contrasena actualizada y correo enviado" : "Contrasena actualizada; el correo fallo", data.email_sent ? "ok" : "bad");
+    if (data.email_sent) setTimeout(closeModal, 1200);
+  } catch (err) {
+    showPwdMsg("Error: " + err.message, false);
+  } finally {
+    $("pwdSave").disabled = false;
+  }
+}
+
+function openAdminResetModal(userId, email) {
+  $("modalTitle").textContent = "Resetear contrasena";
+  $("modalBody").innerHTML = `<div class="stack" style="gap:12px">
+    <div class="result-box">Usuario: <b>${esc(email)}</b><br>Se enviara la nueva contrasena por correo y quedara auditada.</div>
+    <label class="check-row"><input id="resetRandom" type="checkbox"><span>Generar contrasena aleatoria</span></label>
+    <div class="field"><label for="resetNewPassword">Nueva contrasena temporal</label><input id="resetNewPassword" type="password" autocomplete="new-password" placeholder="Min. 8, mayuscula, minuscula, numero y simbolo"></div>
+    <div class="login-note">Si marcas generar aleatoria, el administrador no vera la contrasena; solo se envia al usuario.</div>
+    <div id="resetMsg" class="result-box hidden"></div>
+  </div>`;
+  $("modalActions").innerHTML = `<button id="modalCancel" class="btn ghost" type="button">Cancelar</button><button id="resetSave" class="btn primary" type="button">Resetear y notificar</button>`;
+  $("modal").classList.remove("hidden");
+  $("modalCancel").onclick = closeModal;
+  $("resetRandom").onchange = () => {
+    $("resetNewPassword").disabled = $("resetRandom").checked;
+    if ($("resetRandom").checked) $("resetNewPassword").value = "";
+  };
+  $("resetSave").onclick = () => submitAdminReset(userId);
+  $("resetNewPassword").focus();
+}
+
+function showResetMsg(text, ok) {
+  const box = $("resetMsg");
+  box.classList.remove("hidden");
+  box.textContent = text;
+  box.style.borderColor = ok ? "rgba(52,211,153,.45)" : "rgba(248,113,113,.45)";
+}
+
+async function submitAdminReset(userId) {
+  const generate = $("resetRandom").checked;
+  const value = $("resetNewPassword").value;
+  const body = { generate_random: generate };
+  if (!generate) {
+    const problem = passwordPolicyMessage(value);
+    if (problem) { showResetMsg(problem, false); return; }
+    body.new_password = value;
+  }
+  $("resetSave").disabled = true;
+  try {
+    const data = await api(`/api/v1/admin/users/${userId}/reset-password`, {
+      method:"PUT", body:JSON.stringify(body),
+    });
+    const mode = data.generated ? "aleatoria" : "manual";
+    showResetMsg(`Contrasena ${mode} actualizada. Correo: ${data.email_sent ? "SENT" : "FAILED"}.`, data.email_sent);
+    toast(data.email_sent ? `Contrasena ${mode} actualizada y enviada` : "Contrasena actualizada; el correo fallo", data.email_sent ? "ok" : "bad");
+    await loadEmailLogs();
+    if (data.email_sent) setTimeout(closeModal, 1200);
+  } catch (err) {
+    showResetMsg("Error: " + err.message, false);
+  } finally {
+    $("resetSave").disabled = false;
+  }
+}
+
 function bindStaticEvents() {
   $("loginForm").addEventListener("submit", doEmailLogin);
   $("loginTabEmail").onclick = () => setLoginTab("email");
   $("loginTabKey").onclick = () => setLoginTab("key");
   $("adminKeyBtn").onclick = doKeyLogin;
   $("logoutBtn").onclick = logout;
+  $("passwordBtn").onclick = openSelfPasswordModal;
   $("menuBtn").onclick = openDrawer;
   $("drawerBackdrop").onclick = closeDrawer;
   $("modalClose").onclick = closeModal;

@@ -194,3 +194,44 @@ def render_project_invite(
   </div>
 </body>
 </html>"""
+
+
+def _layout(title: str, body_html: str) -> str:
+    return f"""<!doctype html>
+<html lang="es">
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:Segoe UI,Arial,sans-serif;color:#0f172a;">
+  <div style="max-width:620px;margin:0 auto;padding:24px 12px;">
+    <div style="background:#0b1220;color:#e2e8f0;border-radius:14px 14px 0 0;padding:22px 24px;">
+      <div style="color:#38bdf8;font-size:12px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;">Harness Control Plane</div>
+      <h1 style="margin:8px 0 0;font-size:22px;line-height:1.2;">{html.escape(title)}</h1>
+    </div>
+    <div style="background:#ffffff;border:1px solid #e2e8f0;border-top:0;border-radius:0 0 14px 14px;padding:24px;">
+      {body_html}
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def render_password_changed(portal_url: str, recipient: str) -> str:
+    body = f"""
+      <p style="margin:0 0 12px;">Hola,</p>
+      <p style="margin:0 0 12px;">La contrasena de la cuenta <b>{html.escape(recipient)}</b> fue actualizada correctamente.</p>
+      <p style="margin:0 0 12px;">Si no realizaste este cambio, contacta de inmediato al administrador del Control Plane.</p>
+      <p style="margin:18px 0 0;"><a href="{html.escape(portal_url)}" style="color:#0284c7;">{html.escape(portal_url)}</a></p>
+    """
+    return _layout("Contrasena actualizada", body)
+
+
+def render_admin_password_reset(portal_url: str, recipient: str, temporary_password: str) -> str:
+    body = f"""
+      <p style="margin:0 0 12px;">Hola,</p>
+      <p style="margin:0 0 12px;">El administrador restablecio la contrasena de la cuenta <b>{html.escape(recipient)}</b>.</p>
+      <div style="margin:14px 0;padding:12px 14px;border:1px solid #bae6fd;border-radius:10px;background:#f0f9ff;">
+        <div style="font-size:12px;color:#0369a1;font-weight:700;">Contrasena temporal</div>
+        <div style="font-family:monospace;font-size:16px;color:#0c4a6e;">{html.escape(temporary_password)}</div>
+      </div>
+      <p style="margin:0 0 12px;">Inicia sesion con esta contrasena provisional y cambiala en tu primer acceso.</p>
+      <p style="margin:18px 0 0;"><a href="{html.escape(portal_url)}" style="color:#0284c7;">{html.escape(portal_url)}</a></p>
+    """
+    return _layout("Contrasena restablecida", body)

@@ -2,6 +2,7 @@ import os
 import json
 import re
 import secrets
+import string
 import uuid
 import hashlib
 import hmac
@@ -25,7 +26,12 @@ from src.indexer import (
     validate_repo_url,
 )
 from src.security import hash_password, open_secret, seal_secret, verify_password
-from src.mailer import render_project_invite, send_transactional_email
+from src.mailer import (
+    render_admin_password_reset,
+    render_password_changed,
+    render_project_invite,
+    send_transactional_email,
+)
 from src.git_guardian import (
     GitBarrierError,
     GitTaskPermissionError,
@@ -1623,6 +1629,30 @@ def _valid_email(email: str) -> bool:
     return bool(EMAIL_RE.fullmatch((email or "").strip().lower()))
 
 
+def _password_policy_error(password: str) -> Optional[str]:
+    if len(password) < 8:
+        return "La contrasena debe tener al menos 8 caracteres"
+    if len(password) > 128:
+        return "La contrasena no puede superar 128 caracteres"
+    if not re.search(r"[A-Z]", password):
+        return "La contrasena debe incluir al menos una mayuscula"
+    if not re.search(r"[a-z]", password):
+        return "La contrasena debe incluir al menos una minuscula"
+    if not re.search(r"[0-9]", password):
+        return "La contrasena debe incluir al menos un numero"
+    if not re.search(r"[^A-Za-z0-9]", password):
+        return "La contrasena debe incluir al menos un simbolo"
+    return None
+
+
+def _generate_temporary_password(length: int = 16) -> str:
+    alphabet = string.ascii_letters + string.digits + "!@#$%&*+-_"
+    while True:
+        candidate = "".join(secrets.choice(alphabet) for _ in range(length))
+        if _password_policy_error(candidate) is None:
+            return candidate
+
+
 def _public_user(user) -> Dict[str, Any]:
     item = dict(user)
     item.pop("password_hash", None)
@@ -1646,7 +1676,9 @@ def _issue_portal_token(user) -> str:
 
 class PortalLoginRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=255)
-    password: str = Field(..., min_length=8, max_length=200)
+    # Se permite cualquier longitud en login para la credencial legacy admin/admin.
+    # La politica de complejidad solo se exige al crear o cambiar contrasenas.
+    password: str = Field(..., min_length=1, max_length=200)
 
 
 class PortalRegisterRequest(BaseModel):
@@ -2447,3 +2479,117 @@ def list_admin_email_logs(
             {"limit": limit}
         ).mappings().all()
     return {"logs": [dict(r) for r in rows]}
+
+
+# ---------------------------------------------------------------------------
+# Etapa 7 passwords - autogestion y reset administrativo con notificacion SMTP
+# ---------------------------------------------------------------------------
+class PasswordChangeRequest(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=128)
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
+class AdminPasswordResetRequest(BaseModel):
+    new_password: Optional[str] = Field(default=None, min_length=8, max_length=128)
+    generate_random: bool = False
+
+
+@app.put("/api/v1/auth/password")
+async def change_own_password(
+    payload: PasswordChangeRequest,
+    auth: Dict[str, Any] = Depends(verify_portal),
+):
+    policy_error = _password_policy_error(payload.new_password)
+    if policy_error:
+        raise HTTPException(status_code=400, detail=policy_error)
+
+    with engine.connect() as conn:
+        user = conn.execute(
+            sa.text("""
+                SELECT id::text, email, password_hash, status
+                FROM harness_users WHERE id = CAST(:uid AS UUID)
+            """),
+            {"uid": auth["user_id"]}
+        ).mappings().fetchone()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not verify_password(payload.current_password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    if verify_password(payload.new_password, user["password_hash"]):
+        raise HTTPException(status_code=400, detail="New password must differ from current password")
+
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE harness_users SET password_hash = :ph WHERE id = CAST(:uid AS UUID)"),
+            {"ph": hash_password(payload.new_password), "uid": user["id"]}
+        )
+
+    email_sent = await asyncio.to_thread(
+        send_transactional_email,
+        engine,
+        user["email"],
+        "Tu contrasena fue actualizada - Harness Control Plane",
+        render_password_changed(f"{HARNESS_PUBLIC_URL}/portal", user["email"]),
+        "password_changed",
+    )
+    return {
+        "status": "PASSWORD_UPDATED",
+        "user_id": user["id"],
+        "email_sent": email_sent,
+    }
+
+
+@app.put("/api/v1/admin/users/{user_id}/reset-password")
+async def admin_reset_user_password(
+    user_id: str,
+    payload: AdminPasswordResetRequest,
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    with engine.connect() as conn:
+        user = conn.execute(
+            sa.text("""
+                SELECT id::text, email, full_name, status
+                FROM harness_users WHERE id = CAST(:uid AS UUID)
+            """),
+            {"uid": user_id}
+        ).mappings().fetchone()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user["status"] == "DISABLED":
+        raise HTTPException(status_code=403, detail="User disabled")
+
+    generated = False
+    if payload.generate_random or not payload.new_password:
+        temporary_password = _generate_temporary_password()
+        generated = True
+    else:
+        policy_error = _password_policy_error(payload.new_password)
+        if policy_error:
+            raise HTTPException(status_code=400, detail=policy_error)
+        temporary_password = payload.new_password
+
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text("UPDATE harness_users SET password_hash = :ph WHERE id = CAST(:uid AS UUID)"),
+            {"ph": hash_password(temporary_password), "uid": user["id"]}
+        )
+
+    email_sent = await asyncio.to_thread(
+        send_transactional_email,
+        engine,
+        user["email"],
+        "Contrasena restablecida por el Administrador - Harness Control Plane",
+        render_admin_password_reset(
+            f"{HARNESS_PUBLIC_URL}/portal",
+            user["email"],
+            temporary_password,
+        ),
+        "admin_password_reset",
+    )
+    return {
+        "status": "PASSWORD_RESET",
+        "user_id": user["id"],
+        "email": user["email"],
+        "generated": generated,
+        "email_sent": email_sent,
+    }
