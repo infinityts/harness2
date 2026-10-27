@@ -225,7 +225,7 @@ async def main():
     seeds = db_rows("SELECT slug, category, is_official, compiled_tokens FROM harness_skills WHERE is_official = true ORDER BY slug")
     print("alembic:", version, "| seeds:", [(r["slug"], r["compiled_tokens"]) for r in seeds])
     assert version == "0009" or version > "0009"
-    assert {"python", "fastapi", "ui-responsive", "db-alembic", "doc-analyzer", "tech-writer"}.issubset({r["slug"] for r in seeds})
+    assert {"python", "fastapi", "ui-responsive", "db-alembic", "doc-analyzer", "tech-writer", "frontend-design"}.issubset({r["slug"] for r in seeds})
     assert all(r["compiled_tokens"] <= 500 for r in seeds)
 
     st, admin_login = await api("POST", "/api/v1/auth/login", {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})

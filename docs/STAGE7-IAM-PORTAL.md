@@ -13,6 +13,7 @@ aislamiento estricto por proyecto y una interfaz web unificada en `/portal` y
 | `0007` | `system_smtp_config` y `email_dispatch_logs` para correo transaccional y auditoría. Ver [`STAGE7-SMTP.md`](./STAGE7-SMTP.md). |
 | `0008` | Seed idempotente de `admin@local` / `Super Administrator` para primer acceso. Ver [`STAGE7-PASSWORDS.md`](./STAGE7-PASSWORDS.md). |
 | `0009` | Catálogo estándar `harness_skills`, permisos, asignaciones y seeds oficiales. Ver [`STAGE8-SKILLS.md`](./STAGE8-SKILLS.md). |
+| `0010` | Seed oficial de `frontend-design` (identidad visual frontend). |
 
 La clave de sesión se cifra con SHA-256-CTR + HMAC-SHA256 usando
 `HARNESS_VAULT_SECRET` (o `HARNESS_JWT_SECRET` si no se define). Solo se descifra
