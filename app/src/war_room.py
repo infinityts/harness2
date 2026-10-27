@@ -38,7 +38,7 @@ def get_topology(engine: sa.Engine) -> Dict[str, Any]:
         nodes = conn.execute(sa.text("""
             SELECT id::text AS session_id, engineer_username, agent_tool, llm_provider,
                    skills, status, current_context_tokens, max_context_tokens,
-                   last_heartbeat, connected_at
+                   system_contract_rules, last_heartbeat, connected_at
             FROM agent_sessions
             ORDER BY connected_at DESC
         """)).mappings().all()

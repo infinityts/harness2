@@ -61,6 +61,7 @@ WAR_ROOM_HTML = r"""<!doctype html>
     </div>
     <div class="card">
       <h3>Plan + dispatch</h3>
+      <div class="row"><select id="repo"></select></div>
       <div class="row"><textarea id="prompt" rows="3" style="width:100%">Implementar mejora y validar contratos</textarea></div>
       <div class="row"><button id="propose">Proponer plan A/B/C</button><button id="dispatch">Dispatch</button></div>
     </div>
@@ -200,10 +201,28 @@ async function loadTopology() {
   try {
     const t = await api("/api/v1/war-room/topology");
     render(t);
+    if (!$("repo").options.length) loadRepos();
     $("status").textContent = "conectado · " + new Date().toLocaleTimeString();
   } catch (e) {
     $("status").textContent = "error: " + e.message;
   }
+}
+
+async function loadRepos() {
+  try {
+    const data = await api("/api/v1/repos");
+    const el = $("repo");
+    const prev = el.value;
+    el.innerHTML = "";
+    (data.repos || []).forEach(r => {
+      const o = document.createElement("option");
+      o.value = r.repo_name;
+      o.textContent = `${r.repo_name} (${r.files} archivos)`;
+      el.appendChild(o);
+    });
+    if (prev) el.value = prev;
+    else if (data.default) el.value = data.default;
+  } catch (e) { /* se reintenta en el siguiente refresco */ }
 }
 
 function connect() {
@@ -254,7 +273,7 @@ $("revoke").onclick = async () => {
 $("propose").onclick = async () => {
   try {
     const r = await api("/api/v1/plans/propose", "POST", {
-      requested_by: "war-room", repo_name: "harness-self", requirement_prompt: $("prompt").value,
+      requested_by: "war-room", repo_name: ($("repo").value || "harness-self"), requirement_prompt: $("prompt").value,
     });
     logEvent({event:"PLAN_PROPOSED", data:{plan_id:r.plan_id, tasks:r.created_tasks}});
     await loadTopology();

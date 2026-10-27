@@ -165,6 +165,8 @@ async def main():
     s3 = register("e2e-python", ["python", "fastapi"])
     ws2 = await websockets.connect(f"{WS}/ws/agent/{s2['session_id']}", additional_headers={"Authorization": f"Bearer {s2['session_key']}"})
     ws3 = await websockets.connect(f"{WS}/ws/agent/{s3['session_id']}", additional_headers={"Authorization": f"Bearer {s3['session_key']}"})
+    await recv_event(ws2)
+    await recv_event(ws3)
     await ws2.send(json.dumps({"current_context_tokens": 10}))
     await ws3.send(json.dumps({"current_context_tokens": 10}))
     await recv_event(ws2)
@@ -197,24 +199,30 @@ async def main():
     print("locks:", [dict(x) for x in locks])
     assert locks and all(x["tid"] == task1["task_id"] for x in locks)
 
-    print("\n--- 5. CONTRACT VIOLATION ---")
+    print("\n--- 5. CONTRACT VIOLATION (submit real) ---")
+    worktree = pathlib.Path(dispatch["dispatched"][0]["worktree"])
+    base_path = task1["allowed_files"][0]
+    base_content = (worktree / base_path).read_text(encoding="utf-8")
     st, violation = http(
         "POST",
-        f"/api/v1/tasks/{task1['task_id']}/complete",
-        {"commit_sha": "deadbeef", "modified_files": ["archivo_prohibido.py"], "summary": "probe"},
-        admin=True,
+        f"/api/v1/tasks/{task1['task_id']}/submit",
+        {"file_changes": {"archivo_prohibido.py": "x = 1\n"}, "commit_message": "probe"},
+        bearer=s3["session_key"],
     )
-    print("complete con archivo prohibido:", st, violation)
-    assert st == 403 and "Contract" in json.dumps(violation)
+    print("submit con archivo prohibido:", st, violation)
+    assert st == 403 and violation["detail"]["error"] == "CONTRACT_VIOLATION"
 
-    print("\n--- 6. COMPLETE LIMPIO ---")
+    print("\n--- 6. SUBMIT LIMPIO (Git real) ---")
     st, completed = http(
         "POST",
-        f"/api/v1/tasks/{task1['task_id']}/complete",
-        {"commit_sha": "cafebabe", "modified_files": task1["allowed_files"], "summary": "e2e ok"},
-        admin=True,
+        f"/api/v1/tasks/{task1['task_id']}/submit",
+        {
+            "file_changes": {base_path: base_content + "\n# stage3 e2e merge\n"},
+            "commit_message": "stage3 clean submit",
+        },
+        bearer=s3["session_key"],
     )
-    print("complete valido:", st, completed)
+    print("submit valido:", st, completed)
     assert st == 200 and completed["status"] == "MERGED"
 
     events = []
@@ -225,12 +233,12 @@ async def main():
         events.append(evt)
         if evt.get("event") == "CLEAR_LLM_CONTEXT":
             break
-    print("eventos WS tras complete:", events)
+    print("eventos WS tras submit:", events)
 
     task_row = db_rows("SELECT status FROM harness_tasks WHERE id = CAST(:tid AS UUID)", tid=task1["task_id"])[0]
     s3_row = db_rows("SELECT status, current_context_tokens FROM agent_sessions WHERE id = CAST(:sid AS UUID)", sid=s3["session_id"])[0]
     locks = db_rows("SELECT count(*) AS n FROM repo_file_map WHERE locked_by_task_id = CAST(:tid AS UUID)", tid=task1["task_id"])[0]
-    print("post-complete:", task_row["status"], dict(s3_row), "locks:", locks["n"])
+    print("post-submit:", task_row["status"], dict(s3_row), "locks:", locks["n"])
     assert task_row["status"] == "MERGED" and s3_row["status"] == "ONLINE" and s3_row["current_context_tokens"] == 0 and locks["n"] == 0
 
     print("\n--- 7. FAIL-CHECKPOINT (segunda tarea) ---")

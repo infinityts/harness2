@@ -58,6 +58,8 @@ async def main():
         f"{WS}/ws/agent/{sid}",
         additional_headers={"Authorization": f"Bearer {reg['session_key']}"},
     ) as w:
+        sync = json.loads(await w.recv())
+        print(f"\n=== 2b. SESSION_SYNC ===\n{sync.get('event')} rules={sync.get('system_contract_rules')}")
         await w.send(json.dumps({"current_context_tokens": 22000}))
         show("3. WS heartbeat 22000/32000", json.loads(await w.recv()))
         show("   sesion en BD", {k: session(sid)[k] for k in ("status", "current_context_tokens")})

@@ -11,8 +11,9 @@ from typing import Any, List, Dict, Optional
 import jwt
 import sqlalchemy as sa
 from fastapi import Depends, FastAPI, Header, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
+from pathlib import Path
 
 from src.indexer import index_repository, compute_embedding_768
 from src.git_guardian import (
@@ -24,9 +25,7 @@ from src.git_guardian import (
     submit_task_changes,
 )
 from src.orchestrator import (
-    ContractViolation,
     TaskPermissionError,
-    complete_task,
     dispatch_pending_tasks,
     fail_task_checkpoint,
     generate_dual_plans_and_synthesize,
@@ -178,7 +177,9 @@ def cleanup_disconnected_sessions(conn, session_ids: List[str], target_status: s
 
 async def session_watchdog_loop():
     """Watchdog que corre cada 3s y desconecta sesiones que superen HEARTBEAT_TIMEOUT."""
+    cycle = 0
     while True:
+        cycle += 1
         expired_ids = []
         try:
             with engine.begin() as conn:
@@ -209,6 +210,18 @@ async def session_watchdog_loop():
                         pass
         except Exception as exc:
             print(f"[Watchdog Error] {exc}")
+        if cycle % 20 == 0:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(sa.text("""
+                        DELETE FROM war_room_events
+                        WHERE id < COALESCE(
+                            (SELECT id FROM war_room_events ORDER BY id DESC OFFSET 1000 LIMIT 1),
+                            0
+                        )
+                    """))
+            except Exception as exc:
+                print(f"[war-room] prune error: {exc}")
         await asyncio.sleep(3)
 
 
@@ -301,7 +314,7 @@ def list_sessions():
             sa.text("""
                 SELECT id::text, engineer_username, agent_tool, llm_provider,
                        skills, status, current_context_tokens, max_context_tokens,
-                       last_heartbeat, connected_at
+                       system_contract_rules, last_heartbeat, connected_at
                 FROM agent_sessions
                 ORDER BY connected_at DESC
             """)
@@ -382,7 +395,7 @@ async def agent_heartbeat_ws(websocket: WebSocket, session_id: str):
     with engine.begin() as conn:
         row = conn.execute(
             sa.text("""
-                SELECT status, max_context_tokens
+                SELECT status, max_context_tokens, skills, system_contract_rules
                 FROM agent_sessions
                 WHERE id = CAST(:sid AS UUID) AND session_key_hash = :khash
             """),
@@ -406,6 +419,13 @@ async def agent_heartbeat_ws(websocket: WebSocket, session_id: str):
     if not pre_accepted:
         await websocket.accept()
     active_connections[session_id] = websocket
+    await websocket.send_json({
+        "event": "SESSION_SYNC",
+        "session_id": session_id,
+        "skills": row[2] or [],
+        "max_context_tokens": row[1] or 32000,
+        "system_contract_rules": row[3] or [],
+    })
 
     try:
         while True:
@@ -522,6 +542,22 @@ class ContextPackRequest(BaseModel):
 class SymbolValidationRequest(BaseModel):
     repo_name: str = Field(..., min_length=2, max_length=150)
     referenced_symbols: List[str]
+
+
+@app.get("/api/v1/repos", dependencies=[Depends(verify_auth)])
+def list_indexed_repos():
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.text("""
+                SELECT repo_name, count(*) AS files, max(commit_sha) AS commit_sha
+                FROM repo_file_map
+                GROUP BY repo_name
+                ORDER BY repo_name
+            """)
+        ).mappings().all()
+    repos = [dict(r) for r in rows]
+    default = next((r["repo_name"] for r in repos if r["repo_name"] == "harness-self"), (repos[0]["repo_name"] if repos else None))
+    return {"repos": repos, "default": default}
 
 
 @app.post("/api/v1/repos/index", dependencies=[Depends(require_admin)])
@@ -729,12 +765,6 @@ class PlanProposeRequest(BaseModel):
     plan_b_override: Optional[Dict[str, Any]] = None
 
 
-class TaskCompleteRequest(BaseModel):
-    commit_sha: str = Field(default="", max_length=64)
-    modified_files: List[str] = Field(default_factory=list)
-    summary: str = Field(default="", max_length=2000)
-
-
 class TaskFailRequest(BaseModel):
     error_reason: str = Field(..., min_length=1, max_length=2000)
     git_diff_summary: Optional[str] = None
@@ -851,56 +881,6 @@ def list_tasks(
         ).mappings().all()
 
     return {"tasks": [dict(r) for r in rows]}
-
-
-@app.post("/api/v1/tasks/{task_id}/complete", dependencies=[Depends(require_admin)], deprecated=True)
-async def complete_task_endpoint(
-    task_id: str,
-    payload: TaskCompleteRequest,
-):
-    session_id = None
-    try:
-        with engine.begin() as conn:
-            result = complete_task(
-                conn=conn,
-                task_id=task_id,
-                session_id=session_id,
-                commit_sha=payload.commit_sha,
-                modified_files=payload.modified_files,
-                summary=payload.summary,
-            )
-    except LookupError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    except TaskPermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-    except ContractViolation as exc:
-        raise HTTPException(status_code=403, detail={"error": "Contract Violation", "files": exc.files})
-
-    ws = active_connections.get(result["assigned_session_id"]) if result["assigned_session_id"] else None
-    if ws:
-        try:
-            await ws.send_json({"event": "CLEAR_LLM_CONTEXT", "task_id": task_id})
-        except Exception:
-            pass
-
-    # /complete es legado (solo admin): limpia el worktree efimero si existiera.
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                sa.text("""
-                    SELECT t.git_branch, p.master_plan_c_json->>'repo_name' AS repo_name
-                    FROM harness_tasks t
-                    JOIN feature_consensus_plans p ON p.id = t.plan_id
-                    WHERE t.id = CAST(:tid AS UUID)
-                """),
-                {"tid": task_id}
-            ).mappings().fetchone()
-        if row and row["repo_name"]:
-            cleanup_task_worktree(row["repo_name"], task_id, row["git_branch"])
-    except Exception:
-        pass
-
-    return result
 
 
 @app.post("/api/v1/tasks/{task_id}/fail-checkpoint")
@@ -1096,7 +1076,7 @@ async def control_session(session_id: str, payload: SessionControlRequest):
     with engine.begin() as conn:
         row = conn.execute(
             sa.text("""
-                SELECT id::text, skills, max_context_tokens
+                SELECT id::text, skills, max_context_tokens, system_contract_rules
                 FROM agent_sessions
                 WHERE id = CAST(:sid AS UUID)
                 FOR UPDATE
@@ -1115,8 +1095,13 @@ async def control_session(session_id: str, payload: SessionControlRequest):
                 sa.text("UPDATE agent_sessions SET max_context_tokens = :max_tok WHERE id = CAST(:sid AS UUID)"),
                 {"max_tok": payload.max_context_tokens, "sid": session_id}
             )
+        if payload.system_contract_rules is not None:
+            conn.execute(
+                sa.text("UPDATE agent_sessions SET system_contract_rules = CAST(:rules AS JSONB) WHERE id = CAST(:sid AS UUID)"),
+                {"rules": json.dumps(payload.system_contract_rules), "sid": session_id}
+            )
         current = conn.execute(
-            sa.text("SELECT skills, max_context_tokens FROM agent_sessions WHERE id = CAST(:sid AS UUID)"),
+            sa.text("SELECT skills, max_context_tokens, system_contract_rules FROM agent_sessions WHERE id = CAST(:sid AS UUID)"),
             {"sid": session_id}
         ).mappings().fetchone()
 
@@ -1124,7 +1109,7 @@ async def control_session(session_id: str, payload: SessionControlRequest):
         "event": "CONTROL_RULES_UPDATED",
         "skills": current["skills"],
         "max_context_tokens": current["max_context_tokens"],
-        "system_contract_rules": payload.system_contract_rules or [],
+        "system_contract_rules": current["system_contract_rules"],
     }
     ws = active_connections.get(session_id)
     delivered = False
@@ -1141,7 +1126,7 @@ async def control_session(session_id: str, payload: SessionControlRequest):
             "session_id": session_id,
             "skills": current["skills"],
             "max_context_tokens": current["max_context_tokens"],
-            "system_contract_rules": payload.system_contract_rules or [],
+            "system_contract_rules": current["system_contract_rules"],
             "delivered": delivered,
         },
         target_session_id=session_id,
@@ -1313,6 +1298,18 @@ async def war_room_socket(websocket: WebSocket):
 @app.get("/war-room", response_class=HTMLResponse)
 def war_room_page():
     return WAR_ROOM_HTML
+
+
+@app.get("/api/v1/client/bridge.py", response_class=PlainTextResponse)
+def download_bridge():
+    bridge_path = Path(__file__).resolve().parent.parent / "client" / "harness_mcp_bridge.py"
+    if not bridge_path.exists():
+        raise HTTPException(status_code=404, detail="bridge not found")
+    return PlainTextResponse(
+        bridge_path.read_text(encoding="utf-8"),
+        media_type="text/x-python",
+        headers={"Content-Disposition": 'attachment; filename="harness_mcp_bridge.py"'},
+    )
 
 
 @app.post("/api/v1/tasks/{task_id}/reopen-from-main")

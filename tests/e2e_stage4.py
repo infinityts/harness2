@@ -151,8 +151,9 @@ async def main():
         f"{WS}/ws/agent/{s['session_id']}",
         additional_headers={"Authorization": f"Bearer {s['session_key']}"},
     )
+    await asyncio.wait_for(ws.recv(), 5)  # SESSION_SYNC
     await ws.send(json.dumps({"current_context_tokens": 10}))
-    await asyncio.wait_for(ws.recv(), 5)
+    await asyncio.wait_for(ws.recv(), 5)  # ACK
 
     overrides = {
         "plan_a_override": {
