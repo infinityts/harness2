@@ -3,7 +3,6 @@ import json
 import shutil
 import subprocess
 import tempfile
-import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +11,7 @@ from typing import Dict, Any, List, Set, Optional
 import sqlalchemy as sa
 
 from src.indexer import REPOS_BASE_DIR, index_repository
+from src.repo_lock import repo_lock
 
 WORKTREES_BASE_DIR = Path("/var/lib/harness/worktrees")
 
@@ -20,9 +20,6 @@ DEPENDENCY_MANIFESTS = {
     "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
     "cargo.toml", "cargo.lock", "go.mod", "go.sum"
 }
-
-# Un solo submit/merge a la vez dentro del proceso (uvicorn arranca 1 worker).
-GIT_LOCK = threading.Lock()
 
 
 class GitBarrierError(Exception):
@@ -100,6 +97,11 @@ def run_git(cwd: Path, args: List[str], check: bool = True) -> subprocess.Comple
 
 def prepare_task_worktree(repo_name: str, task_id: str, git_branch: str, base_branch: str = "main") -> Path:
     """Crea un Git Worktree fisico y aislado para la tarea partiendo de base_branch."""
+    with repo_lock(repo_name):
+        return _prepare_task_worktree_locked(repo_name, task_id, git_branch, base_branch)
+
+
+def _prepare_task_worktree_locked(repo_name: str, task_id: str, git_branch: str, base_branch: str = "main") -> Path:
     repo_path = REPOS_BASE_DIR / repo_name
     if not repo_path.exists():
         raise WorktreeError(f"Repository {repo_name} does not exist at {repo_path}")
@@ -120,6 +122,11 @@ def prepare_task_worktree(repo_name: str, task_id: str, git_branch: str, base_br
 
 
 def cleanup_task_worktree(repo_name: str, task_id: str, git_branch: Optional[str] = None) -> None:
+    with repo_lock(repo_name):
+        return _cleanup_task_worktree_locked(repo_name, task_id, git_branch)
+
+
+def _cleanup_task_worktree_locked(repo_name: str, task_id: str, git_branch: Optional[str] = None) -> None:
     repo_path = REPOS_BASE_DIR / repo_name
     wt_path = WORKTREES_BASE_DIR / task_id
     if repo_path.exists():
@@ -338,6 +345,11 @@ def _commit_worktree(wt: Path, message: str, author_name: str, author_email: str
 
 
 def _merge_to_main(repo_name: str, git_branch: str, wt_path: Path) -> str:
+    with repo_lock(repo_name):
+        return _merge_to_main_locked(repo_name, git_branch, wt_path)
+
+
+def _merge_to_main_locked(repo_name: str, git_branch: str, wt_path: Path) -> str:
     repo_path = REPOS_BASE_DIR / repo_name
     checkout = run_git(repo_path, ["checkout", "main"], check=False)
     if checkout.returncode != 0:
@@ -399,7 +411,13 @@ def submit_task_changes(
     commit_message: str,
 ) -> Dict[str, Any]:
     """Aplica cambios reales, ejecuta las 4 barreras, mergea a main y reindexa."""
-    with GIT_LOCK:
+    task, _ = _load_task(engine, task_id)
+    if not task:
+        raise LookupError("task not found")
+    repo_name = task["repo_name"]
+    if not repo_name:
+        raise WorktreeError("La tarea no tiene repo_name en el plan")
+    with repo_lock(repo_name):
         return _submit_locked(engine, task_id, session_id, file_changes, unified_diff, commit_message)
 
 
@@ -425,6 +443,7 @@ def _submit_locked(
         raise NoChangesError("submit sin file_changes ni unified_diff")
 
     with engine.begin() as conn:
+        conn.execute(sa.text("SELECT pg_advisory_xact_lock(hashtext(:rname))"), {"rname": repo_name})
         conn.execute(
             sa.text("UPDATE harness_tasks SET status = 'VALIDATING' WHERE id = CAST(:tid AS UUID)"),
             {"tid": task_id}
@@ -501,6 +520,7 @@ def _submit_locked(
         raise
 
     with engine.begin() as conn:
+        conn.execute(sa.text("SELECT pg_advisory_xact_lock(hashtext(:rname))"), {"rname": repo_name})
         conn.execute(
             sa.text("UPDATE harness_tasks SET status = 'MERGED' WHERE id = CAST(:tid AS UUID)"),
             {"tid": task_id}

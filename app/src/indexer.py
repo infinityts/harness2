@@ -14,6 +14,8 @@ import urllib.request
 
 import sqlalchemy as sa
 
+from src.repo_lock import repo_lock
+
 REPOS_BASE_DIR = Path(os.getenv("HARNESS_REPOS_DIR", "/var/lib/harness/repos"))
 EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL", "")
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
@@ -277,6 +279,12 @@ def get_head_commit_sha(repo_path: Path) -> str:
 
 
 def index_repository(engine: sa.Engine, repo_name: str, repo_url: Optional[str] = None, branch: str = "main") -> Dict[str, Any]:
+    # Lock distribuido: flock entre procesos + RLock intra-proceso.
+    with repo_lock(repo_name):
+        return _index_repository_locked(engine, repo_name, repo_url, branch)
+
+
+def _index_repository_locked(engine: sa.Engine, repo_name: str, repo_url: Optional[str] = None, branch: str = "main") -> Dict[str, Any]:
     repo_path = ensure_git_repo(repo_name, repo_url, branch)
     commit_sha = get_head_commit_sha(repo_path)
 
@@ -285,6 +293,7 @@ def index_repository(engine: sa.Engine, repo_name: str, repo_url: Optional[str] 
     seen_files = set()
 
     with engine.begin() as conn:
+        conn.execute(sa.text("SELECT pg_advisory_xact_lock(hashtext(:rname))"), {"rname": repo_name})
         for root, dirs, files in os.walk(repo_path):
             dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
             for fname in files:

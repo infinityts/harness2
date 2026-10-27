@@ -11,6 +11,7 @@ from typing import Any, List, Dict, Optional
 import jwt
 import sqlalchemy as sa
 from fastapi import Depends, FastAPI, Header, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from src.indexer import index_repository, compute_embedding_768
@@ -18,6 +19,7 @@ from src.git_guardian import (
     GitBarrierError,
     GitTaskPermissionError,
     cleanup_task_worktree,
+    prepare_task_worktree,
     prepare_worktree_for_task,
     submit_task_changes,
 )
@@ -28,9 +30,39 @@ from src.orchestrator import (
     dispatch_pending_tasks,
     fail_task_checkpoint,
     generate_dual_plans_and_synthesize,
+    release_task_assignment,
 )
+from src.war_room import get_topology, record_event
+from src.war_room_ui import WAR_ROOM_HTML
 
 ADMIN_API_KEY = os.getenv("HARNESS_ADMIN_API_KEY", "")
+war_room_clients = set()
+
+
+async def broadcast_war(event: Dict[str, Any]) -> None:
+    dead = []
+    for ws in list(war_room_clients):
+        try:
+            await ws.send_json(event)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        war_room_clients.discard(ws)
+
+
+async def emit_war(
+    event_type: str,
+    payload: Dict[str, Any],
+    source_session_id: Optional[str] = None,
+    target_session_id: Optional[str] = None,
+) -> None:
+    safe_payload = json.loads(json.dumps(payload, default=str))
+    record_event(engine, event_type, safe_payload, source_session_id, target_session_id)
+    await broadcast_war({
+        "event": event_type,
+        "data": safe_payload,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 JWT_SECRET = os.getenv("HARNESS_JWT_SECRET", "change-me-secret")
@@ -67,7 +99,12 @@ def verify_auth(
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization.split(" ", 1)[1].strip()
         try:
-            decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            decoded = jwt.decode(
+                token,
+                JWT_SECRET,
+                algorithms=["HS256"],
+                options={"require": ["exp", "jti", "sub"]},
+            )
         except Exception:
             raise HTTPException(status_code=401, detail="Invalid bearer token")
         session_id = decoded.get("sub")
@@ -142,6 +179,7 @@ def cleanup_disconnected_sessions(conn, session_ids: List[str], target_status: s
 async def session_watchdog_loop():
     """Watchdog que corre cada 3s y desconecta sesiones que superen HEARTBEAT_TIMEOUT."""
     while True:
+        expired_ids = []
         try:
             with engine.begin() as conn:
                 rows = conn.execute(
@@ -155,6 +193,12 @@ async def session_watchdog_loop():
                 expired_ids = [r[0] for r in rows]
                 if expired_ids:
                     cleanup_disconnected_sessions(conn, expired_ids, target_status="OFFLINE")
+            for sid in expired_ids:
+                await emit_war(
+                    "SESSION_OFFLINE",
+                    {"session_id": sid, "reason": "heartbeat_timeout"},
+                    source_session_id=sid,
+                )
             # Cerrar sockets colgados si existieran en memoria
             for sid in expired_ids:
                 ws = active_connections.pop(sid, None)
@@ -194,7 +238,7 @@ def health_check():
 
 
 @app.post("/api/v1/sessions/register", dependencies=[Depends(require_admin)])
-def register_agent_session(payload: SessionRegisterRequest):
+async def register_agent_session(payload: SessionRegisterRequest):
     session_id = str(uuid.uuid4())
     now_ts = int(datetime.now(timezone.utc).timestamp())
     jwt_payload = {
@@ -229,6 +273,18 @@ def register_agent_session(payload: SessionRegisterRequest):
                 "max_tok": payload.max_context_tokens
             }
         )
+
+    await emit_war(
+        "SESSION_REGISTERED",
+        {
+            "session_id": session_id,
+            "engineer_username": payload.engineer_username,
+            "agent_tool": payload.agent_tool,
+            "llm_provider": payload.llm_provider,
+            "skills": payload.skills,
+        },
+        source_session_id=session_id,
+    )
 
     return {
         "session_id": session_id,
@@ -280,6 +336,11 @@ async def revoke_session(session_id: str, auth: Dict[str, Any] = Depends(verify_
     ws = active_connections.pop(session_id, None)
     if ws:
         await ws.close(code=4003, reason="Session revoked by Control Plane")
+    await emit_war(
+        "SESSION_REVOKED",
+        {"session_id": session_id, "status": "REVOKED"},
+        source_session_id=session_id,
+    )
     return {"session_id": session_id, "status": "REVOKED"}
 
 
@@ -304,7 +365,12 @@ async def agent_heartbeat_ws(websocket: WebSocket, session_id: str):
 
     # 2. Validar firma JWT y hash en la base de datos
     try:
-        decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        decoded = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"],
+            options={"require": ["exp", "jti", "sub"]},
+        )
         if decoded.get("sub") != session_id:
             await websocket.close(code=4003, reason="Token subject mismatch")
             return
@@ -393,12 +459,50 @@ async def agent_heartbeat_ws(websocket: WebSocket, session_id: str):
                 "context_ratio": round(ratio, 3),
                 "server_time": datetime.now(timezone.utc).isoformat()
             })
+
+            await broadcast_war({
+                "event": "CONTEXT_UPDATE",
+                "data": {
+                    "session_id": session_id,
+                    "current_context_tokens": current_tokens,
+                    "max_context_tokens": max_tokens,
+                    "context_pct": round(ratio * 100, 1),
+                    "status": agent_state,
+                    "action": action,
+                },
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            })
+            if action == "PURGE_AND_CHECKPOINT_CONTEXT":
+                await emit_war(
+                    "CONTEXT_PURGE",
+                    {
+                        "session_id": session_id,
+                        "current_context_tokens": current_tokens,
+                        "max_context_tokens": max_tokens,
+                        "context_pct": round(ratio * 100, 1),
+                    },
+                    source_session_id=session_id,
+                )
     except WebSocketDisconnect:
         pass
     finally:
         active_connections.pop(session_id, None)
         with engine.begin() as conn:
             cleanup_disconnected_sessions(conn, [session_id], target_status="OFFLINE")
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    sa.text("SELECT status FROM agent_sessions WHERE id = CAST(:sid AS UUID)"),
+                    {"sid": session_id}
+                ).fetchone()
+            if row and row[0] == "OFFLINE":
+                await emit_war(
+                    "SESSION_OFFLINE",
+                    {"session_id": session_id, "reason": "websocket_closed"},
+                    source_session_id=session_id,
+                )
+        except Exception:
+            pass
 
 
 class RepoIndexRequest(BaseModel):
@@ -644,7 +748,7 @@ class TaskSubmitRequest(BaseModel):
 
 
 @app.post("/api/v1/plans/propose", dependencies=[Depends(require_admin)])
-def propose_dual_plan(payload: PlanProposeRequest):
+async def propose_dual_plan(payload: PlanProposeRequest):
     try:
         with engine.begin() as conn:
             result = generate_dual_plans_and_synthesize(
@@ -658,6 +762,17 @@ def propose_dual_plan(payload: PlanProposeRequest):
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    await emit_war(
+        "PLAN_APPROVED",
+        {
+            "plan_id": result["plan_id"],
+            "repo_name": payload.repo_name,
+            "requested_by": payload.requested_by,
+            "scores": result["master_plan_c"].get("scores"),
+            "tasks": result["created_tasks"],
+        }
+    )
     return result
 
 
@@ -666,6 +781,18 @@ async def dispatch_tasks():
     with engine.begin() as conn:
         dispatched = dispatch_pending_tasks(conn, HEARTBEAT_TIMEOUT, MAX_CONTEXT_RATIO)
 
+    prepared = []
+    failed = []
+    for item in dispatched:
+        try:
+            worktree = prepare_task_worktree(item["repo_name"], item["task_id"], item["git_branch"])
+            item["worktree"] = str(worktree)
+            prepared.append(item)
+        except Exception as exc:
+            release_task_assignment(engine, item["task_id"], item["assigned_to"]["session_id"])
+            failed.append({"task_id": item["task_id"], "error": str(exc)})
+
+    dispatched = prepared
     for item in dispatched:
         ws = active_connections.get(item["assigned_to"]["session_id"])
         if ws:
@@ -673,8 +800,20 @@ async def dispatch_tasks():
                 await ws.send_json({"event": "TASK_ASSIGNED", "task": item})
             except Exception:
                 pass
+        await emit_war(
+            "TASK_ASSIGNED",
+            {
+                "task_id": item["task_id"],
+                "title": item["title"],
+                "git_branch": item["git_branch"],
+                "allowed_files": item["allowed_files"],
+                "worktree": item["worktree"],
+                "assigned_to": item["assigned_to"],
+            },
+            target_session_id=item["assigned_to"]["session_id"],
+        )
 
-    return {"dispatched": dispatched, "count": len(dispatched)}
+    return {"dispatched": dispatched, "count": len(dispatched), "failed": failed}
 
 
 @app.get("/api/v1/tasks", dependencies=[Depends(verify_auth)])
@@ -849,6 +988,23 @@ async def submit_task_endpoint(
     except GitTaskPermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
     except GitBarrierError as exc:
+        if exc.code == "MERGE_CONFLICT":
+            await emit_war(
+                "TASK_CONFLICT",
+                {"task_id": task_id, "files": exc.details.get("files", []), "message": exc.message},
+                source_session_id=session_id,
+            )
+        else:
+            await emit_war(
+                "TASK_BARRIER_FAILED",
+                {
+                    "task_id": task_id,
+                    "barrier": exc.code,
+                    "message": exc.message,
+                    "files": exc.details.get("files", []),
+                },
+                source_session_id=session_id,
+            )
         raise HTTPException(
             status_code=exc.status_code,
             detail={"error": exc.code, "message": exc.message, **exc.details}
@@ -862,4 +1018,420 @@ async def submit_task_endpoint(
             except Exception:
                 pass
 
+    await emit_war(
+        "TASK_MERGED",
+        {
+            "task_id": task_id,
+            "task_commit": result["task_commit"],
+            "main_commit": result["main_commit"],
+            "changed_files": result["changed_files"],
+            "assigned_session_id": result["assigned_session_id"],
+        },
+        source_session_id=result["assigned_session_id"],
+    )
+
+    if result["assigned_session_id"]:
+        with engine.connect() as conn:
+            links = conn.execute(
+                sa.text("""
+                    SELECT target_session_id::text
+                    FROM agent_links
+                    WHERE source_session_id = CAST(:src AS UUID)
+                      AND active = true
+                      AND trigger_event = 'ON_TASK_MERGED'
+                """),
+                {"src": result["assigned_session_id"]}
+            ).fetchall()
+        for (target_id,) in links:
+            target_ws = active_connections.get(target_id)
+            delivered = False
+            if target_ws:
+                try:
+                    await target_ws.send_json({
+                        "event": "UPSTREAM_TASK_MERGED",
+                        "from_session_id": result["assigned_session_id"],
+                        "task_id": task_id,
+                        "commit_sha": result["main_commit"],
+                    })
+                    delivered = True
+                except Exception:
+                    pass
+            await emit_war(
+                "AGENT_TO_AGENT_RELAY",
+                {
+                    "action": "upstream_task_merged",
+                    "task_id": task_id,
+                    "commit_sha": result["main_commit"],
+                    "delivered": delivered,
+                },
+                source_session_id=result["assigned_session_id"],
+                target_session_id=target_id,
+            )
+
     return result
+
+
+class SessionControlRequest(BaseModel):
+    skills: Optional[List[str]] = None
+    max_context_tokens: Optional[int] = Field(default=None, ge=1024)
+    system_contract_rules: Optional[List[str]] = None
+
+
+class WarRoomLinkRequest(BaseModel):
+    source_session_id: str
+    target_session_id: str
+    link_type: str = Field(..., pattern="^(PIPELINE_HANDOFF|PEER_REVIEW|CONTEXT_RELAY|SUPERVISOR)$")
+    trigger_event: str = Field(..., pattern="^(ON_TASK_MERGED|ON_CONFLICT|MANUAL_RELAY)$")
+
+
+class WarRoomRelayRequest(BaseModel):
+    target_session_id: str
+    message_type: str = Field(..., min_length=1, max_length=60)
+    content: str = Field(..., min_length=1, max_length=8000)
+    task_id: Optional[str] = None
+
+
+@app.patch("/api/v1/sessions/{session_id}/control", dependencies=[Depends(require_admin)])
+async def control_session(session_id: str, payload: SessionControlRequest):
+    with engine.begin() as conn:
+        row = conn.execute(
+            sa.text("""
+                SELECT id::text, skills, max_context_tokens
+                FROM agent_sessions
+                WHERE id = CAST(:sid AS UUID)
+                FOR UPDATE
+            """),
+            {"sid": session_id}
+        ).mappings().fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Session not found")
+        if payload.skills is not None:
+            conn.execute(
+                sa.text("UPDATE agent_sessions SET skills = CAST(:skills AS JSONB) WHERE id = CAST(:sid AS UUID)"),
+                {"skills": json.dumps(payload.skills), "sid": session_id}
+            )
+        if payload.max_context_tokens is not None:
+            conn.execute(
+                sa.text("UPDATE agent_sessions SET max_context_tokens = :max_tok WHERE id = CAST(:sid AS UUID)"),
+                {"max_tok": payload.max_context_tokens, "sid": session_id}
+            )
+        current = conn.execute(
+            sa.text("SELECT skills, max_context_tokens FROM agent_sessions WHERE id = CAST(:sid AS UUID)"),
+            {"sid": session_id}
+        ).mappings().fetchone()
+
+    event = {
+        "event": "CONTROL_RULES_UPDATED",
+        "skills": current["skills"],
+        "max_context_tokens": current["max_context_tokens"],
+        "system_contract_rules": payload.system_contract_rules or [],
+    }
+    ws = active_connections.get(session_id)
+    delivered = False
+    if ws:
+        try:
+            await ws.send_json(event)
+            delivered = True
+        except Exception:
+            pass
+
+    await emit_war(
+        "SKILLS_INJECTED",
+        {
+            "session_id": session_id,
+            "skills": current["skills"],
+            "max_context_tokens": current["max_context_tokens"],
+            "system_contract_rules": payload.system_contract_rules or [],
+            "delivered": delivered,
+        },
+        target_session_id=session_id,
+    )
+    return {"session_id": session_id, **event, "delivered": delivered}
+
+
+@app.post("/api/v1/war-room/links", dependencies=[Depends(require_admin)])
+async def create_war_room_link(payload: WarRoomLinkRequest):
+    if payload.source_session_id == payload.target_session_id:
+        raise HTTPException(status_code=400, detail="source y target no pueden ser la misma sesion")
+    with engine.begin() as conn:
+        sessions = conn.execute(
+            sa.text("""
+                SELECT id::text FROM agent_sessions
+                WHERE id IN (CAST(:src AS UUID), CAST(:tgt AS UUID))
+            """),
+            {"src": payload.source_session_id, "tgt": payload.target_session_id}
+        ).fetchall()
+        if len(sessions) != 2:
+            raise HTTPException(status_code=404, detail="Session not found")
+        row = conn.execute(
+            sa.text("""
+                INSERT INTO agent_links
+                    (source_session_id, target_session_id, link_type, trigger_event, active)
+                VALUES
+                    (CAST(:src AS UUID), CAST(:tgt AS UUID), :ltype, :trigger, true)
+                ON CONFLICT (source_session_id, target_session_id, link_type)
+                DO UPDATE SET active = true, trigger_event = EXCLUDED.trigger_event
+                RETURNING id::text, source_session_id::text, target_session_id::text,
+                          link_type, trigger_event, active, created_at
+            """),
+            {
+                "src": payload.source_session_id,
+                "tgt": payload.target_session_id,
+                "ltype": payload.link_type,
+                "trigger": payload.trigger_event,
+            }
+        ).mappings().fetchone()
+
+    result = dict(row)
+    await emit_war(
+        "AGENT_TO_AGENT_RELAY",
+        {"action": "link_created", **result},
+        source_session_id=payload.source_session_id,
+        target_session_id=payload.target_session_id,
+    )
+    return result
+
+
+@app.delete("/api/v1/war-room/links/{link_id}", dependencies=[Depends(require_admin)])
+async def delete_war_room_link(link_id: str):
+    with engine.begin() as conn:
+        row = conn.execute(
+            sa.text("""
+                SELECT id::text, source_session_id::text, target_session_id::text, link_type
+                FROM agent_links WHERE id = CAST(:lid AS UUID)
+            """),
+            {"lid": link_id}
+        ).mappings().fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Link not found")
+        conn.execute(sa.text("DELETE FROM agent_links WHERE id = CAST(:lid AS UUID)"), {"lid": link_id})
+
+    await emit_war(
+        "AGENT_TO_AGENT_RELAY",
+        {"action": "link_deleted", **dict(row)},
+        source_session_id=row["source_session_id"],
+        target_session_id=row["target_session_id"],
+    )
+    return {"deleted": link_id}
+
+
+@app.get("/api/v1/war-room/topology", dependencies=[Depends(require_admin)])
+def war_room_topology():
+    return get_topology(engine)
+
+
+@app.post("/api/v1/war-room/relay")
+async def relay_agent_message(payload: WarRoomRelayRequest, auth: Dict[str, Any] = Depends(verify_auth)):
+    if auth["role"] != "agent":
+        raise HTTPException(status_code=403, detail="Agent bearer required")
+    source_id = auth["session_id"]
+    with engine.connect() as conn:
+        target = conn.execute(
+            sa.text("SELECT id::text, status FROM agent_sessions WHERE id = CAST(:tid AS UUID)"),
+            {"tid": payload.target_session_id}
+        ).mappings().fetchone()
+        link = conn.execute(
+            sa.text("""
+                SELECT id::text FROM agent_links
+                WHERE source_session_id = CAST(:src AS UUID)
+                  AND target_session_id = CAST(:tgt AS UUID)
+                  AND active = true
+            """),
+            {"src": source_id, "tgt": payload.target_session_id}
+        ).fetchone()
+    if not target or target["status"] not in ("ONLINE", "BUSY") or not link:
+        raise HTTPException(status_code=403, detail="Link Not Authorized in War Room Topology")
+
+    ws = active_connections.get(payload.target_session_id)
+    delivered = False
+    if ws:
+        try:
+            await ws.send_json({
+                "event": "AGENT_MESSAGE",
+                "from_session_id": source_id,
+                "message_type": payload.message_type,
+                "content": payload.content,
+                "task_id": payload.task_id,
+            })
+            delivered = True
+        except Exception:
+            pass
+
+    await emit_war(
+        "AGENT_TO_AGENT_RELAY",
+        {
+            "action": "relay",
+            "message_type": payload.message_type,
+            "content": payload.content,
+            "task_id": payload.task_id,
+            "delivered": delivered,
+        },
+        source_session_id=source_id,
+        target_session_id=payload.target_session_id,
+    )
+    return {
+        "delivered": delivered,
+        "source_session_id": source_id,
+        "target_session_id": payload.target_session_id,
+    }
+
+
+@app.websocket("/ws/war-room")
+async def war_room_socket(websocket: WebSocket):
+    header_key = websocket.headers.get("x-harness-admin-key") or ""
+    authorized = bool(ADMIN_API_KEY and header_key and hmac.compare_digest(header_key, ADMIN_API_KEY))
+    if not authorized:
+        await websocket.accept()
+        try:
+            first = await asyncio.wait_for(websocket.receive_json(), timeout=5)
+        except Exception:
+            await websocket.close(code=4003, reason="Missing admin key")
+            return
+        candidate = first.get("admin_key") if isinstance(first, dict) and first.get("type") == "AUTH" else None
+        if not (candidate and ADMIN_API_KEY and hmac.compare_digest(str(candidate), ADMIN_API_KEY)):
+            await websocket.close(code=4003, reason="Invalid admin key")
+            return
+    else:
+        await websocket.accept()
+
+    war_room_clients.add(websocket)
+    try:
+        await websocket.send_json({
+            "event": "WAR_ROOM_CONNECTED",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        war_room_clients.discard(websocket)
+
+
+@app.get("/war-room", response_class=HTMLResponse)
+def war_room_page():
+    return WAR_ROOM_HTML
+
+
+@app.post("/api/v1/tasks/{task_id}/reopen-from-main")
+async def reopen_task_from_main(task_id: str, auth: Dict[str, Any] = Depends(verify_auth)):
+    with engine.connect() as conn:
+        task = conn.execute(
+            sa.text("""
+                SELECT t.id::text, t.status, t.assigned_session_id::text AS assigned_session_id,
+                       t.git_branch, t.allowed_files,
+                       p.master_plan_c_json->>'repo_name' AS repo_name
+                FROM harness_tasks t
+                JOIN feature_consensus_plans p ON p.id = t.plan_id
+                WHERE t.id = CAST(:tid AS UUID)
+            """),
+            {"tid": task_id}
+        ).mappings().fetchone()
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    if auth["role"] == "agent" and auth.get("session_id") != task["assigned_session_id"]:
+        raise HTTPException(status_code=403, detail="task assigned to another session")
+    if task["status"] != "CONFLICT":
+        raise HTTPException(status_code=400, detail=f"Task status is {task['status']}, expected CONFLICT")
+    session_id = task["assigned_session_id"]
+    repo_name = task["repo_name"]
+    if not session_id or not repo_name:
+        raise HTTPException(status_code=400, detail="Task has no assigned session or repo_name")
+
+    def norm(p: str) -> str:
+        value = str(p).replace("\\", "/")
+        while value.startswith("./"):
+            value = value[2:]
+        return value
+
+    allowed = [norm(p) for p in (task["allowed_files"] or [])]
+
+    with engine.connect() as conn:
+        locked = conn.execute(
+            sa.text("""
+                SELECT file_path FROM repo_file_map
+                WHERE repo_name = :rname
+                  AND file_path = ANY(:files)
+                  AND locked_by_task_id IS NOT NULL
+                  AND locked_by_task_id <> CAST(:tid AS UUID)
+            """),
+            {"rname": repo_name, "files": allowed, "tid": task_id}
+        ).fetchall()
+    if locked:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "FILES_LOCKED", "files": [x[0] for x in locked]}
+        )
+
+    try:
+        worktree = await asyncio.to_thread(
+            prepare_task_worktree, repo_name, task_id, task["git_branch"]
+        )
+    except GitBarrierError as exc:
+        raise HTTPException(status_code=exc.status_code, detail={"error": exc.code, "message": exc.message})
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("SELECT pg_advisory_xact_lock(hashtext(:rname))"), {"rname": repo_name})
+            locked = conn.execute(
+                sa.text("""
+                    SELECT file_path FROM repo_file_map
+                    WHERE repo_name = :rname
+                      AND file_path = ANY(:files)
+                      AND locked_by_task_id IS NOT NULL
+                      AND locked_by_task_id <> CAST(:tid AS UUID)
+                """),
+                {"rname": repo_name, "files": allowed, "tid": task_id}
+            ).fetchall()
+            if locked:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"error": "FILES_LOCKED", "files": [x[0] for x in locked]}
+                )
+            conn.execute(
+                sa.text("UPDATE harness_tasks SET status = 'IN_PROGRESS' WHERE id = CAST(:tid AS UUID)"),
+                {"tid": task_id}
+            )
+            if allowed:
+                conn.execute(
+                    sa.text("""
+                        UPDATE repo_file_map
+                        SET locked_by_task_id = CAST(:tid AS UUID)
+                        WHERE repo_name = :rname AND file_path = ANY(:files)
+                    """),
+                    {"tid": task_id, "rname": repo_name, "files": allowed}
+                )
+            conn.execute(
+                sa.text("UPDATE agent_sessions SET status = 'BUSY' WHERE id = CAST(:sid AS UUID)"),
+                {"sid": session_id}
+            )
+    except HTTPException:
+        try:
+            cleanup_task_worktree(repo_name, task_id, task["git_branch"])
+        except Exception:
+            pass
+        raise
+
+    await emit_war(
+        "TASK_ASSIGNED",
+        {
+            "action": "reopen_from_main",
+            "task_id": task_id,
+            "worktree": str(worktree),
+            "git_branch": task["git_branch"],
+            "allowed_files": allowed,
+            "assigned_session_id": session_id,
+        },
+        target_session_id=session_id,
+    )
+    return {
+        "task_id": task_id,
+        "status": "IN_PROGRESS",
+        "worktree": str(worktree),
+        "git_branch": task["git_branch"],
+        "allowed_files": allowed,
+        "assigned_session_id": session_id,
+        "reacquired_files": allowed,
+    }

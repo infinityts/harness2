@@ -5,7 +5,6 @@ from typing import List, Dict, Any, Optional
 import sqlalchemy as sa
 
 from src.indexer import compute_embedding_768
-from src.git_guardian import cleanup_task_worktree, prepare_task_worktree
 
 
 class ContractViolation(Exception):
@@ -335,6 +334,7 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
         repo_name = task["repo_name"]
         if not repo_name:
             continue
+        conn.execute(sa.text("SELECT pg_advisory_xact_lock(hashtext(:rname))"), {"rname": repo_name})
 
         # 1. Verificar si alguno de los archivos permitidos esta bloqueado por otra tarea.
         if allowed_files:
@@ -405,12 +405,6 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
                 {"tid": task["task_id"], "rname": repo_name, "afiles": allowed_files}
             )
 
-        try:
-            worktree_path = prepare_task_worktree(repo_name, task["task_id"], task["git_branch"])
-        except Exception:
-            cleanup_task_worktree(repo_name, task["task_id"], task["git_branch"])
-            raise
-
         dispatched.append({
             "task_id": task["task_id"],
             "plan_id": task["plan_id"],
@@ -418,7 +412,6 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
             "git_branch": task["git_branch"],
             "allowed_files": allowed_files,
             "repo_name": repo_name,
-            "worktree": str(worktree_path),
             "assigned_to": {
                 "session_id": agent["session_id"],
                 "engineer_username": agent["engineer_username"],
@@ -548,3 +541,26 @@ def fail_task_checkpoint(
         "assigned_session_id": task["assigned_session_id"],
         "failed_attempts_memory_entry": entry,
     }
+
+
+def release_task_assignment(engine, task_id: str, session_id: Optional[str]) -> Dict[str, Any]:
+    """Libera una asignacion si la creacion del worktree falla tras el dispatch."""
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text("""
+                UPDATE harness_tasks
+                SET status = 'PENDING', assigned_session_id = NULL
+                WHERE id = CAST(:tid AS UUID)
+            """),
+            {"tid": task_id}
+        )
+        conn.execute(
+            sa.text("UPDATE repo_file_map SET locked_by_task_id = NULL WHERE locked_by_task_id = CAST(:tid AS UUID)"),
+            {"tid": task_id}
+        )
+        if session_id:
+            conn.execute(
+                sa.text("UPDATE agent_sessions SET status = 'ONLINE' WHERE id = CAST(:sid AS UUID)"),
+                {"sid": session_id}
+            )
+    return {"task_id": task_id, "status": "PENDING", "released": True}
