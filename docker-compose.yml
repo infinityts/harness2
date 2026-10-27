@@ -1,0 +1,72 @@
+services:
+  harness-db:
+    image: docker.io/pgvector/pgvector:pg16
+    container_name: harness-db
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # Tuning para 4 GB de RAM
+    command:
+      - postgres
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - effective_cache_size=3GB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - max_connections=100
+      - -c
+      - wal_buffers=16MB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - max_parallel_workers_per_gather=2
+      - -c
+      - max_worker_processes=3
+    shm_size: 1g
+    cpus: 3
+    mem_limit: 4g
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data:Z
+      - ./db/init-pgvector.sql:/docker-entrypoint-initdb.d/01-init-pgvector.sql:ro,Z
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      harness-net:
+        ipv4_address: 172.28.0.10
+
+  harness-app:
+    build: ./app
+    image: localhost/harness-app:latest
+    container_name: harness-app
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      harness-db:
+        condition: service_healthy
+    cpus: 3
+    mem_limit: 4g
+    ports:
+      - "${HARNESS_APP_PORT}:8443"
+    volumes:
+      - ./data/git-repos:/srv/git-repos:Z
+    networks:
+      harness-net:
+        ipv4_address: 172.28.0.20
+
+networks:
+  harness-net:
+    name: harness-net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
