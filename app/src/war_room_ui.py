@@ -1233,7 +1233,7 @@ function renderGraph(t) {
   const W = 900, H = 560, cx = W / 2, cy = H / 2;
   const nodes = t.nodes;
   const ns = "http://www.w3.org/2000/svg";
-  const mk = (tag, attrs) => { const el = document.createElementNS(ns, tag); Object.entries(attrs).forEach(([k,v]) => el.setAttribute(k, v)); return el; };
+  const mk = (tag, attrs = {}) => { const el = document.createElementNS(ns, tag); Object.entries(attrs).forEach(([k,v]) => el.setAttribute(k, v)); return el; };
   const hub = mk("circle", { cx, cy, r:42, fill:"#0b1729", stroke:"#2b3d5f", "stroke-width":"1.5" });
   svg.appendChild(hub);
   const hubText = mk("text", { x:cx, y:cy + 4, fill:"#38bdf8", "font-size":"11", "font-weight":"800", "text-anchor":"middle" });
