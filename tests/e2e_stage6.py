@@ -154,7 +154,7 @@ async def main():
         WHERE table_name='agent_sessions' AND column_name='system_contract_rules'
     """)
     print("alembic:", version, "column:", [x["column_name"] for x in col])
-    assert version in ("0004", "0005", "0006", "0007", "0008", "0009") and col
+    assert int(version) >= 4 and col
 
     s = register("e2e-stage6-bridge", "opencode", ["python"])
     ws = await websockets.connect(f"{WS}/ws/agent/{s['session_id']}", additional_headers={"Authorization": f"Bearer {s['session_key']}"})
@@ -218,8 +218,8 @@ async def main():
         tools = mcp_read(proc)
         names = [t["name"] for t in tools["result"]["tools"]]
         print("tools:", names)
-        assert len(names) == 7 and "harness_submit_task_changes" in names
-        assert "harness_get_skill_manual" in names
+        assert len(names) == 10 and "harness_submit_task_changes" in names
+        assert {"harness_get_skill_manual", "harness_rag_ingest", "harness_rag_search", "harness_rag_list"}.issubset(set(names))
 
         st, plan = http("POST", "/api/v1/plans/propose", {
             "requested_by": "e2e-stage6",

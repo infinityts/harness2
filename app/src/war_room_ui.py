@@ -316,6 +316,32 @@ WAR_ROOM_HTML = r"""<!doctype html>
           <div id="projectsGrid" class="project-grid"></div>
         </section>
 
+        <section id="viewKnowledge" class="view hidden">
+          <div class="view-head">
+            <div><h1>Base de Conocimiento <span class="muted" style="font-size:14px">(RAG Docs)</span></h1><p>Documentación canónica indexada por proyecto, con búsqueda semántica y bootstrap del worker docs-curator (skill <code>rag-docs-curator</code>). Tools MCP: <code>harness_rag_list</code>, <code>harness_rag_search</code> y <code>harness_rag_ingest</code>.</p></div>
+            <div class="spacer"></div>
+            <button id="kbBootstrap" class="btn primary hidden" type="button">Ejecutar docs-curator</button>
+          </div>
+          <div class="card stack">
+            <div class="row">
+              <select id="kbProject" style="max-width:360px"></select>
+              <button id="kbRefresh" class="btn sm" type="button">Refrescar</button>
+              <span id="kbStatus" class="muted" style="font-size:12px"></span>
+            </div>
+            <div class="field">
+              <label for="kbSearch">Buscar en la documentación del proyecto</label>
+              <div class="row"><input id="kbSearch" class="grow" placeholder="Ej. arquitectura, contratos, API, runbook..."><button id="kbSearchBtn" class="btn sm" type="button">Buscar</button></div>
+            </div>
+            <div id="kbResults" class="stack" style="gap:8px"></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Fuente</th><th>Tipo</th><th>Título</th><th>Chunks</th><th>Actualizado</th></tr></thead>
+                <tbody id="kbDocs"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
         <section id="viewSkills" class="view hidden">
           <div class="view-head">
             <div><h1>Skill Studio</h1><p>Habilidades con objetivo, pasos obligatorios, prohibiciones y criterio de éxito. El manual se carga solo cuando hace falta.</p></div>
@@ -523,7 +549,7 @@ WAR_ROOM_HTML = r"""<!doctype html>
 const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const STATUS_COLORS = { ONLINE:"#34d399", BUSY:"#fbbf24", OFFLINE:"#8fa3c4", REVOKED:"#f87171" };
-const TOOL_LABELS = { opencode:"OpenCode", claudecode:"Claude Code", cursor:"Cursor", hermes:"Hermes", pi:"Pi", custom:"Custom" };
+const TOOL_LABELS = { opencode:"OpenCode", claudecode:"Claude Code", cursor:"Cursor", hermes:"Hermes", pi:"Pi", custom:"Custom", "headless-worker":"Docs Curator" };
 const SKILL_CATEGORY_LABELS = { backend:"Backend / APIs", frontend:"Frontend / UI", database:"Base de datos", documents:"Documentos", writing:"Redacción", qa:"QA / Testing", devops:"DevOps", security:"Seguridad", general:"General" };
 const state = {
   token: null, adminKey: null, user: null, role: null,
@@ -587,6 +613,7 @@ function navItems() {
   if (state.role === "ADMIN") {
     return [
       { id:"projects", icon:"▦", label:"Proyectos", bottom:"Proyectos" },
+      { id:"knowledge", icon:"▤", label:"Base de Conocimiento", bottom:"Docs" },
       { id:"skills", icon:"✦", label:"Skill Studio", bottom:"Skills" },
       { id:"engineers", icon:"☺", label:"Usuarios y Accesos", bottom:"Usuarios" },
       { id:"warroom", icon:"◎", label:"Sala de Control", bottom:"War Room" },
@@ -595,6 +622,7 @@ function navItems() {
   }
   return [
     { id:"myprojects", icon:"▤", label:"Mis Proyectos", bottom:"Proyectos" },
+    { id:"knowledge", icon:"▤", label:"Base de Conocimiento", bottom:"Docs" },
     { id:"skills", icon:"✦", label:"Skill Studio", bottom:"Skills" },
   ];
 }
@@ -610,13 +638,14 @@ function buildNav() {
 
 function setView(name) {
   state.activeView = name;
-  const views = { projects:"viewProjects", skills:"viewSkills", engineers:"viewEngineers", warroom:"viewWarRoom", smtp:"viewSmtp", myprojects:"viewMyProjects" };
+  const views = { projects:"viewProjects", knowledge:"viewKnowledge", skills:"viewSkills", engineers:"viewEngineers", warroom:"viewWarRoom", smtp:"viewSmtp", myprojects:"viewMyProjects" };
   Object.values(views).forEach(id => $(id).classList.add("hidden"));
   if (views[name]) $(views[name]).classList.remove("hidden");
   document.querySelectorAll("[data-view]").forEach(btn => btn.classList.toggle("active", btn.dataset.view === name));
-  $("topTitle").textContent = ({projects:"Proyectos", skills:"Skill Studio", engineers:"Usuarios y Accesos", warroom:"Sala de Control", smtp:"SMTP y Correos", myprojects:"Mis Proyectos"})[name] || "Harness";
+  $("topTitle").textContent = ({projects:"Proyectos", knowledge:"Base de Conocimiento", skills:"Skill Studio", engineers:"Usuarios y Accesos", warroom:"Sala de Control", smtp:"SMTP y Correos", myprojects:"Mis Proyectos"})[name] || "Harness";
   closeDrawer();
   if (name === "warroom") { if (state.role === "ADMIN") { ensureWarRoom(); } }
+  if (name === "knowledge") loadKnowledge();
   if (name === "skills") loadSkills();
   if (name === "engineers") loadAdminUsers();
   if (name === "projects") renderProjects();
@@ -1270,6 +1299,7 @@ function renderWarSessions(t) {
   box.innerHTML = t.nodes.map(n => `<button class="session-item ${state.selectedSession === n.session_id ? "active" : ""}" data-session-id="${esc(n.session_id)}" type="button">
     <span class="avatar" style="width:28px;height:28px;background:${STATUS_COLORS[n.status] || "#8fa3c4"};color:#06101d">${esc(String(TOOL_LABELS[n.agent_tool] || "?").slice(0,2))}</span>
     <span class="who"><b>${esc(n.engineer_username || n.session_id.slice(0, 8))}</b><span>${esc(TOOL_LABELS[n.agent_tool] || n.agent_tool)} · ${esc(n.project_slug || "sin proyecto")}</span></span>
+    ${n.is_headless_worker ? '<span class="pill info">DOC</span>' : ""}
     ${sessionPill(n.status)}
   </button>`).join("");
   box.querySelectorAll("[data-session-id]").forEach(btn => {
@@ -1302,7 +1332,7 @@ function renderWarInspector() {
     return;
   }
   box.innerHTML = `<div class="stack" style="gap:8px">
-    <div class="row"><b style="flex:1">${esc(node.engineer_username)}</b>${sessionPill(node.status)}</div>
+    <div class="row"><b style="flex:1">${esc(node.engineer_username)}</b>${node.is_headless_worker ? '<span class="pill info">HEADLESS DOC</span>' : ""}${sessionPill(node.status)}</div>
     <div class="muted mono" style="font-size:11px">${esc(node.session_id)}</div>
     <div class="row"><span class="pill">${esc(TOOL_LABELS[node.agent_tool] || node.agent_tool)}</span><span class="pill">${esc(node.llm_provider || "—")}</span><span class="pill info">${esc(node.project_slug || "sin proyecto")}</span></div>
     <div style="font-size:12px">Contexto: <b>${esc(node.current_context_tokens)}</b> / ${esc(node.max_context_tokens)} tokens</div>
@@ -2006,6 +2036,86 @@ async function openSkillAclModal(slug) {
   } catch (err) { toast(err.message, "bad"); }
 }
 
+async function loadKnowledge() {
+  if (!state.projects.length) {
+    try { await refreshProjects(); } catch (err) { toast(err.message, "bad"); }
+  }
+  const select = $("kbProject");
+  const prev = select.value;
+  select.innerHTML = state.projects.map(p => `<option value="${esc(p.id)}">${esc(p.display_name)} · ${esc(p.project_slug)}</option>`).join("");
+  if (prev && [...select.options].some(o => o.value === prev)) select.value = prev;
+  $("kbBootstrap").classList.toggle("hidden", state.role !== "ADMIN");
+  if (!select.value) {
+    $("kbStatus").textContent = "No hay proyectos disponibles.";
+    $("kbDocs").innerHTML = '<tr><td colspan="5" class="muted">Crea o solicita acceso a un proyecto.</td></tr>';
+    return;
+  }
+  await loadKnowledgeDocs();
+}
+
+async function loadKnowledgeDocs() {
+  const projectId = $("kbProject").value;
+  if (!projectId) return;
+  $("kbStatus").textContent = "Cargando documentos…";
+  try {
+    const data = await api(`/api/v1/projects/${projectId}/documents`);
+    const docs = data.documents || [];
+    $("kbStatus").textContent = `${docs.length} documento(s) indexado(s)`;
+    $("kbDocs").innerHTML = docs.length ? docs.map(d => `<tr>
+      <td class="mono" style="font-size:11px">${esc(d.source_uri)}</td>
+      <td><span class="pill">${esc(d.doc_type)}</span></td>
+      <td>${esc(d.title)}</td>
+      <td>${esc(d.chunks)}</td>
+      <td class="muted" style="font-size:11px">${esc(d.updated_at ? new Date(d.updated_at).toLocaleString() : "—")}</td>
+    </tr>`).join("") : '<tr><td colspan="5" class="muted">Sin documentos. Un Admin puede ejecutar docs-curator para el bootstrap.</td></tr>';
+  } catch (err) {
+    $("kbStatus").textContent = "Error al cargar documentos";
+    toast(err.message, "bad");
+  }
+}
+
+async function searchKnowledge() {
+  const projectId = $("kbProject").value;
+  const query = $("kbSearch").value.trim();
+  if (!projectId || !query) { toast("Selecciona un proyecto y escribe una búsqueda", "bad"); return; }
+  $("kbSearchBtn").disabled = true;
+  try {
+    const data = await api(`/api/v1/projects/${projectId}/documents/search`, {
+      method:"POST", body:JSON.stringify({ query, limit: 8 }),
+    });
+    const chunks = data.chunks || [];
+    $("kbResults").innerHTML = chunks.length ? chunks.map(c => `<div class="card" style="padding:12px">
+      <div class="row"><span class="pill info">${esc(c.doc_type)}</span><span class="mono" style="font-size:11px">${esc(c.source_uri)}</span><span class="pill">${esc(c.similarity)} similitud</span></div>
+      <div style="font-weight:650;margin:4px 0">${esc(c.title)}${c.section_heading ? " · " + esc(c.section_heading) : ""}</div>
+      <div class="muted" style="white-space:pre-wrap;font-size:12px;max-height:160px;overflow:auto">${esc(c.chunk_text)}</div>
+    </div>`).join("") : '<div class="result-box">Sin coincidencias documentales para esa búsqueda.</div>';
+  } catch (err) {
+    toast(err.message, "bad");
+  } finally {
+    $("kbSearchBtn").disabled = false;
+  }
+}
+
+async function bootstrapKnowledge() {
+  const projectId = $("kbProject").value;
+  if (!projectId) { toast("Selecciona un proyecto", "bad"); return; }
+  if (!confirm("¿Ejecutar el worker docs-curator para escanear e indexar la documentación del proyecto?")) return;
+  $("kbBootstrap").disabled = true;
+  $("kbStatus").textContent = "Ejecutando docs-curator… esto puede tardar";
+  try {
+    const data = await api(`/api/v1/projects/${projectId}/documents/bootstrap`, { method:"POST" });
+    $("kbStatus").textContent = `Bootstrap completado · ${data.documents_count || 0} documento(s) · errores: ${(data.errors || []).length}`;
+    toast("Documentación indexada por docs-curator", "ok");
+    await loadKnowledgeDocs();
+    if (state.role === "ADMIN") refreshTopology().catch(() => {});
+  } catch (err) {
+    $("kbStatus").textContent = "Error en bootstrap documental";
+    toast(err.message, "bad");
+  } finally {
+    $("kbBootstrap").disabled = false;
+  }
+}
+
 function bindStaticEvents() {
   $("loginForm").addEventListener("submit", doEmailLogin);
   $("loginTabEmail").onclick = () => setLoginTab("email");
@@ -2017,6 +2127,11 @@ function bindStaticEvents() {
   $("drawerBackdrop").onclick = closeDrawer;
   $("modalClose").onclick = closeModal;
   $("newProjectBtn").onclick = openProjectModal;
+  $("kbRefresh").onclick = () => loadKnowledgeDocs();
+  $("kbProject").onchange = () => loadKnowledgeDocs();
+  $("kbSearchBtn").onclick = searchKnowledge;
+  $("kbBootstrap").onclick = bootstrapKnowledge;
+  $("kbSearch").addEventListener("keydown", (e) => { if (e.key === "Enter") searchKnowledge(); });
   $("newSkillBtn").onclick = () => openSkillEditor(null);
   $("skillsRefresh").onclick = () => loadSkills();
   $("skillSearch").oninput = renderSkills;

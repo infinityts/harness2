@@ -313,6 +313,14 @@ def _session_fallback():
     return None
 
 
+def _project_id():
+    mine = _session_fallback() or {}
+    project_id = mine.get("project_id")
+    if not project_id:
+        raise RuntimeError("La tool RAG requiere una sesion vinculada a un proyecto")
+    return project_id
+
+
 def tool_get_active_contract_and_task(args=None):
     status, data = api("GET", "/api/v1/tasks")
     if status != 200:
@@ -448,6 +456,46 @@ def tool_get_skill_manual(args):
     return data
 
 
+def tool_rag_ingest(args):
+    project_id = _project_id()
+    body = {
+        "source_uri": args.get("source_uri"),
+        "title": args.get("title") or args.get("source_uri"),
+        "doc_type": args.get("doc_type", "OTHER"),
+        "content": args.get("content"),
+        "metadata": args.get("metadata") or {},
+        "replace": bool(args.get("replace", True)),
+    }
+    if not body["source_uri"] or not body["content"]:
+        raise ValueError("source_uri y content son obligatorios")
+    status, data = api("POST", f"/api/v1/projects/{project_id}/documents", body)
+    if status != 200:
+        raise RuntimeError(f"rag ingest HTTP {status}: {data}")
+    return data
+
+
+def tool_rag_search(args):
+    project_id = _project_id()
+    query = args.get("query")
+    if not query:
+        raise ValueError("query es obligatorio")
+    status, data = api("POST", f"/api/v1/projects/{project_id}/documents/search", {
+        "query": query,
+        "limit": int(args.get("limit", 5)),
+    })
+    if status != 200:
+        raise RuntimeError(f"rag search HTTP {status}: {data}")
+    return data
+
+
+def tool_rag_list(args=None):
+    project_id = _project_id()
+    status, data = api("GET", f"/api/v1/projects/{project_id}/documents")
+    if status != 200:
+        raise RuntimeError(f"rag list HTTP {status}: {data}")
+    return data
+
+
 TOOL_FUNCS = {
     "harness_get_active_contract_and_task": tool_get_active_contract_and_task,
     "harness_request_context_pack": tool_request_context_pack,
@@ -456,6 +504,9 @@ TOOL_FUNCS = {
     "harness_report_checkpoint_failure": tool_report_checkpoint_failure,
     "harness_send_peer_message": tool_send_peer_message,
     "harness_get_skill_manual": tool_get_skill_manual,
+    "harness_rag_ingest": tool_rag_ingest,
+    "harness_rag_search": tool_rag_search,
+    "harness_rag_list": tool_rag_list,
 }
 
 TOOLS = [
@@ -542,6 +593,39 @@ TOOLS = [
             },
             "required": ["skill_slug"],
         },
+    },
+    {
+        "name": "harness_rag_ingest",
+        "description": "Ingesta o actualiza un documento del RAG del proyecto con checksum idempotente y secret scrubber.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source_uri": {"type": "string"},
+                "title": {"type": "string"},
+                "doc_type": {"type": "string"},
+                "content": {"type": "string"},
+                "metadata": {"type": "object"},
+                "replace": {"type": "boolean"},
+            },
+            "required": ["source_uri", "content"],
+        },
+    },
+    {
+        "name": "harness_rag_search",
+        "description": "Busca por similitud vectorial en la documentacion del proyecto de esta sesion.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "harness_rag_list",
+        "description": "Lista los documentos RAG del proyecto de esta sesion.",
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
 ]
 
@@ -632,9 +716,12 @@ def main():
         log("faltan HARNESS_SESSION_ID / HARNESS_SESSION_KEY")
         return 2
 
-    start_daemon()
     if opts.cli:
+        # Modo one-shot: no abrir WebSocket ni latidos; el proceso termina y
+        # cerrar el WS marcaria OFFLINE la sesion real del agente.
         return run_cli(opts.cli)
+
+    start_daemon()
     mcp_loop()
     return 0
 

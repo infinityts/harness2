@@ -39,7 +39,8 @@ def get_topology(engine: sa.Engine) -> Dict[str, Any]:
             SELECT s.id::text AS session_id, s.engineer_username, s.agent_tool, s.llm_provider,
                    s.skills, s.status, s.current_context_tokens, s.max_context_tokens,
                    s.system_contract_rules, s.last_heartbeat, s.connected_at,
-                   s.project_id::text AS project_id, p.project_slug
+                   s.project_id::text AS project_id, p.project_slug,
+                   s.is_headless_worker
             FROM agent_sessions s
             LEFT JOIN harness_projects p ON p.id = s.project_id
             ORDER BY s.connected_at DESC

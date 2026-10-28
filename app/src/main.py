@@ -41,6 +41,12 @@ from src.skill_compiler import (
     slugify,
     validate_skill_fields,
 )
+from src.doc_rag import (
+    ingest_document,
+    list_documents,
+    search_documents,
+)
+from src.doc_worker import run_doc_worker_job
 from src.git_guardian import (
     GitBarrierError,
     GitTaskPermissionError,
@@ -337,6 +343,7 @@ async def session_watchdog_loop():
                     sa.text("""
                         SELECT id::text FROM agent_sessions
                         WHERE status IN ('ONLINE', 'BUSY')
+                          AND is_headless_worker = false
                           AND last_heartbeat < NOW() - make_interval(secs => :timeout)
                     """),
                     {"timeout": HEARTBEAT_TIMEOUT}
@@ -375,11 +382,37 @@ async def session_watchdog_loop():
         await asyncio.sleep(3)
 
 
+async def headless_heartbeat_loop():
+    # Recupera workers que quedaron BUSY/OFFLINE por un reinicio durante un job.
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text("""
+                UPDATE agent_sessions
+                SET status = 'ONLINE', last_heartbeat = NOW()
+                WHERE is_headless_worker = true AND status IN ('BUSY', 'OFFLINE')
+            """))
+    except Exception as exc:
+        print(f"[docs-worker startup] {exc}")
+    while True:
+        try:
+            with engine.begin() as conn:
+                conn.execute(sa.text("""
+                    UPDATE agent_sessions
+                    SET last_heartbeat = NOW()
+                    WHERE is_headless_worker = true AND status IN ('ONLINE', 'BUSY')
+                """))
+        except Exception as exc:
+            print(f"[docs-worker heartbeat] {exc}")
+        await asyncio.sleep(10)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     watchdog_task = asyncio.create_task(session_watchdog_loop())
+    headless_task = asyncio.create_task(headless_heartbeat_loop())
     yield
     watchdog_task.cancel()
+    headless_task.cancel()
 
 
 app = FastAPI(title="Harness Control Plane", version="0.2.0", lifespan=lifespan)
@@ -462,11 +495,13 @@ def list_sessions():
     with engine.connect() as conn:
         rows = conn.execute(
             sa.text("""
-                SELECT id::text, engineer_username, agent_tool, llm_provider,
-                       skills, status, current_context_tokens, max_context_tokens,
-                       system_contract_rules, last_heartbeat, connected_at
-                FROM agent_sessions
-                ORDER BY connected_at DESC
+                SELECT s.id::text, s.engineer_username, s.agent_tool, s.llm_provider,
+                       s.skills, s.status, s.current_context_tokens, s.max_context_tokens,
+                       s.system_contract_rules, s.last_heartbeat, s.connected_at,
+                       s.project_id::text AS project_id, p.project_slug, s.is_headless_worker
+                FROM agent_sessions s
+                LEFT JOIN harness_projects p ON p.id = s.project_id
+                ORDER BY s.connected_at DESC
             """)
         ).mappings().all()
     return {"sessions": [dict(r) for r in rows]}
@@ -687,6 +722,7 @@ class ContextPackRequest(BaseModel):
     allowed_files: Optional[List[str]] = None
     token_budget: int = Field(default=2000, ge=300, le=16000)
     top_k: int = Field(default=5, ge=1, le=20)
+    include_docs: bool = True
 
 
 class SymbolValidationRequest(BaseModel):
@@ -769,6 +805,16 @@ def build_surgical_context_pack(payload: ContextPackRequest, auth: Dict[str, Any
             """),
             {"rname": payload.repo_name}
         ).mappings().all()
+        project = conn.execute(
+            sa.text("SELECT id::text FROM harness_projects WHERE project_slug = :rname"),
+            {"rname": payload.repo_name}
+        ).fetchone()
+        doc_rows = []
+        if payload.include_docs and project:
+            doc_rows = search_documents(
+                conn, project[0], payload.query,
+                limit=max(payload.top_k, 8), qvec=q_vec,
+            )
 
         # 2. Busqueda vectorial HNSW en code_ast_vectors
         if payload.allowed_files:
@@ -801,14 +847,18 @@ def build_surgical_context_pack(payload: ContextPackRequest, auth: Dict[str, Any
                 {"qvec": q_vec_str, "rname": payload.repo_name, "topk": payload.top_k}
             ).mappings().all()
 
-    # Empaquetado respetando estrictamente el presupuesto de tokens (~4 caracteres por token)
+    # Empaquetado respetando estrictamente el presupuesto de tokens (~4 caracteres por token).
+    # Hasta 28% para documentacion y el resto para mapa/AST.
     char_budget = payload.token_budget * 4
+    docs_budget_chars = int(char_budget * 0.28) if payload.include_docs else 0
+    code_budget_chars = char_budget - docs_budget_chars
     used_chars = 0
+    used_doc_chars = 0
 
     repo_overview = []
     for r in map_rows:
         line = f"{r['quick_summary']} [LOCK={r['locked_by_task_id'] or 'FREE'}]"
-        if used_chars + len(line) > int(char_budget * 0.35):
+        if used_chars + len(line) > int(code_budget_chars * 0.35):
             break
         repo_overview.append(line)
         used_chars += len(line)
@@ -816,7 +866,7 @@ def build_surgical_context_pack(payload: ContextPackRequest, auth: Dict[str, Any
     selected_snippets = []
     for vr in vec_rows:
         snippet_text = vr["code_snippet"]
-        remaining = char_budget - used_chars
+        remaining = code_budget_chars - used_chars
         if remaining <= 120:
             break
         if len(snippet_text) > remaining:
@@ -832,14 +882,38 @@ def build_surgical_context_pack(payload: ContextPackRequest, auth: Dict[str, Any
             "code_snippet": snippet_text
         })
 
-    estimated_tokens = min(payload.token_budget, max(1, used_chars // 4))
+    relevant_doc_chunks = []
+    for doc in doc_rows:
+        text = doc["chunk_text"]
+        remaining = docs_budget_chars - used_doc_chars
+        if remaining <= 80:
+            break
+        if len(text) > remaining:
+            suffix = "\n[...truncated by documentation budget]"
+            text = text[: max(0, remaining - len(suffix))] + suffix
+        used_doc_chars += len(text)
+        relevant_doc_chunks.append({
+            "document_id": doc["document_id"],
+            "source_uri": doc["source_uri"],
+            "title": doc["title"],
+            "doc_type": doc["doc_type"],
+            "section_heading": doc["section_heading"],
+            "similarity": float(doc["similarity"]),
+            "chunk_text": text,
+            "token_estimate": int(doc["token_estimate"]),
+        })
+
+    estimated_tokens = min(payload.token_budget, max(1, (used_chars + used_doc_chars) // 4))
     return {
         "repo_name": payload.repo_name,
         "token_budget": payload.token_budget,
         "estimated_tokens_used": estimated_tokens,
+        "documentation_tokens_used": max(0, used_doc_chars // 4),
+        "include_docs": payload.include_docs,
         "allowed_files_contract": payload.allowed_files or "READ_ONLY_UNRESTRICTED",
         "repo_quick_map": repo_overview,
-        "surgical_ast_chunks": selected_snippets
+        "surgical_ast_chunks": selected_snippets,
+        "relevant_doc_chunks": relevant_doc_chunks,
     }
 
 
@@ -1128,6 +1202,7 @@ def prepare_worktree_endpoint(task_id: str):
 async def submit_task_endpoint(
     task_id: str,
     payload: TaskSubmitRequest,
+    background: BackgroundTasks,
     auth: Dict[str, Any] = Depends(verify_auth),
 ):
     session_id = auth.get("session_id") if auth["role"] == "agent" else None
@@ -1188,6 +1263,22 @@ async def submit_task_endpoint(
         },
         source_session_id=result["assigned_session_id"],
     )
+
+    with engine.connect() as conn:
+        project_row = conn.execute(
+            sa.text("""
+                SELECT p.project_id::text
+                FROM harness_tasks t
+                JOIN feature_consensus_plans p ON p.id = t.plan_id
+                WHERE t.id = CAST(:tid AS UUID)
+            """),
+            {"tid": task_id}
+        ).fetchone()
+    if project_row and project_row[0]:
+        background.add_task(
+            run_doc_worker_job, engine, project_row[0],
+            f"task_merged:{task_id}", False,
+        )
 
     if result["assigned_session_id"]:
         with engine.connect() as conn:
@@ -2110,7 +2201,7 @@ def portal_me(auth: Dict[str, Any] = Depends(verify_portal)):
 
 
 @app.post("/api/v1/projects")
-def create_project(payload: ProjectCreateRequest, auth: Dict[str, Any] = Depends(verify_portal_admin)):
+def create_project(payload: ProjectCreateRequest, background: BackgroundTasks, auth: Dict[str, Any] = Depends(verify_portal_admin)):
     try:
         slug = validate_repo_name(payload.project_slug)
         repo_url = validate_repo_url(payload.repo_url)
@@ -2165,6 +2256,9 @@ def create_project(payload: ProjectCreateRequest, auth: Dict[str, Any] = Depends
                 """),
                 {"id": str(uuid.uuid4()), "pid": project["id"], "uid": auth["user_id"]}
             )
+    background.add_task(
+        run_doc_worker_job, engine, project["id"], "project_created", False
+    )
     return {"project": dict(project), "index": index_result}
 
 
@@ -3755,3 +3849,131 @@ def set_membership_skills(
             conn, project_id, user_id, slugs, auth.get("user_id"), replace=True
         )
     return {"project_id": project_id, "user_id": user_id, "skill_slugs": result}
+
+
+# ---------------------------------------------------------------------------
+# Etapa 9 - RAG documental nativo, bootstrap y aislamiento por proyecto
+# ---------------------------------------------------------------------------
+class DocumentIngestRequest(BaseModel):
+    source_uri: str = Field(..., min_length=3, max_length=500)
+    title: str = Field(..., min_length=1, max_length=255)
+    doc_type: str = Field(default="OTHER", max_length=50)
+    content: str = Field(..., min_length=1)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    replace: bool = True
+
+
+class DocumentSearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=2000)
+    limit: int = Field(default=5, ge=1, le=20)
+
+
+def verify_auth_or_portal(
+    x_harness_admin_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    if ADMIN_API_KEY and x_harness_admin_key and hmac.compare_digest(x_harness_admin_key, ADMIN_API_KEY):
+        return {"role": "admin", "role_name": "ADMIN", "session_id": None, "user_id": None}
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing credentials")
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        decoded = jwt.decode(
+            token, JWT_SECRET, algorithms=["HS256"],
+            options={"require": ["exp", "jti", "sub"]},
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
+    if decoded.get("typ") == "portal":
+        return _portal_auth_from_header(authorization)
+    return verify_auth(x_harness_admin_key=x_harness_admin_key, authorization=authorization)
+
+
+def _assert_doc_project_access(auth: Dict[str, Any], project_id: str, require_write: bool = False) -> None:
+    if auth.get("role") == "admin":
+        return
+    if auth.get("role") == "agent":
+        if auth.get("project_id") != project_id:
+            raise HTTPException(status_code=403, detail="Cross-Project Isolation Violation")
+        if require_write:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    sa.text("SELECT skills FROM agent_sessions WHERE id = CAST(:sid AS UUID)"),
+                    {"sid": auth.get("session_id")}
+                ).fetchone()
+            skills = set(row[0] or []) if row else set()
+            if not ({"rag-docs-curator", "tech-writer"} & skills):
+                raise HTTPException(status_code=403, detail="Document ingestion requires rag-docs-curator or tech-writer skill")
+        return
+    if require_write:
+        raise HTTPException(status_code=403, detail="Document ingestion requires Admin or Documenter agent")
+    with engine.connect() as conn:
+        membership = conn.execute(
+            sa.text("""
+                SELECT 1 FROM project_memberships
+                WHERE project_id = CAST(:pid AS UUID) AND user_id = CAST(:uid AS UUID)
+                  AND status = 'APPROVED'
+            """),
+            {"pid": project_id, "uid": auth.get("user_id")}
+        ).fetchone()
+    if not membership:
+        raise HTTPException(status_code=403, detail="Project access not approved")
+
+
+@app.post("/api/v1/projects/{project_id}/documents/bootstrap")
+async def bootstrap_project_documents(
+    project_id: str,
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    try:
+        summary = await asyncio.to_thread(
+            run_doc_worker_job, engine, project_id, "admin_bootstrap", True
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Documentation bootstrap failed: {exc}")
+    return summary
+
+
+@app.get("/api/v1/projects/{project_id}/documents")
+def list_project_documents(
+    project_id: str,
+    auth: Dict[str, Any] = Depends(verify_auth_or_portal),
+):
+    _assert_doc_project_access(auth, project_id)
+    with engine.connect() as conn:
+        documents = list_documents(conn, project_id)
+    return {"project_id": project_id, "documents": documents}
+
+
+@app.post("/api/v1/projects/{project_id}/documents/search")
+def search_project_documents(
+    project_id: str,
+    payload: DocumentSearchRequest,
+    auth: Dict[str, Any] = Depends(verify_auth_or_portal),
+):
+    _assert_doc_project_access(auth, project_id)
+    with engine.connect() as conn:
+        chunks = search_documents(conn, project_id, payload.query, limit=payload.limit)
+    return {"project_id": project_id, "query": payload.query, "chunks": chunks}
+
+
+@app.post("/api/v1/projects/{project_id}/documents")
+def ingest_project_document(
+    project_id: str,
+    payload: DocumentIngestRequest,
+    auth: Dict[str, Any] = Depends(verify_auth_or_portal),
+):
+    _assert_doc_project_access(auth, project_id, require_write=True)
+    try:
+        with engine.begin() as conn:
+            result = ingest_document(
+                conn, project_id, payload.source_uri, payload.title,
+                payload.doc_type, payload.content, payload.metadata,
+                auth.get("session_id") if auth.get("role") == "agent" else None,
+                replace=payload.replace,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return result

@@ -34,6 +34,7 @@ Seeds oficiales (solo lectura para ingenieros):
 | `doc-analyzer` | documents | 251 |
 | `tech-writer` | writing | 255 |
 | `frontend-design` | frontend | 475 |
+| `rag-docs-curator` | documents | 348 |
 
 `frontend-design` está adaptada de
 [`anthropics/skills/frontend-design`](https://www.skills.sh/anthropics/skills/frontend-design):
