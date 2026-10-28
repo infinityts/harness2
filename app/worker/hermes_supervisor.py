@@ -8,6 +8,7 @@ import concurrent.futures
 import json
 import os
 import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -35,6 +36,7 @@ WORKER_ID = f"{socket.gethostname()}-{os.getpid()}"
 
 BRIDGES = {}
 BRIDGE_LOCK = Lock()
+HERMES_LOCK = Lock()
 STOP = False
 
 
@@ -216,15 +218,58 @@ Reglas:
 """
 
 
+def cleanup_hermes_runtime():
+    """Libera kernels efimeros; el gateway se auto-retira por idle-exit."""
+    try:
+        subprocess.run(["pkill", "-f", "hermes_kernel_runner.py"], check=False, timeout=10)
+    except Exception:
+        pass
+    scratch = Path("/opt/data/cache/scratch")
+    if scratch.exists():
+        for path in scratch.glob("hermes_kernel_*"):
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+            except Exception:
+                pass
+
+
+def reap_zombies():
+    """Reapea huerfanos del gateway; los bridges vivos no estan en estado Z."""
+    while not STOP:
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    raw = Path(f"/proc/{entry}/stat").read_text()
+                    tail = raw.rsplit(")", 1)[1].split()
+                    state, ppid = tail[0], int(tail[1])
+                    if state == "Z" and ppid == 1:
+                        try:
+                            os.waitpid(int(entry), os.WNOHANG)
+                        except ChildProcessError:
+                            pass
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        time.sleep(5)
+
+
 def call_hermes(prompt, workspace, usage_path):
     cmd = [
         HERMES_PYTHON, HERMES_BIN,
         "--in", str(workspace),
         "--ignore-rules",
+        "-t", "skills",
         "-z", prompt,
         "--usage-file", str(usage_path),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=HERMES_TIMEOUT)
+    with HERMES_LOCK:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=HERMES_TIMEOUT)
+        finally:
+            cleanup_hermes_runtime()
     if proc.returncode != 0:
         raise RuntimeError(f"hermes exit {proc.returncode}: {(proc.stderr or proc.stdout)[-1500:]}")
     content = (proc.stdout or "").strip()
@@ -378,6 +423,7 @@ def main():
     global STOP
     signal.signal(signal.SIGTERM, _handle_stop)
     signal.signal(signal.SIGINT, _handle_stop)
+    threading.Thread(target=reap_zombies, daemon=True).start()
     log(f"supervisor iniciado worker={WORKER_ID} harness={HARNESS_URL} max_parallel={MAX_PARALLEL}")
     for _ in range(60):
         try:

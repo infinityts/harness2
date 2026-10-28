@@ -72,6 +72,7 @@ services:
     image: localhost/harness-hermes-worker:latest
     container_name: harness-hermes-worker
     restart: unless-stopped
+    init: true
     env_file: .env
     environment:
       HARNESS_URL: http://harness-app:8443

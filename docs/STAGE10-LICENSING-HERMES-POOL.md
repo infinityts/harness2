@@ -73,6 +73,9 @@ acotado. No hay un contenedor por proyecto.
 - Al terminar un job: `current_context_tokens=0`, estado `ONLINE`.
 - El `docs-curator` determinista de la Etapa 9 se mantiene como fallback de
   gobernanza y no cuenta contra `max_hermes_sessions`.
+- El contenedor usa `podman-init` para reap de huérfanos, limpia kernels
+  efímeros y el gateway Hermes se auto-retira por idle-exit (30 s). En reposo
+  queda en ~40 MB; el pico durante inferencia es ~400–500 MB.
 
 ### Cola
 

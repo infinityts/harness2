@@ -1,3 +1,5 @@
 model:
   provider: openai
   default: deepseek-chat
+gateway:
+  unmanaged_idle_exit_seconds: 30
