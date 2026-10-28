@@ -1,0 +1,300 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "Harness2 — Activación, Lease y Gracia Offline",
+    "subtitle": "Flujo entre licencia firmada, vendor activation, enforcement y auditoría",
+    "visual_preset": "signal-flow",
+    "quality_profile": "showcase",
+    "animation": "none",
+    "column_fit": "spread",
+    "viewBox": [
+      1000,
+      1020
+    ],
+    "views": [
+      {
+        "id": "activate",
+        "label": "Activación",
+        "focus": [
+          "license",
+          "harness",
+          "activation",
+          "audit"
+        ],
+        "note": "La licencia firmada habilita el lease; el vendor lo firma."
+      },
+      {
+        "id": "operate",
+        "label": "Operación",
+        "focus": [
+          "harness",
+          "enforcement",
+          "audit"
+        ],
+        "note": "Sin lease válido, Enforcement bloquea las operaciones nuevas."
+      },
+      {
+        "id": "degrade",
+        "label": "Gracia y revocación",
+        "focus": [
+          "harness",
+          "grace",
+          "enforcement",
+          "activation"
+        ],
+        "note": "La gracia cubre caídas; la revocación es inmediata."
+      }
+    ]
+  },
+  "participants": [
+    {
+      "id": "license",
+      "type": "security",
+      "label": "Signed License",
+      "sublabel": "Ed25519 + binding"
+    },
+    {
+      "id": "harness",
+      "type": "backend",
+      "label": "Activation Manager",
+      "sublabel": "lease + grace"
+    },
+    {
+      "id": "activation",
+      "type": "cloud",
+      "label": "Vendor Activation",
+      "sublabel": "registry + private key"
+    },
+    {
+      "id": "audit",
+      "type": "database",
+      "label": "License Audit",
+      "sublabel": "hash chain"
+    },
+    {
+      "id": "enforcement",
+      "type": "backend",
+      "label": "Enforcement",
+      "sublabel": "projects · sessions · jobs"
+    },
+    {
+      "id": "grace",
+      "type": "security",
+      "label": "Offline Grace",
+      "sublabel": "7 días"
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 390,
+      "label": "Activación"
+    },
+    {
+      "from": 410,
+      "to": 530,
+      "label": "Operación"
+    },
+    {
+      "from": 550,
+      "to": 940,
+      "label": "Degradación / gracia"
+    }
+  ],
+  "messages": [
+    {
+      "from": "license",
+      "to": "harness",
+      "y": 180,
+      "label": "verify signature + installation_id",
+      "variant": "emphasis"
+    },
+    {
+      "from": "harness",
+      "to": "license",
+      "y": 220,
+      "label": "entitlement: plan + limits",
+      "variant": "return"
+    },
+    {
+      "from": "harness",
+      "to": "activation",
+      "y": 270,
+      "label": "POST /v1/activate",
+      "variant": "emphasis"
+    },
+    {
+      "from": "activation",
+      "to": "harness",
+      "y": 315,
+      "label": "signed lease (TTL 7d)",
+      "variant": "return"
+    },
+    {
+      "from": "harness",
+      "to": "audit",
+      "y": 355,
+      "label": "LICENSE_ACTIVATED / RENEWED",
+      "variant": "dashed"
+    },
+    {
+      "from": "harness",
+      "to": "enforcement",
+      "y": 450,
+      "label": "operational gate = allow",
+      "variant": "emphasis"
+    },
+    {
+      "from": "harness",
+      "to": "enforcement",
+      "y": 495,
+      "label": "quota checks",
+      "variant": "default"
+    },
+    {
+      "from": "harness",
+      "to": "activation",
+      "y": 560,
+      "label": "renew / heartbeat",
+      "variant": "dashed"
+    },
+    {
+      "from": "activation",
+      "to": "harness",
+      "y": 600,
+      "label": "503 maintenance / unreachable",
+      "variant": "security"
+    },
+    {
+      "from": "harness",
+      "to": "grace",
+      "y": 645,
+      "label": "lease expired + grace valid",
+      "variant": "dashed"
+    },
+    {
+      "from": "harness",
+      "to": "enforcement",
+      "y": 690,
+      "label": "allow during OFFLINE_GRACE",
+      "variant": "emphasis"
+    },
+    {
+      "from": "harness",
+      "to": "audit",
+      "y": 730,
+      "label": "LICENSE_OFFLINE_GRACE",
+      "variant": "dashed"
+    },
+    {
+      "from": "activation",
+      "to": "harness",
+      "y": 790,
+      "label": "403 LICENSE_REVOKED",
+      "variant": "security"
+    },
+    {
+      "from": "harness",
+      "to": "enforcement",
+      "y": 835,
+      "label": "503 block writes",
+      "variant": "security"
+    },
+    {
+      "from": "harness",
+      "to": "audit",
+      "y": 875,
+      "label": "LICENSE_REVOKED",
+      "variant": "dashed"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "harness",
+      "from": 170,
+      "to": 880,
+      "type": "backend"
+    },
+    {
+      "participant": "activation",
+      "from": 260,
+      "to": 330,
+      "type": "cloud"
+    },
+    {
+      "participant": "audit",
+      "from": 345,
+      "to": 365,
+      "type": "database"
+    },
+    {
+      "participant": "enforcement",
+      "from": 440,
+      "to": 700,
+      "type": "backend"
+    },
+    {
+      "participant": "grace",
+      "from": 635,
+      "to": 660,
+      "type": "security"
+    },
+    {
+      "participant": "activation",
+      "from": 550,
+      "to": 610,
+      "type": "cloud"
+    },
+    {
+      "participant": "activation",
+      "from": 780,
+      "to": 800,
+      "type": "cloud"
+    },
+    {
+      "participant": "audit",
+      "from": 720,
+      "to": 740,
+      "type": "database"
+    },
+    {
+      "participant": "audit",
+      "from": 865,
+      "to": 885,
+      "type": "database"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Lease",
+      "items": [
+        "Firma Ed25519 del vendor",
+        "license_id + installation_id",
+        "TTL 7 días",
+        "renovación cada 5 min"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Gracia",
+      "items": [
+        "Caída o mantenimiento: 7 días",
+        "Revocación: sin gracia",
+        "Lease almacenado se verifica",
+        "Gracia agotada: 503"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Auditoría",
+      "items": [
+        "Activación y renovación",
+        "Gracia y expiración",
+        "Revocación inmediata",
+        "Cadena de hashes"
+      ]
+    }
+  ]
+}

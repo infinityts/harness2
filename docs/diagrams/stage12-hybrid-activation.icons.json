@@ -1,0 +1,5 @@
+{
+  "nodes": {
+    "audit": { "provider": "brand", "match": "postgresql" }
+  }
+}

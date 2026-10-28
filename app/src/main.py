@@ -64,6 +64,7 @@ from src.licensing import (
     update_policy,
 )
 from src.signed_license import LicenseManager
+from src.license_activation import ActivationManager
 from src.hermes_pool import (
     claim_job,
     complete_job,
@@ -132,6 +133,13 @@ HARNESS_PUBLIC_URL = os.getenv("HARNESS_PUBLIC_URL", "http://11.0.0.3:8444").rst
 
 engine = sa.create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=10, max_overflow=20)
 LICENSE_MANAGER = LicenseManager(engine)
+ACTIVATION_MANAGER = ActivationManager(engine, LICENSE_MANAGER)
+
+
+def assert_license_operational() -> None:
+    LICENSE_MANAGER.assert_operational()
+    ACTIVATION_MANAGER.assert_operational()
+    ACTIVATION_MANAGER.assert_operational()
 
 # Registro en memoria de conexiones WebSocket activas en este nodo
 active_connections: Dict[str, WebSocket] = {}
@@ -461,19 +469,37 @@ async def license_reload_loop():
             print(f"[license] periodic reload failed: {exc}")
 
 
+async def activation_loop():
+    while True:
+        try:
+            await asyncio.to_thread(ACTIVATION_MANAGER.activate, "periodic", False)
+        except Exception as exc:
+            print(f"[license] activation failed: {exc}")
+        delay = int(os.getenv("HARNESS_ACTIVATION_RENEW_SECONDS", "300"))
+        if not ACTIVATION_MANAGER.is_operational():
+            delay = min(delay, 30)
+        await asyncio.sleep(max(15, delay))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
         await asyncio.to_thread(LICENSE_MANAGER.reload, "startup", True)
     except Exception as exc:
         print(f"[license] startup reload failed: {exc}")
+    try:
+        await asyncio.to_thread(ACTIVATION_MANAGER.activate, "startup", True)
+    except Exception as exc:
+        print(f"[license] startup activation failed: {exc}")
     watchdog_task = asyncio.create_task(session_watchdog_loop())
     headless_task = asyncio.create_task(headless_heartbeat_loop())
     license_task = asyncio.create_task(license_reload_loop())
+    activation_task = asyncio.create_task(activation_loop())
     yield
     watchdog_task.cancel()
     headless_task.cancel()
     license_task.cancel()
+    activation_task.cancel()
 
 
 app = FastAPI(title="Harness Control Plane", version="0.2.0", lifespan=lifespan)
@@ -499,6 +525,7 @@ def health_check():
         "session_jwt_ttl_hours": SESSION_JWT_TTL_HOURS,
         "active_ws_connections": len(active_connections),
         "license_status": LICENSE_MANAGER.state.get("status"),
+        "license_activation_status": ACTIVATION_MANAGER.state.get("status"),
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
@@ -2207,7 +2234,7 @@ def portal_login(payload: PortalLoginRequest):
 
 @app.post("/api/v1/auth/register-invite")
 def portal_register_invite(payload: PortalRegisterRequest):
-    LICENSE_MANAGER.assert_operational()
+    assert_license_operational()
     email = payload.email.strip().lower()
     if not _valid_email(email):
         raise HTTPException(status_code=400, detail="Invalid email")
@@ -2308,7 +2335,7 @@ def portal_me(auth: Dict[str, Any] = Depends(verify_portal)):
 
 @app.post("/api/v1/projects")
 def create_project(payload: ProjectCreateRequest, auth: Dict[str, Any] = Depends(verify_portal_admin)):
-    LICENSE_MANAGER.assert_operational()
+    assert_license_operational()
     try:
         slug = validate_repo_name(payload.project_slug)
         repo_url = validate_repo_url(payload.repo_url)
@@ -2528,6 +2555,8 @@ def _license_payload(conn, policy: Dict[str, Any]) -> Dict[str, Any]:
         "error_message": signed.get("error_message"),
     }
     data["license_operational"] = LICENSE_MANAGER.is_operational()
+    data["activation"] = ACTIVATION_MANAGER.get_state(conn)
+    data["activation_operational"] = ACTIVATION_MANAGER.is_operational()
     data["audit_chain"] = LICENSE_MANAGER.verify_audit_chain(conn, limit=500)
     data["plans"] = LICENSE_TIERS
     data["recent_audit"] = [
@@ -2562,7 +2591,7 @@ def toggle_project_slot(
     payload: ProjectSlotRequest,
     auth: Dict[str, Any] = Depends(verify_portal_admin),
 ):
-    LICENSE_MANAGER.assert_operational()
+    assert_license_operational()
     worker = None
     job = None
     with engine.begin() as conn:
@@ -2662,7 +2691,7 @@ def put_admin_license(
     payload: LicenseUpdateRequest,
     auth: Dict[str, Any] = Depends(verify_portal_admin),
 ):
-    LICENSE_MANAGER.assert_operational()
+    assert_license_operational()
     overrides = {
         field: getattr(payload, field)
         for field in QUOTA_FIELDS
@@ -2690,11 +2719,26 @@ def put_admin_license(
 
 @app.post("/api/v1/admin/license/reload")
 async def reload_admin_license(auth: Dict[str, Any] = Depends(verify_portal_admin)):
-    state = await asyncio.to_thread(LICENSE_MANAGER.reload, auth.get("email") or "admin", True)
+    actor = auth.get("email") or "admin"
+    await asyncio.to_thread(LICENSE_MANAGER.reload, actor, True)
+    try:
+        await asyncio.to_thread(ACTIVATION_MANAGER.activate, actor, True)
+    except Exception as exc:
+        print(f"[license] activation after reload failed: {exc}")
     with engine.connect() as conn:
         policy = get_policy(conn)
         data = _license_payload(conn, policy)
     return data
+
+
+@app.post("/api/v1/admin/license/activate")
+async def activate_admin_license(auth: Dict[str, Any] = Depends(verify_portal_admin)):
+    actor = auth.get("email") or "admin"
+    state = await asyncio.to_thread(ACTIVATION_MANAGER.activate, actor, True)
+    with engine.connect() as conn:
+        policy = get_policy(conn)
+        data = _license_payload(conn, policy)
+    return {"activation": state, "license": data}
 
 
 @app.get("/api/v1/admin/license/audit")
@@ -2934,7 +2978,7 @@ async def remove_project_member(project_id: str, user_id: str, auth: Dict[str, A
 
 @app.post("/api/v1/portal/sessions")
 async def create_portal_session(payload: PortalSessionRequest, auth: Dict[str, Any] = Depends(verify_portal)):
-    LICENSE_MANAGER.assert_operational()
+    assert_license_operational()
     uid = auth["user_id"]
     with engine.connect() as conn:
         membership = conn.execute(
@@ -3467,7 +3511,7 @@ async def create_admin_user(
     payload: AdminUserCreateRequest,
     auth: Dict[str, Any] = Depends(verify_portal_admin),
 ):
-    LICENSE_MANAGER.assert_operational()
+    assert_license_operational()
     email = payload.email.strip().lower()
     if not _valid_email(email):
         raise HTTPException(status_code=400, detail="Invalid email")
@@ -4326,7 +4370,7 @@ async def bootstrap_project_documents(
     timeout: int = Query(default=180, ge=10, le=600),
     auth: Dict[str, Any] = Depends(verify_portal_admin),
 ):
-    LICENSE_MANAGER.assert_operational()
+    assert_license_operational()
     with engine.connect() as conn:
         project = conn.execute(
             sa.text("""
@@ -4424,7 +4468,7 @@ def ingest_project_document(
     payload: DocumentIngestRequest,
     auth: Dict[str, Any] = Depends(verify_auth_or_portal),
 ):
-    LICENSE_MANAGER.assert_operational()
+    assert_license_operational()
     _assert_doc_project_access(auth, project_id, require_write=True)
     try:
         with engine.begin() as conn:
@@ -4463,7 +4507,7 @@ class InternalBootstrapRequest(BaseModel):
 
 @app.post("/api/v1/internal/hermes/pool/sync")
 def internal_hermes_pool_sync(auth: Dict[str, Any] = Depends(require_worker)):
-    LICENSE_MANAGER.assert_operational()
+    assert_license_operational()
     with engine.begin() as conn:
         policy = get_policy(conn, for_update=True)
         data = sync_pool(conn, policy)
@@ -4472,7 +4516,7 @@ def internal_hermes_pool_sync(auth: Dict[str, Any] = Depends(require_worker)):
 
 @app.post("/api/v1/internal/hermes/jobs/claim")
 def internal_hermes_claim(payload: HermesWorkerRequest, auth: Dict[str, Any] = Depends(require_worker)):
-    LICENSE_MANAGER.assert_operational()
+    assert_license_operational()
     with engine.begin() as conn:
         claimed = claim_job(conn, payload.worker_id)
     if not claimed:

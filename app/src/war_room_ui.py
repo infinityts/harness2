@@ -487,6 +487,7 @@ WAR_ROOM_HTML = r"""<!doctype html>
             <div class="card" style="padding:14px">
               <div class="row"><span id="licenseSignedStatus" class="pill">MISSING</span><b id="licenseSignedCustomer" style="flex:1"></b><span id="licenseAuditState" class="pill">Audit —</span></div>
               <div id="licenseSignedMeta" class="muted" style="font-size:12px;margin-top:6px"></div>
+              <div class="row" style="margin-top:8px"><span id="licenseActivationStatus" class="pill">Activación —</span><span id="licenseActivationMeta" class="muted" style="font-size:12px;flex:1"></span><button id="licenseActivate" class="btn sm" type="button">Activar / Renovar</button></div>
             </div>
             <div class="row">
               <div class="field grow"><label for="licensePlan">Plan activo</label><select id="licensePlan"></select></div>
@@ -2220,14 +2221,28 @@ function renderLicense(data) {
     signed.grace_until ? `Gracia hasta ${new Date(signed.grace_until).toLocaleString()}` : "Sin gracia",
     signed.error_message || "",
   ].filter(Boolean).join(" · ");
+  const act = data.activation || {};
+  const actStatus = act.status || "UNKNOWN";
+  const actClass = ["ACTIVE", "OFFLINE_GRACE", "TEST_BYPASS", "NOT_CONFIGURED"].includes(actStatus) ? (actStatus === "ACTIVE" || actStatus === "TEST_BYPASS" ? "ok" : "warn") : "bad";
+  $("licenseActivationStatus").textContent = `Activación ${actStatus}`;
+  $("licenseActivationStatus").className = `pill ${actClass}`;
+  $("licenseActivationMeta").textContent = [
+    act.server_url ? `Servidor ${act.server_url}` : "Sin servidor de activación",
+    act.lease_expires_at ? `Lease hasta ${new Date(act.lease_expires_at).toLocaleString()}` : "Sin lease",
+    act.lease_grace_until ? `Gracia offline hasta ${new Date(act.lease_grace_until).toLocaleString()}` : "",
+    act.last_success_at ? `Última activación ${new Date(act.last_success_at).toLocaleString()}` : "",
+    act.last_error || "",
+  ].filter(Boolean).join(" · ");
+  const operational = Boolean(data.license_operational && data.activation_operational);
+  $("licenseApply").disabled = !operational;
+  $("licensePlan").disabled = !operational;
+  $("licenseActivate").disabled = !data.license_operational;
   const audit = data.audit_chain || {};
   $("licenseAuditState").textContent = audit.valid ? `Audit OK (${audit.events_checked})` : `Audit roto en #${audit.broken_at}`;
   $("licenseAuditState").className = `pill ${audit.valid ? "ok" : "bad"}`;
-  $("licenseOverLimit").classList.toggle("hidden", data.license_operational && !data.over_limit);
-  $("licenseOverLimit").textContent = !data.license_operational ? `Licencia ${status}` : "Over limit";
-  $("licenseApply").disabled = !data.license_operational;
-  $("licensePlan").disabled = !data.license_operational;
-  $("licenseStatus").textContent = `Plan ${data.plan_code} · ${status} · actualizado ${data.updated_at ? new Date(data.updated_at).toLocaleString() : "—"}${data.over_limit ? " · uso por encima del plan" : ""}`;
+  $("licenseOverLimit").classList.toggle("hidden", operational && !data.over_limit);
+  $("licenseOverLimit").textContent = !data.license_operational ? `Licencia ${status}` : (!data.activation_operational ? `Activación ${actStatus}` : "Over limit");
+  $("licenseStatus").textContent = `Plan ${data.plan_code} · ${status} · ${actStatus} · actualizado ${data.updated_at ? new Date(data.updated_at).toLocaleString() : "—"}${data.over_limit ? " · uso por encima del plan" : ""}`;
   const cards = [
     ["Proyectos activos", usage.active_projects_used, data.limits?.max_active_projects],
     ["Hermes online", usage.hermes_workers_online, data.limits?.max_hermes_sessions],
@@ -2281,6 +2296,19 @@ async function applyLicense() {
   }
 }
 
+async function activateLicense() {
+  $("licenseActivate").disabled = true;
+  try {
+    const data = await api("/api/v1/admin/license/activate", { method:"POST" });
+    if (data.license) renderLicense(data.license);
+    toast("Activación renovada", "ok");
+  } catch (err) {
+    toast(err.message, "bad");
+  } finally {
+    $("licenseActivate").disabled = false;
+  }
+}
+
 async function toggleProjectSlot(projectId, active) {
   const verb = active ? "activar" : "desactivar";
   if (!confirm(`¿${verb[0].toUpperCase() + verb.slice(1)} el slot de este proyecto?`)) return;
@@ -2314,6 +2342,7 @@ function bindStaticEvents() {
   $("kbSearch").addEventListener("keydown", (e) => { if (e.key === "Enter") searchKnowledge(); });
   $("licenseRefresh").onclick = () => loadLicense();
   $("licenseApply").onclick = applyLicense;
+  $("licenseActivate").onclick = activateLicense;
   $("licensePlan").onchange = () => {
     const limits = state.license?.plans?.[$("licensePlan").value];
     if (!limits) return;

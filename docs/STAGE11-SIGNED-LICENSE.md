@@ -172,6 +172,13 @@ La prueba Stage 10 usa el mismo set de prueba; se ejecuta dentro de
 `harness-app` con `license/test` copiado temporalmente a
 `/var/lib/harness/license-test`, y se elimina al terminar.
 
+## Evolución en Etapa 12
+
+La Etapa 12 añade activación online híbrida con lease Ed25519 de corta duración,
+gracia offline y revocación vendor-side. La licencia firmada sigue siendo la
+base de entitlement; el lease es la autorización operativa. Ver
+`docs/STAGE12-HYBRID-ACTIVATION.md`.
+
 ## Diagrama
 
 Diagrama interactivo Archify:
