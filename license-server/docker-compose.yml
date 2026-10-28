@@ -1,0 +1,34 @@
+services:
+  license-server:
+    build: .
+    image: localhost/harness-license-server:latest
+    container_name: harness-license-server
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      LICENSE_SERVER_PRIVATE_KEY: /license/private/private_key.pem
+      LICENSE_SERVER_DB: /data/activation.db
+      VENDOR_LICENSE_ID: ${VENDOR_LICENSE_ID:-prod-enterprise-10-2026}
+      VENDOR_INSTALLATION_ID: ${VENDOR_INSTALLATION_ID}
+      VENDOR_PLAN_CODE: ${VENDOR_PLAN_CODE:-ENTERPRISE_10}
+      LEASE_TTL_SECONDS: ${LEASE_TTL_SECONDS:-604800}
+      ACTIVATION_TOKEN: ${ACTIVATION_TOKEN}
+      ACTIVATION_ADMIN_TOKEN: ${ACTIVATION_ADMIN_TOKEN}
+    cpus: 1
+    mem_limit: 256m
+    volumes:
+      - ${LICENSE_PRIVATE_DIR:-../license/private}:/license/private:ro,z
+      - ./data:/data:z
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8450/health', timeout=3)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      harness-net:
+        ipv4_address: 172.28.0.40
+
+networks:
+  harness-net:
+    external: true

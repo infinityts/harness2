@@ -53,8 +53,6 @@ services:
     depends_on:
       harness-db:
         condition: service_healthy
-      license-server:
-        condition: service_started
     cpus: 3
     mem_limit: 4g
     ports:
@@ -92,30 +90,6 @@ services:
     networks:
       harness-net:
         ipv4_address: 172.28.0.30
-
-  license-server:
-    build: ./license-server
-    image: localhost/harness-license-server:latest
-    container_name: harness-license-server
-    restart: unless-stopped
-    init: true
-    environment:
-      LICENSE_SERVER_PRIVATE_KEY: /license/private/private_key.pem
-      LICENSE_SERVER_DB: /data/activation.db
-      VENDOR_LICENSE_ID: prod-enterprise-10-2026
-      VENDOR_INSTALLATION_ID: ${HARNESS_INSTALLATION_ID}
-      VENDOR_PLAN_CODE: ENTERPRISE_10
-      LEASE_TTL_SECONDS: "604800"
-      ACTIVATION_TOKEN: ${HARNESS_ACTIVATION_TOKEN}
-      ACTIVATION_ADMIN_TOKEN: ${HARNESS_ACTIVATION_ADMIN_TOKEN}
-    cpus: 1
-    mem_limit: 256m
-    volumes:
-      - ./license/private:/license/private:ro,z
-      - ./license-server/data:/data:z
-    networks:
-      harness-net:
-        ipv4_address: 172.28.0.40
 
 networks:
   harness-net:

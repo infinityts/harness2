@@ -100,6 +100,35 @@ Servidor vendor:
 | `POST` | `/v1/restore` | `X-Activation-Admin` |
 | `POST` | `/v1/maintenance` | `X-Activation-Admin` |
 
+## Docker separado
+
+`license-server` es un proyecto Docker independiente. El compose principal de
+Harness2 ya **no** contiene el servicio de licenciamiento; solo levanta
+`harness-db`, `harness-app` y `hermes-worker`.
+
+```bash
+# 1. Levantar Harness2 (crea la red harness-net)
+cd /opt/harness-control-plane
+podman-compose up -d
+
+# 2. Levantar el servidor de licenciamiento en su propio compose
+cd license-server
+cp .env.example .env
+# editar VENDOR_INSTALLATION_ID, ACTIVATION_TOKEN, ACTIVATION_ADMIN_TOKEN
+podman-compose up -d --build
+```
+
+El compose de `license-server` declara `harness-net` como red externa y se une
+como `harness-license-server` en `172.28.0.40:8450`. Harness2 lo consume con:
+
+```text
+HARNESS_ACTIVATION_URL=http://harness-license-server:8450
+```
+
+En producción este compose se publica en infraestructura del vendor, no en la
+del cliente. La clave privada se monta desde fuera del repositorio
+(`LICENSE_PRIVATE_DIR`) y nunca se copia dentro de Harness2.
+
 ## Variables de entorno
 
 Cliente:
