@@ -64,6 +64,31 @@ services:
       harness-net:
         ipv4_address: 172.28.0.20
 
+  hermes-worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    image: localhost/harness-hermes-worker:latest
+    container_name: harness-hermes-worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      HARNESS_URL: http://harness-app:8443
+      MAX_PARALLEL_JOBS: "3"
+      HERMES_TIMEOUT: "240"
+      SYNC_SECONDS: "10"
+    depends_on:
+      harness-app:
+        condition: service_started
+    cpus: 2
+    mem_limit: 2g
+    volumes:
+      - ./worker/home:/opt/data:Z
+      - ./worker/workspaces:/opt/harness-worker/workspaces:Z
+    networks:
+      harness-net:
+        ipv4_address: 172.28.0.30
+
 networks:
   harness-net:
     name: harness-net

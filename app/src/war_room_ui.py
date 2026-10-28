@@ -477,6 +477,40 @@ WAR_ROOM_HTML = r"""<!doctype html>
           </div>
         </section>
 
+        <section id="viewLicense" class="view hidden">
+          <div class="view-head">
+            <div><h1>Licencia y Pool Hermes</h1><p>Planes, cuotas atómicas y estado del pool de workers Hermes por proyecto.</p></div>
+            <div class="spacer"></div>
+            <span id="licenseOverLimit" class="pill bad hidden">Over limit</span>
+          </div>
+          <div class="card stack">
+            <div class="row">
+              <div class="field grow"><label for="licensePlan">Plan activo</label><select id="licensePlan"></select></div>
+              <button id="licenseApply" class="btn primary" type="button">Aplicar plan / cuotas</button>
+              <button id="licenseRefresh" class="btn sm" type="button">Refrescar</button>
+            </div>
+            <div class="grid-2">
+              <div class="field"><label for="licenseActiveProjects">Máx. proyectos activos</label><input id="licenseActiveProjects" type="number" min="0"></div>
+              <div class="field"><label for="licenseHermesSessions">Máx. sesiones Hermes</label><input id="licenseHermesSessions" type="number" min="0"></div>
+              <div class="field"><label for="licenseEngineersProject">Máx. ingenieros por proyecto</label><input id="licenseEngineersProject" type="number" min="0"></div>
+              <div class="field"><label for="licenseEngineersTotal">Máx. sesiones de ingeniero globales</label><input id="licenseEngineersTotal" type="number" min="0"></div>
+              <div class="field"><label for="licenseUsers">Máx. usuarios registrados</label><input id="licenseUsers" type="number" min="0"></div>
+              <div class="field"><label for="licenseParallelJobs">Jobs RAG en paralelo</label><input id="licenseParallelJobs" type="number" min="1"></div>
+            </div>
+            <div id="licenseUsage" class="project-grid"></div>
+            <div class="card" style="padding:14px">
+              <div class="side-label">Jobs Hermes recientes</div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Proyecto</th><th>Tipo</th><th>Estado</th><th>Intentos</th><th>Creado</th><th>Error</th></tr></thead>
+                  <tbody id="licenseJobs"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="muted" id="licenseStatus" style="font-size:12px"></div>
+          </div>
+        </section>
+
         <section id="viewSmtp" class="view hidden">
           <div class="view-head">
             <div><h1>SMTP y Notificaciones</h1><p>Configura el correo transaccional y verifica las credenciales antes de invitar ingenieros.</p></div>
@@ -616,6 +650,7 @@ function navItems() {
       { id:"knowledge", icon:"▤", label:"Base de Conocimiento", bottom:"Docs" },
       { id:"skills", icon:"✦", label:"Skill Studio", bottom:"Skills" },
       { id:"engineers", icon:"☺", label:"Usuarios y Accesos", bottom:"Usuarios" },
+      { id:"license", icon:"▣", label:"Licencia y Pool", bottom:"Licencia" },
       { id:"warroom", icon:"◎", label:"Sala de Control", bottom:"War Room" },
       { id:"smtp", icon:"✉", label:"SMTP y Correos", bottom:"SMTP" },
     ];
@@ -638,16 +673,17 @@ function buildNav() {
 
 function setView(name) {
   state.activeView = name;
-  const views = { projects:"viewProjects", knowledge:"viewKnowledge", skills:"viewSkills", engineers:"viewEngineers", warroom:"viewWarRoom", smtp:"viewSmtp", myprojects:"viewMyProjects" };
+  const views = { projects:"viewProjects", knowledge:"viewKnowledge", skills:"viewSkills", engineers:"viewEngineers", license:"viewLicense", warroom:"viewWarRoom", smtp:"viewSmtp", myprojects:"viewMyProjects" };
   Object.values(views).forEach(id => $(id).classList.add("hidden"));
   if (views[name]) $(views[name]).classList.remove("hidden");
   document.querySelectorAll("[data-view]").forEach(btn => btn.classList.toggle("active", btn.dataset.view === name));
-  $("topTitle").textContent = ({projects:"Proyectos", knowledge:"Base de Conocimiento", skills:"Skill Studio", engineers:"Usuarios y Accesos", warroom:"Sala de Control", smtp:"SMTP y Correos", myprojects:"Mis Proyectos"})[name] || "Harness";
+  $("topTitle").textContent = ({projects:"Proyectos", knowledge:"Base de Conocimiento", skills:"Skill Studio", engineers:"Usuarios y Accesos", license:"Licencia y Pool Hermes", warroom:"Sala de Control", smtp:"SMTP y Correos", myprojects:"Mis Proyectos"})[name] || "Harness";
   closeDrawer();
   if (name === "warroom") { if (state.role === "ADMIN") { ensureWarRoom(); } }
   if (name === "knowledge") loadKnowledge();
   if (name === "skills") loadSkills();
   if (name === "engineers") loadAdminUsers();
+  if (name === "license") loadLicense();
   if (name === "projects") renderProjects();
   if (name === "smtp") { loadSmtpConfig(); loadEmailLogs(); }
   if (name === "myprojects") renderMyProjects();
@@ -790,17 +826,21 @@ function renderProjects() {
   grid.innerHTML = projects.map(p => {
     const members = p.members || [];
     const sessions = p.active_sessions || [];
+    const worker = p.hermes_worker;
     return `<article class="card project-card">
-      <div class="row"><div style="flex:1;min-width:0"><h2>${esc(p.display_name)}</h2><div class="muted mono" style="font-size:12px">${esc(p.project_slug)}</div></div><span class="pill ${sessions.length ? "ok" : ""}">${sessions.length} sesiones activas</span></div>
+      <div class="row"><div style="flex:1;min-width:0"><h2>${esc(p.display_name)}</h2><div class="muted mono" style="font-size:12px">${esc(p.project_slug)}</div></div><span class="pill ${p.is_active_slot ? "ok" : "bad"}">${p.is_active_slot ? "Slot activo" : "Slot inactivo"}</span><span class="pill ${sessions.length ? "ok" : ""}">${sessions.length} sesiones activas</span></div>
       <div class="muted" style="font-size:12.5px">${esc(p.description || "Sin descripción")}</div>
-      <div class="meta"><span class="pill">${esc(p.default_branch || "main")}</span>${p.repo_url ? `<span class="pill info">repo remoto</span>` : `<span class="pill">repo local</span>`}<span class="pill">${members.length} miembros</span></div>
+      <div class="meta"><span class="pill">${esc(p.default_branch || "main")}</span>${p.repo_url ? `<span class="pill info">repo remoto</span>` : `<span class="pill">repo local</span>`}<span class="pill">${members.length} miembros</span>${worker ? `<span class="pill ${worker.status === "ONLINE" || worker.status === "BUSY" ? "ok" : "warn"}">Hermes ${esc(worker.status)}</span>` : '<span class="pill">Hermes sin worker</span>'}</div>
       <div class="divider"></div>
       <div><div class="side-label" style="padding:0 0 6px">Miembros aprobados</div>${members.length ? members.map(m => `<div class="row" style="justify-content:space-between;font-size:12px;padding:2px 0"><span>${esc(m.email)}</span><span class="muted">${esc((m.allowed_skills || []).join(", ") || "sin skills")}</span></div>`).join("") : '<div class="muted" style="font-size:12px">Sin miembros</div>'}</div>
-      <div class="row" style="margin-top:auto"><button class="btn sm" data-war-pid="${esc(p.id)}" type="button">Abrir War Room</button></div>
+      <div class="row" style="margin-top:auto"><button class="btn sm" data-war-pid="${esc(p.id)}" type="button">Abrir War Room</button><button class="btn sm" data-toggle-slot="${esc(p.id)}" data-active="${p.is_active_slot ? "false" : "true"}" type="button">${p.is_active_slot ? "Desactivar slot" : "Activar slot"}</button></div>
     </article>`;
   }).join("");
   grid.querySelectorAll("[data-war-pid]").forEach(btn => {
     btn.onclick = () => { state.projectFilter = btn.dataset.warPid; setView("warroom"); };
+  });
+  grid.querySelectorAll("[data-toggle-slot]").forEach(btn => {
+    btn.onclick = () => toggleProjectSlot(btn.dataset.toggleSlot, btn.dataset.active === "true");
   });
 }
 
@@ -2060,7 +2100,10 @@ async function loadKnowledgeDocs() {
   try {
     const data = await api(`/api/v1/projects/${projectId}/documents`);
     const docs = data.documents || [];
-    $("kbStatus").textContent = `${docs.length} documento(s) indexado(s)`;
+    const project = state.projects.find(p => p.id === projectId);
+    const worker = project?.hermes_worker;
+    const workerText = worker ? ` · Hermes ${worker.status}` : " · Hermes sin worker";
+    $("kbStatus").textContent = `${docs.length} documento(s) indexado(s)${workerText}`;
     $("kbDocs").innerHTML = docs.length ? docs.map(d => `<tr>
       <td class="mono" style="font-size:11px">${esc(d.source_uri)}</td>
       <td><span class="pill">${esc(d.doc_type)}</span></td>
@@ -2116,6 +2159,93 @@ async function bootstrapKnowledge() {
   }
 }
 
+async function loadLicense() {
+  try {
+    const data = await api("/api/v1/admin/license");
+    state.license = data;
+    const plan = $("licensePlan");
+    const plans = Object.keys(data.plans || {});
+    plan.innerHTML = plans.map(code => `<option value="${esc(code)}">${esc(code)}</option>`).join("");
+    if (plans.includes(data.plan_code)) plan.value = data.plan_code;
+    const limits = data.limits || {};
+    $("licenseActiveProjects").value = limits.max_active_projects ?? 0;
+    $("licenseHermesSessions").value = limits.max_hermes_sessions ?? 0;
+    $("licenseEngineersProject").value = limits.max_engineers_per_project ?? 0;
+    $("licenseEngineersTotal").value = limits.max_total_engineer_sessions ?? 0;
+    $("licenseUsers").value = limits.max_registered_users ?? 0;
+    $("licenseParallelJobs").value = limits.max_parallel_rag_jobs ?? 1;
+    renderLicense(data);
+  } catch (err) {
+    toast(err.message, "bad");
+    $("licenseStatus").textContent = "Error al cargar licencia: " + err.message;
+  }
+}
+
+function renderLicense(data) {
+  const usage = data.usage || {};
+  const jobs = usage.hermes_jobs || {};
+  $("licenseOverLimit").classList.toggle("hidden", !data.over_limit);
+  $("licenseStatus").textContent = `Plan ${data.plan_code} · actualizado ${data.updated_at ? new Date(data.updated_at).toLocaleString() : "—"}${data.over_limit ? " · uso por encima del plan" : ""}`;
+  const cards = [
+    ["Proyectos activos", usage.active_projects_used, data.limits?.max_active_projects],
+    ["Hermes online", usage.hermes_workers_online, data.limits?.max_hermes_sessions],
+    ["Ingenieros online", usage.total_engineers_online, data.limits?.max_total_engineer_sessions],
+    ["Sesiones de ingeniero", usage.total_engineer_sessions_online, data.limits?.max_total_engineer_sessions],
+    ["Usuarios registrados", usage.registered_engineers, data.limits?.max_registered_users],
+    ["Jobs RAG", `${jobs.queued || 0}Q / ${jobs.running || 0}R / ${jobs.completed || 0}C / ${jobs.failed || 0}F`, "—"],
+  ];
+  $("licenseUsage").innerHTML = cards.map(([label, used, limit]) => `<div class="card" style="padding:14px">
+    <div class="muted" style="font-size:12px">${esc(label)}</div>
+    <div style="font-size:26px;font-weight:800;margin-top:4px">${esc(String(used ?? 0))}${limit !== "—" && limit != null ? `<span class="muted" style="font-size:13px"> / ${esc(String(limit))}</span>` : ""}</div>
+  </div>`).join("");
+  const recent = data.recent_jobs || [];
+  $("licenseJobs").innerHTML = recent.length ? recent.map(j => `<tr>
+    <td class="mono" style="font-size:11px">${esc(j.project_slug || j.project_id)}</td>
+    <td>${esc(j.job_type)}</td>
+    <td><span class="pill ${j.status === "FAILED" ? "bad" : j.status === "COMPLETED" ? "ok" : j.status === "RUNNING" ? "warn" : ""}">${esc(j.status)}</span></td>
+    <td>${esc(j.attempts)}</td>
+    <td class="muted" style="font-size:11px">${esc(j.created_at ? new Date(j.created_at).toLocaleString() : "—")}</td>
+    <td class="muted" style="font-size:11px">${esc(j.error_message || "—")}</td>
+  </tr>`).join("") : '<tr><td colspan="6" class="muted">Sin jobs registrados.</td></tr>';
+}
+
+async function applyLicense() {
+  const body = {
+    plan_code: $("licensePlan").value,
+    max_active_projects: Number($("licenseActiveProjects").value),
+    max_hermes_sessions: Number($("licenseHermesSessions").value),
+    max_engineers_per_project: Number($("licenseEngineersProject").value),
+    max_total_engineer_sessions: Number($("licenseEngineersTotal").value),
+    max_registered_users: Number($("licenseUsers").value),
+    max_parallel_rag_jobs: Number($("licenseParallelJobs").value),
+  };
+  $("licenseApply").disabled = true;
+  try {
+    const data = await api("/api/v1/admin/license", { method:"PUT", body:JSON.stringify(body) });
+    renderLicense(data);
+    toast("Licencia actualizada", "ok");
+  } catch (err) {
+    toast(err.message, "bad");
+  } finally {
+    $("licenseApply").disabled = false;
+  }
+}
+
+async function toggleProjectSlot(projectId, active) {
+  const verb = active ? "activar" : "desactivar";
+  if (!confirm(`¿${verb[0].toUpperCase() + verb.slice(1)} el slot de este proyecto?`)) return;
+  try {
+    await api(`/api/v1/projects/${projectId}/toggle-slot`, {
+      method:"POST", body:JSON.stringify({ active }),
+    });
+    toast(`Slot ${active ? "activado" : "desactivado"}`, "ok");
+    await refreshProjects();
+    if (state.activeView === "license") await loadLicense();
+  } catch (err) {
+    toast(err.message, "bad");
+  }
+}
+
 function bindStaticEvents() {
   $("loginForm").addEventListener("submit", doEmailLogin);
   $("loginTabEmail").onclick = () => setLoginTab("email");
@@ -2132,6 +2262,18 @@ function bindStaticEvents() {
   $("kbSearchBtn").onclick = searchKnowledge;
   $("kbBootstrap").onclick = bootstrapKnowledge;
   $("kbSearch").addEventListener("keydown", (e) => { if (e.key === "Enter") searchKnowledge(); });
+  $("licenseRefresh").onclick = () => loadLicense();
+  $("licenseApply").onclick = applyLicense;
+  $("licensePlan").onchange = () => {
+    const limits = state.license?.plans?.[$("licensePlan").value];
+    if (!limits) return;
+    $("licenseActiveProjects").value = limits.max_active_projects;
+    $("licenseHermesSessions").value = limits.max_hermes_sessions;
+    $("licenseEngineersProject").value = limits.max_engineers_per_project;
+    $("licenseEngineersTotal").value = limits.max_total_engineer_sessions;
+    $("licenseUsers").value = limits.max_registered_users;
+    $("licenseParallelJobs").value = limits.max_parallel_rag_jobs;
+  };
   $("newSkillBtn").onclick = () => openSkillEditor(null);
   $("skillsRefresh").onclick = () => loadSkills();
   $("skillSearch").oninput = renderSkills;

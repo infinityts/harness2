@@ -33,10 +33,25 @@ SESSION_ID = os.environ.get("HARNESS_SESSION_ID", "").strip()
 SESSION_KEY = os.environ.get("HARNESS_SESSION_KEY", "").strip()
 HEARTBEAT_SECONDS = float(os.environ.get("HARNESS_HEARTBEAT_SECONDS", "3"))
 INITIAL_TOKENS = int(os.environ.get("HARNESS_CURRENT_TOKENS", "0"))
+STATUS_FILE = os.environ.get("HARNESS_STATUS_FILE", "").strip()
 
 _parsed = urllib.parse.urlparse(HARNESS_URL)
 _ws_scheme = "wss" if _parsed.scheme == "https" else "ws"
 WS_URL = f"{_ws_scheme}://{_parsed.netloc}/ws/agent/{SESSION_ID}"
+
+
+def reported_status(default="ONLINE"):
+    """Permite que un supervisor externo marque BUSY/ONLINE via archivo."""
+    if not STATUS_FILE:
+        return default
+    try:
+        with open(STATUS_FILE, "r", encoding="utf-8") as fh:
+            value = fh.read().strip().upper()
+        if value in ("ONLINE", "BUSY"):
+            return value
+    except Exception:
+        pass
+    return default
 
 state_lock = threading.RLock()
 bridge_state = {
@@ -249,7 +264,7 @@ def ws_loop():
             with state_lock:
                 initial = {
                     "current_context_tokens": bridge_state["current_context_tokens"],
-                    "status": bridge_state["status"],
+                    "status": reported_status(bridge_state["status"]),
                 }
             client.send_text(json.dumps(initial))
             while not _stop.is_set():
@@ -274,7 +289,7 @@ def _send_heartbeat_now():
     with state_lock:
         payload = {
             "current_context_tokens": bridge_state["current_context_tokens"],
-            "status": bridge_state["status"],
+            "status": reported_status(bridge_state["status"]),
         }
     try:
         client.send_text(json.dumps(payload))
@@ -290,7 +305,7 @@ def heartbeat_loop():
             with state_lock:
                 payload = {
                     "current_context_tokens": bridge_state["current_context_tokens"],
-                    "status": bridge_state["status"],
+                    "status": reported_status(bridge_state["status"]),
                 }
             try:
                 client.send_text(json.dumps(payload))
@@ -340,7 +355,7 @@ def tool_get_active_contract_and_task(args=None):
     return {
         "session_id": SESSION_ID,
         "connected": snap["connected"],
-        "status": snap["status"],
+        "status": reported_status(snap["status"]),
         "skills": skills,
         "max_context_tokens": max_tokens,
         "current_context_tokens": current,

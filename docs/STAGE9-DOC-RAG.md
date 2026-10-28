@@ -114,6 +114,13 @@ La pestaña **Base de Conocimiento** (`/portal`, vista `knowledge`) permite:
 - buscar semánticamente en la documentación;
 - ejecutar `docs-curator` con un clic (solo Admin).
 
+## Evolución en Etapa 10
+
+La Etapa 10 (`docs/STAGE10-LICENSING-HERMES-POOL.md`) mantiene estas tablas y
+endpoints, pero el bootstrap y los merges se ejecutan mediante un pool de
+sesiones Hermes por proyecto (`hermes_worker_jobs`). El `docs-curator`
+determinista queda como fallback de gobernanza y no consume cupo de licencia.
+
 ## Prueba E2E
 
 ```bash

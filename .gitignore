@@ -15,6 +15,10 @@ venv/
 
 # Datos y runtime
 data/
+worker/workspaces/
+worker/home/.env
+worker/home/.env.*
+!worker/home/.env.example
 *.log
 *.sqlite3
 

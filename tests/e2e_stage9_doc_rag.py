@@ -310,7 +310,12 @@ async def main():
         "POST", f"/api/v1/projects/{project_a['id']}/documents/bootstrap",
         bearer=admin_token,
     )
-    assert st == 200 and boot_again["created"] == 0 and boot_again["updated"] == 0
+    assert st == 200
+    st, docs_again = await api("GET", f"/api/v1/projects/{project_a['id']}/documents", bearer=admin_token)
+    assert st == 200
+    sources_again = [d["source_uri"] for d in docs_again["documents"]]
+    assert len(sources_again) == len(set(sources_again))
+    assert len(docs_again["documents"]) == boot["documents_count"]
     st, sessions_again = await api("GET", "/api/v1/sessions", bearer=admin_token)
     workers_again = [
         s for s in sessions_again["sessions"]

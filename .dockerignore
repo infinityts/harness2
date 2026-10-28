@@ -1,0 +1,10 @@
+.git
+.env
+data
+worker/workspaces
+worker/home/.env
+worker/home/.env.*
+**/__pycache__
+**/*.pyc
+docs
+tests

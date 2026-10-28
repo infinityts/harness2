@@ -2,6 +2,7 @@ import os
 import json
 import re
 import secrets
+import shutil
 import string
 import uuid
 import hashlib
@@ -14,11 +15,12 @@ from typing import Any, List, Dict, Optional
 import jwt
 import sqlalchemy as sa
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, Query, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from pathlib import Path
 
 from src.indexer import (
+    REPOS_BASE_DIR,
     compute_embedding_768,
     ensure_project_repo,
     index_repository,
@@ -42,11 +44,35 @@ from src.skill_compiler import (
     validate_skill_fields,
 )
 from src.doc_rag import (
+    bootstrap_project_docs,
     ingest_document,
     list_documents,
     search_documents,
 )
-from src.doc_worker import run_doc_worker_job
+from src.doc_worker import ensure_headless_worker_session
+from src.licensing import (
+    LICENSE_TIERS,
+    QUOTA_FIELDS,
+    LicenseError,
+    assert_downgrade_allowed,
+    assert_engineer_quota,
+    assert_hermes_slot_available,
+    assert_project_slot_available,
+    assert_registered_user_quota,
+    get_policy,
+    license_response,
+    update_policy,
+)
+from src.hermes_pool import (
+    claim_job,
+    complete_job,
+    deactivate_hermes_session,
+    enqueue_job,
+    ensure_hermes_worker_session,
+    fail_job,
+    heartbeat_job,
+    sync_pool,
+)
 from src.git_guardian import (
     GitBarrierError,
     GitTaskPermissionError,
@@ -66,6 +92,7 @@ from src.war_room import get_topology, record_event
 from src.war_room_ui import WAR_ROOM_HTML
 
 ADMIN_API_KEY = os.getenv("HARNESS_ADMIN_API_KEY", "")
+WORKER_API_KEY = os.getenv("HARNESS_WORKER_KEY", "")
 war_room_clients = set()
 
 
@@ -199,6 +226,22 @@ def require_admin(auth: Dict[str, Any] = Depends(verify_auth)) -> Dict[str, Any]
     if auth.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin key required")
     return auth
+
+
+def require_worker(
+    x_harness_worker_key: Optional[str] = Header(default=None),
+    x_harness_admin_key: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """Autentica al supervisor del pool Hermes.
+
+    Acepta una clave de servicio dedicada y, como fallback operativo, la Admin
+    API key. No acepta tokens de portal ni session keys de agentes.
+    """
+    if WORKER_API_KEY and x_harness_worker_key and hmac.compare_digest(x_harness_worker_key, WORKER_API_KEY):
+        return {"role": "worker", "role_name": "WORKER"}
+    if ADMIN_API_KEY and x_harness_admin_key and hmac.compare_digest(x_harness_admin_key, ADMIN_API_KEY):
+        return {"role": "worker", "role_name": "WORKER", "via": "admin_key"}
+    raise HTTPException(status_code=403, detail="Worker service key required")
 
 
 def _portal_auth_from_header(authorization: Optional[str]) -> Dict[str, Any]:
@@ -418,6 +461,14 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Harness Control Plane", version="0.2.0", lifespan=lifespan)
 
 
+@app.exception_handler(LicenseError)
+async def license_error_handler(request, exc: LicenseError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.message, "code": exc.code},
+    )
+
+
 @app.get("/health")
 def health_check():
     with engine.connect() as conn:
@@ -498,7 +549,8 @@ def list_sessions():
                 SELECT s.id::text, s.engineer_username, s.agent_tool, s.llm_provider,
                        s.skills, s.status, s.current_context_tokens, s.max_context_tokens,
                        s.system_contract_rules, s.last_heartbeat, s.connected_at,
-                       s.project_id::text AS project_id, p.project_slug, s.is_headless_worker
+                       s.project_id::text AS project_id, p.project_slug, s.is_headless_worker,
+                       s.session_kind, s.worker_role
                 FROM agent_sessions s
                 LEFT JOIN harness_projects p ON p.id = s.project_id
                 ORDER BY s.connected_at DESC
@@ -577,29 +629,54 @@ async def agent_heartbeat_ws(websocket: WebSocket, session_id: str):
         return
 
     token_hash = hash_token(token)
-    with engine.begin() as conn:
-        row = conn.execute(
-            sa.text("""
-                SELECT status, max_context_tokens, skills, system_contract_rules
-                FROM agent_sessions
-                WHERE id = CAST(:sid AS UUID) AND session_key_hash = :khash
-            """),
-            {"sid": session_id, "khash": token_hash}
-        ).fetchone()
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(
+                sa.text("""
+                    SELECT status, max_context_tokens, skills, system_contract_rules,
+                           user_id::text AS user_id, project_id::text AS project_id,
+                           session_kind
+                    FROM agent_sessions
+                    WHERE id = CAST(:sid AS UUID) AND session_key_hash = :khash
+                """),
+                {"sid": session_id, "khash": token_hash}
+            ).mappings().fetchone()
 
-        if not row or row[0] == "REVOKED":
-            await websocket.close(code=4003, reason="Session unauthorized or revoked")
-            return
+            if not row or row["status"] == "REVOKED":
+                await websocket.close(code=4003, reason="Session unauthorized or revoked")
+                return
 
-        # Al reconectar con key valida (y no revocada), asegurar estado ONLINE y heartbeat fresco
-        conn.execute(
-            sa.text("""
-                UPDATE agent_sessions
-                SET status = 'ONLINE', last_heartbeat = NOW()
-                WHERE id = CAST(:sid AS UUID)
-            """),
-            {"sid": session_id}
-        )
+            if row["session_kind"] == "INTERACTIVE" and row["project_id"] and row["user_id"]:
+                policy = get_policy(conn, for_update=True)
+                assert_engineer_quota(
+                    conn, policy, row["project_id"], row["user_id"],
+                    exclude_session_ids=[session_id],
+                )
+
+            # Al reconectar con key valida (y no revocada), asegurar estado ONLINE y heartbeat fresco
+            conn.execute(
+                sa.text("""
+                    UPDATE agent_sessions
+                    SET status = 'ONLINE', last_heartbeat = NOW()
+                    WHERE id = CAST(:sid AS UUID)
+                """),
+                {"sid": session_id}
+            )
+    except LicenseError as exc:
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    sa.text("""
+                        UPDATE agent_sessions
+                        SET status = 'OFFLINE', last_heartbeat = NOW()
+                        WHERE id = CAST(:sid AS UUID)
+                    """),
+                    {"sid": session_id}
+                )
+        except Exception:
+            pass
+        await websocket.close(code=4003, reason=exc.message[:120])
+        return
 
     if not pre_accepted:
         await websocket.accept()
@@ -607,9 +684,9 @@ async def agent_heartbeat_ws(websocket: WebSocket, session_id: str):
     await websocket.send_json({
         "event": "SESSION_SYNC",
         "session_id": session_id,
-        "skills": row[2] or [],
-        "max_context_tokens": row[1] or 32000,
-        "system_contract_rules": row[3] or [],
+        "skills": row["skills"] or [],
+        "max_context_tokens": row["max_context_tokens"] or 32000,
+        "system_contract_rules": row["system_contract_rules"] or [],
     })
 
     try:
@@ -1202,7 +1279,6 @@ def prepare_worktree_endpoint(task_id: str):
 async def submit_task_endpoint(
     task_id: str,
     payload: TaskSubmitRequest,
-    background: BackgroundTasks,
     auth: Dict[str, Any] = Depends(verify_auth),
 ):
     session_id = auth.get("session_id") if auth["role"] == "agent" else None
@@ -1264,7 +1340,7 @@ async def submit_task_endpoint(
         source_session_id=result["assigned_session_id"],
     )
 
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         project_row = conn.execute(
             sa.text("""
                 SELECT p.project_id::text
@@ -1274,11 +1350,19 @@ async def submit_task_endpoint(
             """),
             {"tid": task_id}
         ).fetchone()
-    if project_row and project_row[0]:
-        background.add_task(
-            run_doc_worker_job, engine, project_row[0],
-            f"task_merged:{task_id}", False,
-        )
+        if project_row and project_row[0]:
+            job = enqueue_job(
+                conn, project_row[0], "RAG_UPDATE_ARCHITECTURE",
+                {"task_id": task_id, "reason": "task_merged"},
+                idempotency_key=f"task-merged:{task_id}",
+                priority=30,
+            )
+            record_event(
+                engine,
+                "HERMES_JOB_ENQUEUED",
+                {"project_id": project_row[0], "task_id": task_id,
+                 "job_type": "RAG_UPDATE_ARCHITECTURE", **job},
+            )
 
     if result["assigned_session_id"]:
         with engine.connect() as conn:
@@ -2138,6 +2222,8 @@ def portal_register_invite(payload: PortalRegisterRequest):
         else:
             if payload.invite_token:
                 raise HTTPException(status_code=403, detail="Invalid invite token")
+            policy = get_policy(conn, for_update=True)
+            assert_registered_user_quota(conn, policy)
             conn.execute(
                 sa.text("""
                     INSERT INTO harness_users
@@ -2201,7 +2287,7 @@ def portal_me(auth: Dict[str, Any] = Depends(verify_portal)):
 
 
 @app.post("/api/v1/projects")
-def create_project(payload: ProjectCreateRequest, background: BackgroundTasks, auth: Dict[str, Any] = Depends(verify_portal_admin)):
+def create_project(payload: ProjectCreateRequest, auth: Dict[str, Any] = Depends(verify_portal_admin)):
     try:
         slug = validate_repo_name(payload.project_slug)
         repo_url = validate_repo_url(payload.repo_url)
@@ -2213,6 +2299,13 @@ def create_project(payload: ProjectCreateRequest, background: BackgroundTasks, a
         exists = conn.execute(sa.text("SELECT id FROM harness_projects WHERE project_slug = :slug"), {"slug": slug}).fetchone()
     if exists:
         raise HTTPException(status_code=409, detail="Project already exists")
+
+    # Pre-check antes de clonar/indexar: un plan lleno no debe dejar side effects.
+    with engine.begin() as conn:
+        policy = get_policy(conn, for_update=True)
+        assert_project_slot_available(conn, policy)
+        assert_hermes_slot_available(conn, policy)
+
     try:
         ensure_project_repo(slug, repo_url, payload.default_branch)
     except ValueError as exc:
@@ -2224,42 +2317,84 @@ def create_project(payload: ProjectCreateRequest, background: BackgroundTasks, a
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Initial index failed: {exc}")
 
-    with engine.begin() as conn:
-        project = conn.execute(
-            sa.text("""
-                INSERT INTO harness_projects
-                    (id, project_slug, display_name, description, repo_url, default_branch, created_by_user_id)
-                VALUES
-                    (CAST(:id AS UUID), :slug, :display_name, :description, :repo_url, :branch, CAST(:created_by AS UUID))
-                RETURNING id::text, project_slug, display_name, description, repo_url, default_branch,
-                          created_by_user_id::text, created_at
-            """),
-            {
-                "id": str(uuid.uuid4()),
-                "slug": slug,
-                "display_name": payload.display_name,
-                "description": payload.description,
-                "repo_url": repo_url,
-                "branch": payload.default_branch,
-                "created_by": auth.get("user_id"),
-            }
-        ).mappings().fetchone()
-        if auth.get("user_id"):
-            conn.execute(
+    try:
+        with engine.begin() as conn:
+            policy = get_policy(conn, for_update=True)
+            assert_project_slot_available(conn, policy)
+            assert_hermes_slot_available(conn, policy)
+            project = conn.execute(
                 sa.text("""
-                    INSERT INTO project_memberships
-                        (id, project_id, user_id, approved_by_admin_id, allowed_skills, status)
+                    INSERT INTO harness_projects
+                        (id, project_slug, display_name, description, repo_url,
+                         default_branch, created_by_user_id, is_active_slot)
                     VALUES
-                        (CAST(:id AS UUID), CAST(:pid AS UUID), CAST(:uid AS UUID), CAST(:uid AS UUID),
-                         CAST('[]' AS JSONB), 'APPROVED')
-                    ON CONFLICT (project_id, user_id) DO NOTHING
+                        (CAST(:id AS UUID), :slug, :display_name, :description, :repo_url,
+                         :branch, CAST(:created_by AS UUID), true)
+                    RETURNING id::text, project_slug, display_name, description, repo_url,
+                              default_branch, created_by_user_id::text, created_at, is_active_slot
                 """),
-                {"id": str(uuid.uuid4()), "pid": project["id"], "uid": auth["user_id"]}
+                {
+                    "id": str(uuid.uuid4()),
+                    "slug": slug,
+                    "display_name": payload.display_name,
+                    "description": payload.description,
+                    "repo_url": repo_url,
+                    "branch": payload.default_branch,
+                    "created_by": auth.get("user_id"),
+                }
+            ).mappings().fetchone()
+            if auth.get("user_id"):
+                conn.execute(
+                    sa.text("""
+                        INSERT INTO project_memberships
+                            (id, project_id, user_id, approved_by_admin_id, allowed_skills, status)
+                        VALUES
+                            (CAST(:id AS UUID), CAST(:pid AS UUID), CAST(:uid AS UUID), CAST(:uid AS UUID),
+                             CAST('[]' AS JSONB), 'APPROVED')
+                        ON CONFLICT (project_id, user_id) DO NOTHING
+                    """),
+                    {"id": str(uuid.uuid4()), "pid": project["id"], "uid": auth["user_id"]}
+                )
+            worker = ensure_hermes_worker_session(
+                conn, project["id"], set_online=False, initial_status="OFFLINE"
             )
-    background.add_task(
-        run_doc_worker_job, engine, project["id"], "project_created", False
-    )
-    return {"project": dict(project), "index": index_result}
+            # Fallback determinista historico (Etapa 9): sesion de gobernanza
+            # sin proceso LLM. No consume cupo de Hermes.
+            headless_worker = ensure_headless_worker_session(conn, project["id"], False)
+            job = enqueue_job(
+                conn, project["id"], "RAG_BOOTSTRAP",
+                {"reason": "project_created", "project_slug": slug},
+                idempotency_key=f"project-created:{project['id']}",
+                priority=20,
+            )
+    except LicenseError:
+        shutil.rmtree(REPOS_BASE_DIR / slug, ignore_errors=True)
+        try:
+            with engine.begin() as conn:
+                conn.execute(sa.text("DELETE FROM repo_file_map WHERE repo_name = :slug"), {"slug": slug})
+        except Exception:
+            pass
+        raise
+    if headless_worker:
+        record_event(
+            engine,
+            "HEADLESS_WORKER_READY",
+            {
+                "session_id": headless_worker["session_id"],
+                "project_id": project["id"],
+                "project_slug": slug,
+                "skills": ["tech-writer", "doc-analyzer", "rag-docs-curator"],
+                "trigger": "project_created",
+                "created": headless_worker.get("created"),
+            },
+            source_session_id=headless_worker["session_id"],
+        )
+    return {
+        "project": dict(project),
+        "index": index_result,
+        "hermes_worker": {k: v for k, v in (worker or {}).items() if k != "session_key"},
+        "job": job,
+    }
 
 
 @app.get("/api/v1/projects")
@@ -2270,13 +2405,14 @@ def list_projects(auth: Dict[str, Any] = Depends(verify_portal_or_admin)):
         if is_admin:
             projects = conn.execute(sa.text("""
                 SELECT id::text, project_slug, display_name, description, repo_url, default_branch,
-                       created_by_user_id::text, created_at
+                       created_by_user_id::text, created_at, is_active_slot
                 FROM harness_projects ORDER BY project_slug
             """)).mappings().all()
         else:
             projects = conn.execute(sa.text("""
                 SELECT p.id::text, p.project_slug, p.display_name, p.description, p.repo_url,
                        p.default_branch, p.created_by_user_id::text, p.created_at,
+                       p.is_active_slot,
                        m.allowed_skills, m.status AS membership_status
                 FROM harness_projects p
                 JOIN project_memberships m ON m.project_id = p.id
@@ -2287,6 +2423,18 @@ def list_projects(auth: Dict[str, Any] = Depends(verify_portal_or_admin)):
         result = []
         for project in projects:
             item = dict(project)
+            worker = conn.execute(sa.text("""
+                SELECT s.id::text, s.status, s.agent_tool, s.worker_role,
+                       s.current_context_tokens, s.max_context_tokens, s.last_heartbeat
+                FROM agent_sessions s
+                WHERE s.project_id = CAST(:pid AS UUID)
+                  AND s.session_kind = 'SYSTEM_WORKER'
+                  AND s.agent_tool = 'hermes'
+                  AND s.status <> 'REVOKED'
+                ORDER BY s.connected_at DESC
+                LIMIT 1
+            """), {"pid": project["id"]}).mappings().fetchone()
+            item["hermes_worker"] = dict(worker) if worker else None
             if is_admin:
                 members = conn.execute(sa.text("""
                     SELECT m.user_id::text, u.email, u.full_name, m.status, m.allowed_skills,
@@ -2325,6 +2473,165 @@ def list_projects(auth: Dict[str, Any] = Depends(verify_portal_or_admin)):
             item["active_sessions"] = [dict(x) for x in sessions]
             result.append(item)
     return {"projects": result}
+
+
+class ProjectSlotRequest(BaseModel):
+    active: bool
+
+
+class LicenseUpdateRequest(BaseModel):
+    plan_code: str = Field(..., min_length=3, max_length=40)
+    max_active_projects: Optional[int] = Field(default=None, ge=0)
+    max_hermes_sessions: Optional[int] = Field(default=None, ge=0)
+    max_engineers_per_project: Optional[int] = Field(default=None, ge=0)
+    max_total_engineer_sessions: Optional[int] = Field(default=None, ge=0)
+    max_registered_users: Optional[int] = Field(default=None, ge=0)
+    max_parallel_rag_jobs: Optional[int] = Field(default=None, ge=1)
+
+
+def _license_payload(conn, policy: Dict[str, Any]) -> Dict[str, Any]:
+    data = license_response(conn, policy)
+    data["plans"] = LICENSE_TIERS
+    data["recent_jobs"] = [
+        dict(row) for row in conn.execute(
+            sa.text("""
+                SELECT j.id::text, j.project_id::text, p.project_slug, j.job_type,
+                       j.status, j.attempts, j.error_message, j.created_at,
+                       j.started_at, j.completed_at
+                FROM hermes_worker_jobs j
+                JOIN harness_projects p ON p.id = j.project_id
+                ORDER BY j.created_at DESC
+                LIMIT 15
+            """)
+        ).mappings().all()
+    ]
+    return data
+
+
+@app.post("/api/v1/projects/{project_id}/toggle-slot")
+def toggle_project_slot(
+    project_id: str,
+    payload: ProjectSlotRequest,
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    worker = None
+    job = None
+    with engine.begin() as conn:
+        policy = get_policy(conn, for_update=True)
+        project = conn.execute(
+            sa.text("""
+                SELECT id::text, project_slug, display_name, is_active_slot
+                FROM harness_projects
+                WHERE id = CAST(:pid AS UUID)
+                FOR UPDATE
+            """),
+            {"pid": project_id},
+        ).mappings().fetchone()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        if payload.active and not project["is_active_slot"]:
+            assert_project_slot_available(conn, policy)
+            existing = conn.execute(
+                sa.text("""
+                    SELECT id::text FROM agent_sessions
+                    WHERE project_id = CAST(:pid AS UUID)
+                      AND session_kind = 'SYSTEM_WORKER'
+                      AND agent_tool = 'hermes'
+                      AND status <> 'REVOKED'
+                    LIMIT 1
+                """),
+                {"pid": project_id},
+            ).fetchone()
+            assert_hermes_slot_available(
+                conn, policy,
+                exclude_session_id=existing[0] if existing else None,
+            )
+            conn.execute(
+                sa.text("UPDATE harness_projects SET is_active_slot = true WHERE id = CAST(:pid AS UUID)"),
+                {"pid": project_id},
+            )
+            worker = ensure_hermes_worker_session(
+                conn, project_id, set_online=False, initial_status="OFFLINE"
+            )
+            job = enqueue_job(
+                conn, project_id, "RAG_REFRESH_PROJECT",
+                {"reason": "slot_activated", "project_slug": project["project_slug"]},
+                idempotency_key=None,
+                priority=40,
+            )
+        elif not payload.active and project["is_active_slot"]:
+            conn.execute(
+                sa.text("UPDATE harness_projects SET is_active_slot = false WHERE id = CAST(:pid AS UUID)"),
+                {"pid": project_id},
+            )
+            conn.execute(
+                sa.text("""
+                    UPDATE hermes_worker_jobs
+                    SET status = 'CANCELLED',
+                        completed_at = NOW(),
+                        updated_at = NOW(),
+                        error_message = COALESCE(error_message, 'project slot deactivated')
+                    WHERE project_id = CAST(:pid AS UUID) AND status = 'QUEUED'
+                """),
+                {"pid": project_id},
+            )
+            deactivate_hermes_session(conn, project_id, "OFFLINE")
+        data = _license_payload(conn, policy)
+    record_event(
+        engine,
+        "PROJECT_SLOT_CHANGED",
+        {
+            "project_id": project_id,
+            "project_slug": project["project_slug"],
+            "active": bool(payload.active),
+            "job_id": (job or {}).get("id"),
+        },
+    )
+    return {
+        "project": {
+            "id": project_id,
+            "project_slug": project["project_slug"],
+            "display_name": project["display_name"],
+            "is_active_slot": bool(payload.active),
+        },
+        "hermes_worker": {k: v for k, v in (worker or {}).items() if k != "session_key"},
+        "job": job,
+        "license": data,
+    }
+
+
+@app.get("/api/v1/admin/license")
+def get_admin_license(auth: Dict[str, Any] = Depends(verify_portal_admin)):
+    with engine.connect() as conn:
+        policy = get_policy(conn)
+        return _license_payload(conn, policy)
+
+
+@app.put("/api/v1/admin/license")
+def put_admin_license(
+    payload: LicenseUpdateRequest,
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    overrides = {
+        field: getattr(payload, field)
+        for field in QUOTA_FIELDS
+        if getattr(payload, field, None) is not None
+    }
+    with engine.begin() as conn:
+        get_policy(conn, for_update=True)
+        policy = update_policy(conn, payload.plan_code, overrides)
+        assert_downgrade_allowed(conn, policy)
+        data = _license_payload(conn, policy)
+    record_event(
+        engine,
+        "LICENSE_PLAN_CHANGED",
+        {
+            "plan_code": policy["plan_code"],
+            "limits": {field: policy[field] for field in QUOTA_FIELDS},
+        },
+    )
+    return data
 
 
 @app.post("/api/v1/projects/{project_id}/members")
@@ -2571,28 +2878,6 @@ async def create_portal_session(payload: PortalSessionRequest, auth: Dict[str, A
         ).fetchall()
     skills = [row[0] for row in skill_rows] or membership["allowed_skills"] or auth["user"].get("default_skills") or []
     old_sessions = []
-    with engine.begin() as conn:
-        rows = conn.execute(
-            sa.text("""
-                SELECT id::text FROM agent_sessions
-                WHERE user_id = CAST(:uid AS UUID) AND project_id = CAST(:pid AS UUID)
-                  AND agent_tool = :tool AND status IN ('ONLINE', 'BUSY')
-            """),
-            {"uid": uid, "pid": payload.project_id, "tool": payload.agent_tool}
-        ).fetchall()
-        old_sessions = [r[0] for r in rows]
-        for sid in old_sessions:
-            cleanup_disconnected_sessions(conn, [sid], target_status="REVOKED")
-
-    for sid in old_sessions:
-        ws = active_connections.pop(sid, None)
-        if ws:
-            try:
-                await ws.close(code=4003, reason="Session replaced by portal rotation")
-            except Exception:
-                pass
-        await emit_war("SESSION_REVOKED", {"session_id": sid, "reason": "portal_session_rotated"}, source_session_id=sid)
-
     session_id = str(uuid.uuid4())
     now = int(datetime.now(timezone.utc).timestamp())
     jwt_payload = {
@@ -2611,16 +2896,32 @@ async def create_portal_session(payload: PortalSessionRequest, auth: Dict[str, A
     vault = seal_secret(session_key)
 
     with engine.begin() as conn:
+        policy = get_policy(conn, for_update=True)
+        rows = conn.execute(
+            sa.text("""
+                SELECT id::text FROM agent_sessions
+                WHERE user_id = CAST(:uid AS UUID) AND project_id = CAST(:pid AS UUID)
+                  AND agent_tool = :tool AND status IN ('ONLINE', 'BUSY')
+            """),
+            {"uid": uid, "pid": payload.project_id, "tool": payload.agent_tool}
+        ).fetchall()
+        old_sessions = [r[0] for r in rows]
+        assert_engineer_quota(
+            conn, policy, payload.project_id, uid,
+            exclude_session_ids=old_sessions,
+        )
+        for sid in old_sessions:
+            cleanup_disconnected_sessions(conn, [sid], target_status="REVOKED")
         conn.execute(
             sa.text("""
                 INSERT INTO agent_sessions (
                     id, engineer_username, agent_tool, llm_provider, session_key_hash,
                     skills, status, max_context_tokens, current_context_tokens,
-                    user_id, project_id, session_key_vault
+                    user_id, project_id, session_key_vault, session_kind
                 ) VALUES (
                     CAST(:id AS UUID), :user, :tool, :provider, :khash,
                     CAST(:skills AS JSONB), 'ONLINE', :max_tok, 0,
-                    CAST(:uid AS UUID), CAST(:pid AS UUID), :vault
+                    CAST(:uid AS UUID), CAST(:pid AS UUID), :vault, 'INTERACTIVE'
                 )
             """),
             {
@@ -2636,6 +2937,15 @@ async def create_portal_session(payload: PortalSessionRequest, auth: Dict[str, A
                 "vault": vault,
             }
         )
+
+    for sid in old_sessions:
+        ws = active_connections.pop(sid, None)
+        if ws:
+            try:
+                await ws.close(code=4003, reason="Session replaced by portal rotation")
+            except Exception:
+                pass
+        await emit_war("SESSION_REVOKED", {"session_id": sid, "reason": "portal_session_rotated"}, source_session_id=sid)
 
     await emit_war(
         "SESSION_REGISTERED",
@@ -3108,6 +3418,8 @@ async def create_admin_user(
 
     user_id = str(uuid.uuid4())
     with engine.begin() as conn:
+        policy = get_policy(conn, for_update=True)
+        assert_registered_user_quota(conn, policy)
         user = conn.execute(
             sa.text("""
                 INSERT INTO harness_users
@@ -3923,17 +4235,76 @@ def _assert_doc_project_access(auth: Dict[str, Any], project_id: str, require_wr
 @app.post("/api/v1/projects/{project_id}/documents/bootstrap")
 async def bootstrap_project_documents(
     project_id: str,
+    wait: bool = Query(default=True),
+    timeout: int = Query(default=180, ge=10, le=600),
     auth: Dict[str, Any] = Depends(verify_portal_admin),
 ):
-    try:
-        summary = await asyncio.to_thread(
-            run_doc_worker_job, engine, project_id, "admin_bootstrap", True
+    with engine.connect() as conn:
+        project = conn.execute(
+            sa.text("""
+                SELECT id::text, project_slug, is_active_slot
+                FROM harness_projects WHERE id = CAST(:pid AS UUID)
+            """),
+            {"pid": project_id},
+        ).mappings().fetchone()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not project["is_active_slot"]:
+        raise HTTPException(status_code=409, detail="Project slot is inactive")
+
+    with engine.begin() as conn:
+        ensure_hermes_worker_session(conn, project_id, set_online=False, initial_status="OFFLINE")
+        ensure_headless_worker_session(conn, project_id, True)
+        job = enqueue_job(
+            conn, project_id, "RAG_BOOTSTRAP",
+            {"reason": "admin_bootstrap", "project_slug": project["project_slug"]},
+            idempotency_key=None,
+            priority=10,
         )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Documentation bootstrap failed: {exc}")
-    return summary
+    job_id = job["id"]
+    if not wait:
+        return {"queued": True, "job_id": job_id, "status": "QUEUED"}
+
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout)
+    row = None
+    while datetime.now(timezone.utc) < deadline:
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.text("""
+                    SELECT status, payload, error_message
+                    FROM hermes_worker_jobs WHERE id = CAST(:jid AS UUID)
+                """),
+                {"jid": job_id},
+            ).mappings().fetchone()
+        if row and row["status"] in ("COMPLETED", "FAILED", "CANCELLED"):
+            break
+        await asyncio.sleep(2)
+
+    with engine.connect() as conn:
+        documents_count = len(list_documents(conn, project_id))
+    if not row:
+        return JSONResponse(status_code=202, content={
+            "queued": True, "job_id": job_id, "status": "UNKNOWN",
+            "documents_count": documents_count,
+        })
+    payload = row["payload"] or {}
+    result = payload.get("result") or {}
+    summary = result.get("bootstrap") if isinstance(result, dict) else None
+    if not isinstance(summary, dict):
+        summary = result if isinstance(result, dict) else {}
+    response = {
+        "queued": False,
+        "job_id": job_id,
+        "status": row["status"],
+        "documents_count": documents_count,
+        **{k: summary.get(k) for k in ("scanned", "created", "updated", "skipped", "generated", "errors") if k in summary},
+    }
+    if row["error_message"]:
+        response["error_message"] = row["error_message"]
+        response.setdefault("errors", []).append(row["error_message"])
+    if row["status"] != "COMPLETED":
+        return JSONResponse(status_code=202, content=response)
+    return response
 
 
 @app.get("/api/v1/projects/{project_id}/documents")
@@ -3977,3 +4348,166 @@ def ingest_project_document(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return result
+
+
+# ---------------------------------------------------------------------------
+# Etapa 10 - API interna del supervisor Hermes
+# ---------------------------------------------------------------------------
+class HermesWorkerRequest(BaseModel):
+    worker_id: str = Field(..., min_length=1, max_length=150)
+
+
+class HermesCompleteRequest(BaseModel):
+    worker_id: str = Field(default="hermes-worker", max_length=150)
+    result: Dict[str, Any] = Field(default_factory=dict)
+
+
+class HermesFailRequest(BaseModel):
+    worker_id: str = Field(default="hermes-worker", max_length=150)
+    error_message: str = Field(..., min_length=1, max_length=4000)
+
+
+class InternalBootstrapRequest(BaseModel):
+    session_id: Optional[str] = None
+    trigger: str = Field(default="hermes_worker", max_length=100)
+
+
+@app.post("/api/v1/internal/hermes/pool/sync")
+def internal_hermes_pool_sync(auth: Dict[str, Any] = Depends(require_worker)):
+    with engine.begin() as conn:
+        policy = get_policy(conn, for_update=True)
+        data = sync_pool(conn, policy)
+    return data
+
+
+@app.post("/api/v1/internal/hermes/jobs/claim")
+def internal_hermes_claim(payload: HermesWorkerRequest, auth: Dict[str, Any] = Depends(require_worker)):
+    with engine.begin() as conn:
+        claimed = claim_job(conn, payload.worker_id)
+    if not claimed:
+        return {"job": None}
+    record_event(
+        engine,
+        "HERMES_JOB_CLAIMED",
+        {
+            "job_id": claimed["job"]["id"],
+            "project_id": claimed["job"]["project_id"],
+            "job_type": claimed["job"]["job_type"],
+            "worker_id": payload.worker_id,
+        },
+        source_session_id=claimed["session"]["session_id"],
+    )
+    return claimed
+
+
+@app.post("/api/v1/internal/hermes/jobs/{job_id}/heartbeat")
+def internal_hermes_heartbeat(
+    job_id: str,
+    payload: HermesWorkerRequest,
+    auth: Dict[str, Any] = Depends(require_worker),
+):
+    with engine.begin() as conn:
+        ok = heartbeat_job(conn, job_id, payload.worker_id)
+    return {"job_id": job_id, "extended": bool(ok)}
+
+
+@app.post("/api/v1/internal/hermes/jobs/{job_id}/complete")
+def internal_hermes_complete(
+    job_id: str,
+    payload: HermesCompleteRequest,
+    auth: Dict[str, Any] = Depends(require_worker),
+):
+    with engine.begin() as conn:
+        job = complete_job(conn, job_id, payload.result)
+    record_event(
+        engine,
+        "HERMES_JOB_COMPLETED",
+        {
+            "job_id": job_id,
+            "project_id": job["project_id"],
+            "job_type": job["job_type"],
+            "worker_id": payload.worker_id,
+        },
+        source_session_id=job["session_id"],
+    )
+    if job["job_type"] in ("RAG_BOOTSTRAP", "RAG_REFRESH_PROJECT", "RAG_UPDATE_ARCHITECTURE"):
+        detail = payload.result.get("bootstrap") if isinstance(payload.result, dict) else {}
+        record_event(
+            engine,
+            "DOCS_BOOTSTRAP_COMPLETED",
+            {
+                "job_id": job_id,
+                "project_id": job["project_id"],
+                "job_type": job["job_type"],
+                "trigger": job["job_type"].lower(),
+                "scanned": (detail or {}).get("scanned", 0),
+                "created": (detail or {}).get("created", 0),
+                "updated": (detail or {}).get("updated", 0),
+                "skipped": (detail or {}).get("skipped", 0),
+                "documents_count": (detail or {}).get("documents_count", 0),
+                "generated": (detail or {}).get("generated", []),
+                "errors": (detail or {}).get("errors", []),
+            },
+            source_session_id=job["session_id"],
+        )
+    return {"job_id": job_id, "status": "COMPLETED", "project_id": job["project_id"]}
+
+
+@app.post("/api/v1/internal/hermes/jobs/{job_id}/fail")
+def internal_hermes_fail(
+    job_id: str,
+    payload: HermesFailRequest,
+    auth: Dict[str, Any] = Depends(require_worker),
+):
+    with engine.begin() as conn:
+        job = fail_job(conn, job_id, payload.error_message)
+    record_event(
+        engine,
+        "HERMES_JOB_FAILED" if not job["retry"] else "HERMES_JOB_RETRY",
+        {
+            "job_id": job_id,
+            "project_id": job["project_id"],
+            "status": job["status"],
+            "error": payload.error_message,
+            "worker_id": payload.worker_id,
+        },
+        source_session_id=job["session_id"],
+    )
+    return job
+
+
+@app.post("/api/v1/internal/projects/{project_id}/rag/bootstrap")
+def internal_rag_bootstrap(
+    project_id: str,
+    payload: InternalBootstrapRequest,
+    auth: Dict[str, Any] = Depends(require_worker),
+):
+    with engine.begin() as conn:
+        project = conn.execute(
+            sa.text("""
+                SELECT id::text, project_slug, display_name
+                FROM harness_projects
+                WHERE id = CAST(:pid AS UUID) AND is_active_slot = true
+            """),
+            {"pid": project_id},
+        ).mappings().fetchone()
+        if not project:
+            raise HTTPException(status_code=404, detail="Active project not found")
+        session_id = payload.session_id
+        if not session_id:
+            row = conn.execute(
+                sa.text("""
+                    SELECT id::text FROM agent_sessions
+                    WHERE project_id = CAST(:pid AS UUID)
+                      AND session_kind = 'SYSTEM_WORKER'
+                      AND agent_tool = 'hermes'
+                      AND status <> 'REVOKED'
+                    LIMIT 1
+                """),
+                {"pid": project_id},
+            ).fetchone()
+            session_id = row[0] if row else None
+        summary = bootstrap_project_docs(
+            conn, project_id, project["project_slug"], session_id, payload.trigger,
+        )
+    return {"project_id": project_id, "project_slug": project["project_slug"], **summary}
