@@ -1,0 +1,8 @@
+{
+  "nodes": {
+    "installation": { "provider": "brand", "match": "postgresql" },
+    "audit": { "provider": "brand", "match": "postgresql" },
+    "policy": { "provider": "brand", "match": "postgresql" },
+    "pool": { "provider": "brand", "match": "docker" }
+  }
+}

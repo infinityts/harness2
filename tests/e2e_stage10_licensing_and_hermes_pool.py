@@ -28,6 +28,8 @@ ADMIN_PASSWORD = os.environ.get("HARNESS_E2E_ADMIN_PASSWORD", "admin")
 REPOS = pathlib.Path("/var/lib/harness/repos")
 WORKTREES = pathlib.Path("/var/lib/harness/worktrees")
 BRIDGE = "/app/client/harness_mcp_bridge.py"
+LICENSE_DIR = pathlib.Path("/var/lib/harness/license")
+TEST_LICENSE_DIR = pathlib.Path("/var/lib/harness/license-test")
 
 PROJECT_A = "stage10-lic-a"
 PROJECT_B = "stage10-lic-b"
@@ -173,6 +175,26 @@ def close_ws():
     return _close()
 
 
+def activate_test_license(admin_token):
+    test_license = TEST_LICENSE_DIR / "test-all-plans.json"
+    if not test_license.exists():
+        return False
+    shutil.copyfile(test_license, LICENSE_DIR / "license.json")
+    st, data = http("POST", "/api/v1/admin/license/reload", None, bearer=admin_token)
+    assert st == 200, data
+    assert data["signed_license"]["status"] == "VALID", data["signed_license"]
+    assert len(data["signed_license"]["allowed_plans"]) >= 5
+    return True
+
+
+def restore_production_license(admin_token):
+    production = TEST_LICENSE_DIR / "license.production.json"
+    if not production.exists():
+        return
+    shutil.copyfile(production, LICENSE_DIR / "license.json")
+    http("POST", "/api/v1/admin/license/reload", None, bearer=admin_token)
+
+
 async def open_agent_ws(session_id, session_key):
     ws = await websockets.connect(
         f"{WS_BASE}/ws/agent/{session_id}",
@@ -316,6 +338,7 @@ async def main():
 
     try:
         print("\n--- 1. Plan ENTERPRISE_10 y usuarios de prueba ---")
+        assert activate_test_license(admin), "test-all-plans license not available"
         st, lic = await api("PUT", "/api/v1/admin/license", {"plan_code": "ENTERPRISE_10"}, bearer=admin)
         assert st == 200 and lic["plan_code"] == "ENTERPRISE_10"
 
@@ -558,6 +581,7 @@ async def main():
         await close_ws()
         cleanup()
         try:
+            restore_production_license(admin)
             st, _ = await api("PUT", "/api/v1/admin/license", {
                 "plan_code": ORIGINAL_LICENSE["plan_code"],
                 **ORIGINAL_LICENSE["limits"],

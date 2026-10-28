@@ -153,6 +153,11 @@ harness-hermes-worker
 
 ## Pruebas
 
+La Etapa 11 añade licencia firmada Ed25519. La prueba de planes requiere la
+licencia de evaluación multi-plan (`license/test/test-all-plans.json`) y se
+ejecuta con los mounts descritos en `docs/STAGE11-SIGNED-LICENSE.md`. En
+producción solo se instala `license.production.json`.
+
 ```bash
 podman cp tests/e2e_stage10_licensing_and_hermes_pool.py harness-app:/tmp/
 podman exec harness-app python /tmp/e2e_stage10_licensing_and_hermes_pool.py

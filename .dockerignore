@@ -1,6 +1,7 @@
 .git
 .env
 data
+license
 worker/workspaces
 worker/home/.env
 worker/home/.env.*

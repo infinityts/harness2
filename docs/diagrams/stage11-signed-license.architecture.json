@@ -1,0 +1,463 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Harness2 â€” Licencia Firmada y Pool Hermes",
+    "subtitle": "Ed25519, binding por instalaciÃ³n, enforcement por entitlement y auditorÃ­a hash-chain",
+    "visual_preset": "signal-flow",
+    "quality_profile": "showcase",
+    "animation": "none",
+    "viewBox": [
+      1200,
+      620
+    ],
+    "views": [
+      {
+        "id": "signing",
+        "label": "Firma y binding",
+        "focus": [
+          "vendor",
+          "license",
+          "public_key",
+          "installation",
+          "manager"
+        ],
+        "note": "El vendor firma; la app solo verifica con la clave pÃºblica."
+      },
+      {
+        "id": "enforcement",
+        "label": "Enforcement",
+        "focus": [
+          "manager",
+          "policy",
+          "endpoints",
+          "degraded",
+          "pool",
+          "sessions"
+        ],
+        "note": "El Admin solo puede operar dentro del entitlement firmado."
+      },
+      {
+        "id": "audit",
+        "label": "AuditorÃ­a",
+        "focus": [
+          "manager",
+          "policy",
+          "audit"
+        ],
+        "note": "Cada cambio se encadena por hash; el vendor puede firmar un export."
+      }
+    ]
+  },
+  "layout": {
+    "mode": "grid",
+    "origin": [
+      20,
+      20
+    ],
+    "cols": 12,
+    "gapX": 20,
+    "gapY": 20,
+    "cellW": 92,
+    "cellH": 52
+  },
+  "components": [
+    {
+      "id": "vendor",
+      "type": "external",
+      "label": "Vendor License Signer",
+      "sublabel": "Ed25519 private key",
+      "pos": [
+        40,
+        80
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "tag": "offline"
+    },
+    {
+      "id": "license",
+      "type": "security",
+      "label": "Signed License",
+      "sublabel": "payload + signature",
+      "pos": [
+        230,
+        80
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "tag": "license.json"
+    },
+    {
+      "id": "manager",
+      "type": "backend",
+      "label": "License Manager",
+      "sublabel": "verify + status + reload",
+      "pos": [
+        460,
+        80
+      ],
+      "size": [
+        170,
+        64
+      ],
+      "tag": "startup + periodic"
+    },
+    {
+      "id": "endpoints",
+      "type": "backend",
+      "label": "Enforcement",
+      "sublabel": "projects Â· sessions Â· jobs",
+      "pos": [
+        700,
+        80
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "tag": "fail closed"
+    },
+    {
+      "id": "portal",
+      "type": "frontend",
+      "label": "Admin Portal",
+      "sublabel": "plan + quotas + audit",
+      "pos": [
+        950,
+        80
+      ],
+      "size": [
+        150,
+        60
+      ]
+    },
+    {
+      "id": "public_key",
+      "type": "security",
+      "label": "Public Key",
+      "sublabel": "trust anchor",
+      "pos": [
+        230,
+        230
+      ],
+      "size": [
+        150,
+        60
+      ]
+    },
+    {
+      "id": "installation",
+      "type": "database",
+      "label": "Installation ID",
+      "sublabel": "system_installation",
+      "pos": [
+        230,
+        390
+      ],
+      "size": [
+        170,
+        60
+      ]
+    },
+    {
+      "id": "audit",
+      "type": "database",
+      "label": "License Audit",
+      "sublabel": "hash chain",
+      "pos": [
+        460,
+        230
+      ],
+      "size": [
+        170,
+        60
+      ]
+    },
+    {
+      "id": "policy",
+      "type": "database",
+      "label": "Policy Cache",
+      "sublabel": "system_license_policy",
+      "pos": [
+        700,
+        230
+      ],
+      "size": [
+        160,
+        60
+      ]
+    },
+    {
+      "id": "degraded",
+      "type": "security",
+      "label": "Degraded Mode",
+      "sublabel": "EXPIRED / INVALID",
+      "pos": [
+        460,
+        390
+      ],
+      "size": [
+        160,
+        60
+      ],
+      "tag": "503"
+    },
+    {
+      "id": "pool",
+      "type": "cloud",
+      "label": "Hermes Worker Pool",
+      "sublabel": "max 3 jobs Â· 1 container",
+      "pos": [
+        950,
+        230
+      ],
+      "size": [
+        150,
+        60
+      ]
+    },
+    {
+      "id": "sessions",
+      "type": "backend",
+      "label": "Project Sessions",
+      "sublabel": "SYSTEM_WORKER + RAG",
+      "pos": [
+        950,
+        390
+      ],
+      "size": [
+        150,
+        60
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Vendor trust boundary",
+      "wraps": [
+        "vendor",
+        "license",
+        "public_key"
+      ],
+      "pad": 18
+    },
+    {
+      "kind": "security-group",
+      "label": "Harness2 on-premise",
+      "wraps": [
+        "manager",
+        "installation",
+        "policy",
+        "audit",
+        "endpoints",
+        "degraded",
+        "pool",
+        "sessions"
+      ],
+      "pad": 18
+    }
+  ],
+  "connections": [
+    {
+      "id": "sign",
+      "from": "vendor",
+      "to": "license",
+      "label": "sign",
+      "variant": "emphasis"
+    },
+    {
+      "id": "verify",
+      "from": "license",
+      "to": "manager",
+      "label": "verify payload",
+      "labelAt": [
+        420,
+        96
+      ]
+    },
+    {
+      "id": "trust",
+      "from": "public_key",
+      "to": "manager",
+      "label": "public key",
+      "variant": "security",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelAt": [
+        330,
+        180
+      ]
+    },
+    {
+      "id": "bind",
+      "from": "installation",
+      "to": "manager",
+      "label": "installation binding",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [
+        [
+          410,
+          420
+        ],
+        [
+          410,
+          112
+        ]
+      ],
+      "route": "orthogonal-v",
+      "labelAt": [
+        340,
+        360
+      ]
+    },
+    {
+      "id": "sync",
+      "from": "manager",
+      "to": "policy",
+      "label": "cache active policy",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [
+        [
+          670,
+          112
+        ],
+        [
+          670,
+          260
+        ]
+      ],
+      "route": "orthogonal-v",
+      "labelAt": [
+        670,
+        190
+      ]
+    },
+    {
+      "id": "audit-write",
+      "from": "manager",
+      "to": "audit",
+      "label": "append event",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        560,
+        205
+      ]
+    },
+    {
+      "id": "degrade",
+      "from": "manager",
+      "to": "degraded",
+      "label": "INVALID / EXPIRED",
+      "variant": "security",
+      "fromSide": "left",
+      "toSide": "left",
+      "via": [
+        [
+          430,
+          112
+        ],
+        [
+          430,
+          420
+        ]
+      ],
+      "route": "orthogonal-v",
+      "labelAt": [
+        470,
+        300
+      ]
+    },
+    {
+      "id": "admin",
+      "from": "portal",
+      "to": "endpoints",
+      "label": "admin PUT",
+      "fromSide": "left",
+      "toSide": "right",
+      "labelAt": [
+        905,
+        96
+      ]
+    },
+    {
+      "id": "policy-read",
+      "from": "endpoints",
+      "to": "policy",
+      "label": "quota check",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        780,
+        188
+      ]
+    },
+    {
+      "id": "jobs",
+      "from": "endpoints",
+      "to": "pool",
+      "label": "allow / block jobs",
+      "labelAt": [
+        880,
+        158
+      ],
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "top"
+    },
+    {
+      "id": "workers",
+      "from": "pool",
+      "to": "sessions",
+      "label": "1 session / project",
+      "labelAt": [
+        1025,
+        304
+      ],
+      "fromSide": "bottom",
+      "toSide": "top"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Licencia",
+      "items": [
+        "Ed25519 + clave pÃºblica",
+        "installation_id binding",
+        "expiraciÃ³n + gracia",
+        "plan y techo firmados"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Enforcement",
+      "items": [
+        "proyectos y slots",
+        "sesiones INTERACTIVE",
+        "jobs Hermes",
+        "503 en modo degradado"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Anti-tamper",
+      "items": [
+        "hash chain de auditorÃ­a",
+        "detecciÃ³n de alteraciÃ³n",
+        "reload periÃ³dico",
+        "Admin no eleva cuotas"
+      ]
+    }
+  ]
+}

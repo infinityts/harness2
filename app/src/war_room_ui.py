@@ -484,6 +484,10 @@ WAR_ROOM_HTML = r"""<!doctype html>
             <span id="licenseOverLimit" class="pill bad hidden">Over limit</span>
           </div>
           <div class="card stack">
+            <div class="card" style="padding:14px">
+              <div class="row"><span id="licenseSignedStatus" class="pill">MISSING</span><b id="licenseSignedCustomer" style="flex:1"></b><span id="licenseAuditState" class="pill">Audit —</span></div>
+              <div id="licenseSignedMeta" class="muted" style="font-size:12px;margin-top:6px"></div>
+            </div>
             <div class="row">
               <div class="field grow"><label for="licensePlan">Plan activo</label><select id="licensePlan"></select></div>
               <button id="licenseApply" class="btn primary" type="button">Aplicar plan / cuotas</button>
@@ -504,6 +508,15 @@ WAR_ROOM_HTML = r"""<!doctype html>
                 <table>
                   <thead><tr><th>Proyecto</th><th>Tipo</th><th>Estado</th><th>Intentos</th><th>Creado</th><th>Error</th></tr></thead>
                   <tbody id="licenseJobs"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="card" style="padding:14px">
+              <div class="side-label">Auditoría de licencia (hash chain)</div>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>#</th><th>Evento</th><th>Actor</th><th>Hash</th><th>Fecha</th></tr></thead>
+                  <tbody id="licenseAuditRows"></tbody>
                 </table>
               </div>
             </div>
@@ -2164,16 +2177,26 @@ async function loadLicense() {
     const data = await api("/api/v1/admin/license");
     state.license = data;
     const plan = $("licensePlan");
-    const plans = Object.keys(data.plans || {});
+    const signed = data.signed_license || {};
+    const allowed = signed.allowed_plans || [];
+    const plans = Object.keys(data.plans || {}).filter(code => !allowed.length || allowed.includes(code));
     plan.innerHTML = plans.map(code => `<option value="${esc(code)}">${esc(code)}</option>`).join("");
     if (plans.includes(data.plan_code)) plan.value = data.plan_code;
     const limits = data.limits || {};
-    $("licenseActiveProjects").value = limits.max_active_projects ?? 0;
-    $("licenseHermesSessions").value = limits.max_hermes_sessions ?? 0;
-    $("licenseEngineersProject").value = limits.max_engineers_per_project ?? 0;
-    $("licenseEngineersTotal").value = limits.max_total_engineer_sessions ?? 0;
-    $("licenseUsers").value = limits.max_registered_users ?? 0;
-    $("licenseParallelJobs").value = limits.max_parallel_rag_jobs ?? 1;
+    const ceilings = signed.signed_limits || {};
+    const fields = {
+      licenseActiveProjects: "max_active_projects",
+      licenseHermesSessions: "max_hermes_sessions",
+      licenseEngineersProject: "max_engineers_per_project",
+      licenseEngineersTotal: "max_total_engineer_sessions",
+      licenseUsers: "max_registered_users",
+      licenseParallelJobs: "max_parallel_rag_jobs",
+    };
+    Object.entries(fields).forEach(([id, field]) => {
+      const input = $(id);
+      input.value = limits[field] ?? ceilings[field] ?? 0;
+      if (ceilings[field] != null) input.max = ceilings[field];
+    });
     renderLicense(data);
   } catch (err) {
     toast(err.message, "bad");
@@ -2184,8 +2207,27 @@ async function loadLicense() {
 function renderLicense(data) {
   const usage = data.usage || {};
   const jobs = usage.hermes_jobs || {};
-  $("licenseOverLimit").classList.toggle("hidden", !data.over_limit);
-  $("licenseStatus").textContent = `Plan ${data.plan_code} · actualizado ${data.updated_at ? new Date(data.updated_at).toLocaleString() : "—"}${data.over_limit ? " · uso por encima del plan" : ""}`;
+  const signed = data.signed_license || {};
+  const status = signed.status || "UNKNOWN";
+  const statusClass = status === "VALID" ? "ok" : status === "GRACE" ? "warn" : "bad";
+  $("licenseSignedStatus").textContent = status;
+  $("licenseSignedStatus").className = `pill ${statusClass}`;
+  $("licenseSignedCustomer").textContent = signed.customer || "Sin cliente firmado";
+  $("licenseSignedMeta").textContent = [
+    signed.license_id ? `Licencia ${signed.license_id}` : "Sin license_id",
+    signed.installation_id ? `Instalación ${signed.installation_id}` : "Sin installation_id",
+    signed.expires_at ? `Expira ${new Date(signed.expires_at).toLocaleString()}` : "Sin expiración",
+    signed.grace_until ? `Gracia hasta ${new Date(signed.grace_until).toLocaleString()}` : "Sin gracia",
+    signed.error_message || "",
+  ].filter(Boolean).join(" · ");
+  const audit = data.audit_chain || {};
+  $("licenseAuditState").textContent = audit.valid ? `Audit OK (${audit.events_checked})` : `Audit roto en #${audit.broken_at}`;
+  $("licenseAuditState").className = `pill ${audit.valid ? "ok" : "bad"}`;
+  $("licenseOverLimit").classList.toggle("hidden", data.license_operational && !data.over_limit);
+  $("licenseOverLimit").textContent = !data.license_operational ? `Licencia ${status}` : "Over limit";
+  $("licenseApply").disabled = !data.license_operational;
+  $("licensePlan").disabled = !data.license_operational;
+  $("licenseStatus").textContent = `Plan ${data.plan_code} · ${status} · actualizado ${data.updated_at ? new Date(data.updated_at).toLocaleString() : "—"}${data.over_limit ? " · uso por encima del plan" : ""}`;
   const cards = [
     ["Proyectos activos", usage.active_projects_used, data.limits?.max_active_projects],
     ["Hermes online", usage.hermes_workers_online, data.limits?.max_hermes_sessions],
@@ -2207,6 +2249,14 @@ function renderLicense(data) {
     <td class="muted" style="font-size:11px">${esc(j.created_at ? new Date(j.created_at).toLocaleString() : "—")}</td>
     <td class="muted" style="font-size:11px">${esc(j.error_message || "—")}</td>
   </tr>`).join("") : '<tr><td colspan="6" class="muted">Sin jobs registrados.</td></tr>';
+  const auditRows = data.recent_audit || [];
+  $("licenseAuditRows").innerHTML = auditRows.length ? auditRows.map(e => `<tr>
+    <td class="mono">${esc(e.id)}</td>
+    <td>${esc(e.event_type)}</td>
+    <td>${esc(e.actor || "—")}</td>
+    <td class="mono" style="font-size:10px">${esc(String(e.event_hash || "").slice(0, 12))}…</td>
+    <td class="muted" style="font-size:11px">${esc(e.created_at ? new Date(e.created_at).toLocaleString() : "—")}</td>
+  </tr>`).join("") : '<tr><td colspan="5" class="muted">Sin eventos de auditoría.</td></tr>';
 }
 
 async function applyLicense() {
@@ -2267,12 +2317,14 @@ function bindStaticEvents() {
   $("licensePlan").onchange = () => {
     const limits = state.license?.plans?.[$("licensePlan").value];
     if (!limits) return;
-    $("licenseActiveProjects").value = limits.max_active_projects;
-    $("licenseHermesSessions").value = limits.max_hermes_sessions;
-    $("licenseEngineersProject").value = limits.max_engineers_per_project;
-    $("licenseEngineersTotal").value = limits.max_total_engineer_sessions;
-    $("licenseUsers").value = limits.max_registered_users;
-    $("licenseParallelJobs").value = limits.max_parallel_rag_jobs;
+    const ceilings = state.license?.signed_license?.signed_limits || {};
+    const clamp = (field) => Math.min(limits[field], ceilings[field] ?? limits[field]);
+    $("licenseActiveProjects").value = clamp("max_active_projects");
+    $("licenseHermesSessions").value = clamp("max_hermes_sessions");
+    $("licenseEngineersProject").value = clamp("max_engineers_per_project");
+    $("licenseEngineersTotal").value = clamp("max_total_engineer_sessions");
+    $("licenseUsers").value = clamp("max_registered_users");
+    $("licenseParallelJobs").value = clamp("max_parallel_rag_jobs");
   };
   $("newSkillBtn").onclick = () => openSkillEditor(null);
   $("skillsRefresh").onclick = () => loadSkills();
