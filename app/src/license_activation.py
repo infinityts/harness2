@@ -171,7 +171,12 @@ class ActivationManager:
         )
         self.state = {**self.state, **values, "server_url": self.url or None}
 
-    def activate(self, actor: str = "system", force: bool = False) -> Dict[str, Any]:
+    def activate(
+        self,
+        actor: str = "system",
+        force: bool = False,
+        audit_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         with self.lock:
             now = datetime.now(timezone.utc)
             installation = self.license_manager.state.get("installation_id")
@@ -200,6 +205,7 @@ class ActivationManager:
                 self.license_manager.record_audit(
                     "LICENSE_LEASE_INVALID", actor,
                     {"license_id": license_id, "reason": "stored lease signature invalid"},
+                    context=audit_context,
                 )
                 return dict(self.state)
 
@@ -211,6 +217,7 @@ class ActivationManager:
                 self.license_manager.record_audit(
                     "LICENSE_ACTIVATION_SKIPPED", actor,
                     {"reason": "test_license", "license_id": license_id},
+                    context=audit_context,
                 )
                 return dict(self.state)
 
@@ -254,6 +261,7 @@ class ActivationManager:
                     actor,
                     {"license_id": license_id, "lease_id": payload.get("lease_id"),
                      "expires_at": payload.get("expires_at"), "plan_code": payload.get("plan_code")},
+                    context=audit_context,
                 )
                 return dict(self.state)
             except urllib.error.HTTPError as exc:
@@ -271,14 +279,25 @@ class ActivationManager:
                             installation_id=installation, last_error="activation revoked by vendor",
                             last_attempt_at=now,
                         )
-                    self.license_manager.record_audit("LICENSE_REVOKED", actor, {"license_id": license_id})
+                    self.license_manager.record_audit(
+                        "LICENSE_REVOKED", actor, {"license_id": license_id},
+                        context=audit_context,
+                    )
                     return dict(self.state)
                 return self._offline_or_error(actor, license_id, installation, now,
-                                              f"activation HTTP {exc.code}: {raw[:300]}")
+                                              f"activation HTTP {exc.code}: {raw[:300]}", audit_context)
             except Exception as exc:
-                return self._offline_or_error(actor, license_id, installation, now, str(exc))
+                return self._offline_or_error(actor, license_id, installation, now, str(exc), audit_context)
 
-    def _offline_or_error(self, actor: str, license_id: str, installation: str, now: datetime, error: str) -> Dict[str, Any]:
+    def _offline_or_error(
+        self,
+        actor: str,
+        license_id: str,
+        installation: str,
+        now: datetime,
+        error: str,
+        audit_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         grace = _parse_dt(self.state.get("lease_grace_until"))
         expires = _parse_dt(self.state.get("lease_expires_at"))
         if grace and now <= grace:
@@ -295,6 +314,7 @@ class ActivationManager:
             self.license_manager.record_audit(
                 "LICENSE_OFFLINE_GRACE", actor,
                 {"license_id": license_id, "error": error[:500], "lease_expires_at": str(expires)},
+                context=audit_context,
             )
         else:
             with self.engine.begin() as conn:
@@ -310,5 +330,6 @@ class ActivationManager:
             self.license_manager.record_audit(
                 "LICENSE_ACTIVATION_EXPIRED", actor,
                 {"license_id": license_id, "error": error[:500]},
+                context=audit_context,
             )
         return dict(self.state)

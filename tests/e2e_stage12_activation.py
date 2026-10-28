@@ -2,6 +2,8 @@
 import asyncio
 import json
 import os
+import pathlib
+import sys
 import urllib.error
 import urllib.request
 
@@ -15,8 +17,16 @@ ADMIN_TOKEN = os.environ.get("HARNESS_ACTIVATION_ADMIN_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 ADMIN_EMAIL = os.environ.get("HARNESS_E2E_ADMIN_EMAIL", "admin@local")
 ADMIN_PASSWORD = os.environ.get("HARNESS_E2E_ADMIN_PASSWORD", "admin")
+LICENSE_EMAIL = os.environ.get("HARNESS_E2E_LICENSE_OPERATOR_EMAIL", "license-operator@harness.local")
+LICENSE_PASSWORD = os.environ.get("HARNESS_E2E_LICENSE_OPERATOR_PASSWORD", "")
+LICENSE_TOTP_SECRET = os.environ.get("HARNESS_E2E_LICENSE_OPERATOR_TOTP_SECRET", "")
 LICENSE_ID = "prod-enterprise-10-2026"
 INSTALLATION_ID = os.environ.get("HARNESS_INSTALLATION_ID", "")
+
+for _candidate in ("/app", str(pathlib.Path(__file__).resolve().parents[1] / "app")):
+    if _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
+from src import totp as totp_lib
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
@@ -73,6 +83,27 @@ def db_exec(sql, **params):
         conn.execute(sa.text(sql), params)
 
 
+async def login_license_operator():
+    if not LICENSE_PASSWORD or not LICENSE_TOTP_SECRET:
+        raise AssertionError(
+            "HARNESS_E2E_LICENSE_OPERATOR_PASSWORD and HARNESS_E2E_LICENSE_OPERATOR_TOTP_SECRET are required"
+        )
+    db_exec(
+        """UPDATE harness_users
+           SET mfa_last_used_step = NULL, failed_login_attempts = 0, locked_until = NULL
+           WHERE email = :email""",
+        email=LICENSE_EMAIL,
+    )
+    st, body = await api("POST", "/api/v1/auth/login", {
+        "email": LICENSE_EMAIL,
+        "password": LICENSE_PASSWORD,
+        "totp_code": totp_lib.code(LICENSE_TOTP_SECRET),
+    })
+    assert st == 200, body
+    assert body["user"]["role"] == "LICENSE_ADMIN", body
+    return body["access_token"]
+
+
 def db_rows(sql, **params):
     with engine.connect() as conn:
         return conn.execute(sa.text(sql), params).mappings().all()
@@ -107,6 +138,7 @@ async def main():
         st, login = await api("POST", "/api/v1/auth/login", {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
         assert st == 200, login
         admin = login["access_token"]
+        license_token = await login_license_operator()
 
         print("\n--- 1. Activacion inicial ---")
         st, lic = await api("GET", "/api/v1/admin/license", bearer=admin)
@@ -133,7 +165,7 @@ async def main():
         })
         print("revoke server:", st, body)
         assert st == 200 and body["status"] == "REVOKED"
-        st, body = await api("POST", "/api/v1/admin/license/activate", bearer=admin)
+        st, body = await api("POST", "/api/v1/admin/license/activate", bearer=license_token)
         print("client revoked:", st, body.get("activation", {}).get("status"))
         assert st == 200 and body["activation"]["status"] == "REVOKED"
         assert body["license"]["activation_operational"] is False
@@ -148,7 +180,7 @@ async def main():
             "license_id": LICENSE_ID, "installation_id": INSTALLATION_ID,
         })
         assert st == 200
-        st, body = await api("POST", "/api/v1/admin/license/activate", bearer=admin)
+        st, body = await api("POST", "/api/v1/admin/license/activate", bearer=license_token)
         print("client restored:", st, body.get("activation", {}).get("status"))
         assert st == 200 and body["activation"]["status"] == "ACTIVE"
         assert body["license"]["activation_operational"] is True
@@ -164,7 +196,7 @@ async def main():
                 last_error = NULL
             WHERE id = 1
         """)
-        st, body = await api("POST", "/api/v1/admin/license/activate", bearer=admin, timeout=60)
+        st, body = await api("POST", "/api/v1/admin/license/activate", bearer=license_token, timeout=60)
         print("offline grace:", st, body.get("activation", {}).get("status"))
         assert st == 200 and body["activation"]["status"] == "OFFLINE_GRACE"
         assert body["license"]["activation_operational"] is True
@@ -177,7 +209,7 @@ async def main():
                 lease_grace_until = NOW() - interval '3 days'
             WHERE id = 1
         """)
-        st, body = await api("POST", "/api/v1/admin/license/activate", bearer=admin)
+        st, body = await api("POST", "/api/v1/admin/license/activate", bearer=license_token)
         print("expired:", st, body.get("activation", {}).get("status"))
         assert st == 200 and body["activation"]["status"] == "EXPIRED"
         assert body["license"]["activation_operational"] is False
@@ -196,7 +228,7 @@ async def main():
                 lease_signature = 'tampered-signature'
             WHERE id = 1
         """)
-        st, body = await api("POST", "/api/v1/admin/license/activate", bearer=admin)
+        st, body = await api("POST", "/api/v1/admin/license/activate", bearer=license_token)
         print("tampered stored lease:", st, body.get("activation", {}).get("status"), body.get("activation", {}).get("last_error"))
         assert st == 200 and body["activation"]["status"] == "ERROR"
         assert body["license"]["activation_operational"] is False
@@ -208,7 +240,7 @@ async def main():
             "license_id": LICENSE_ID, "installation_id": INSTALLATION_ID,
         })
         assert st == 200
-        st, body = await api("POST", "/api/v1/admin/license/activate", bearer=admin)
+        st, body = await api("POST", "/api/v1/admin/license/activate", bearer=license_token)
         print("final activation:", st, body.get("activation", {}).get("status"))
         assert st == 200 and body["activation"]["status"] == "ACTIVE"
         assert body["license"]["activation_operational"] is True
@@ -237,7 +269,7 @@ async def main():
             pass
         if admin:
             try:
-                await api("POST", "/api/v1/admin/license/activate", bearer=admin)
+                await api("POST", "/api/v1/admin/license/activate", bearer=license_token)
             except Exception:
                 pass
 

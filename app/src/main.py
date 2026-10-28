@@ -14,7 +14,7 @@ from typing import Any, List, Dict, Optional
 
 import jwt
 import sqlalchemy as sa
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, Query, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, Query, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from pathlib import Path
@@ -65,6 +65,7 @@ from src.licensing import (
 )
 from src.signed_license import LicenseManager
 from src.license_activation import ActivationManager
+from src import totp
 from src.hermes_pool import (
     claim_job,
     complete_job,
@@ -272,7 +273,8 @@ def _portal_auth_from_header(authorization: Optional[str]) -> Dict[str, Any]:
     with engine.connect() as conn:
         user = conn.execute(
             sa.text("""
-                SELECT id::text, email, full_name, role, status, default_skills
+                SELECT id::text, email, full_name, role, status, default_skills,
+                       password_change_allowed, mfa_enabled
                 FROM harness_users
                 WHERE id = CAST(:uid AS UUID)
             """),
@@ -280,8 +282,9 @@ def _portal_auth_from_header(authorization: Optional[str]) -> Dict[str, Any]:
         ).mappings().fetchone()
     if not user or user["status"] != "ACTIVE":
         raise HTTPException(status_code=401, detail="User not active")
+    role = "admin" if user["role"] == "ADMIN" else ("license_admin" if user["role"] == "LICENSE_ADMIN" else "engineer")
     return {
-        "role": "admin" if user["role"] == "ADMIN" else "engineer",
+        "role": role,
         "role_name": user["role"],
         "user_id": user["id"],
         "email": user["email"],
@@ -312,6 +315,57 @@ def verify_portal_admin(
     if auth["role_name"] != "ADMIN":
         raise HTTPException(status_code=403, detail="Admin role required")
     return auth
+
+
+def verify_portal_admin_or_license(
+    x_harness_admin_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """Lectura de licencia: ADMIN normal o LICENSE_ADMIN.
+
+    El ADMIN conserva visibilidad y auditoria, pero no puede mutar la licencia.
+    """
+    if ADMIN_API_KEY and x_harness_admin_key and hmac.compare_digest(x_harness_admin_key, ADMIN_API_KEY):
+        return {"role": "admin", "role_name": "ADMIN", "user_id": None, "email": None, "user": None}
+    auth = _portal_auth_from_header(authorization)
+    if auth["role_name"] not in ("ADMIN", "LICENSE_ADMIN"):
+        raise HTTPException(status_code=403, detail="Admin or license operator role required")
+    return auth
+
+
+def verify_license_admin(
+    x_harness_admin_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    """Mutacion de licencia: solo LICENSE_ADMIN con token de portal y MFA.
+
+    La Admin API Key no sirve aqui a proposito: es una credencial de
+    automatizacion y no debe saltarse la separacion de funciones.
+    """
+    if not authorization and x_harness_admin_key:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "LICENSE_ADMIN_REQUIRED",
+                "message": "The Admin API Key cannot change the license; use LICENSE_ADMIN with MFA",
+            },
+        )
+    auth = _portal_auth_from_header(authorization)
+    if auth["role_name"] != "LICENSE_ADMIN":
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "LICENSE_ADMIN_REQUIRED",
+                "message": "Only LICENSE_ADMIN can change the license or activation",
+            },
+        )
+    return auth
+
+
+def _client_ip(request: Optional[Request]) -> Optional[str]:
+    if request is None or request.client is None:
+        return None
+    return request.client.host
 
 
 def assert_repo_access(auth: Dict[str, Any], repo_name: str) -> None:
@@ -2153,6 +2207,10 @@ def _public_user(user) -> Dict[str, Any]:
     item = dict(user)
     item.pop("password_hash", None)
     item.pop("invite_token", None)
+    item.pop("mfa_totp_secret_vault", None)
+    item.pop("mfa_last_used_step", None)
+    item.pop("failed_login_attempts", None)
+    item.pop("locked_until", None)
     return item
 
 
@@ -2175,6 +2233,7 @@ class PortalLoginRequest(BaseModel):
     # Se permite cualquier longitud en login para la credencial legacy admin/admin.
     # La politica de complejidad solo se exige al crear o cambiar contrasenas.
     password: str = Field(..., min_length=1, max_length=200)
+    totp_code: Optional[str] = Field(default=None, max_length=10)
 
 
 class PortalRegisterRequest(BaseModel):
@@ -2208,21 +2267,150 @@ class ProjectMemberRequest(BaseModel):
     allowed_skills: List[str] = Field(default_factory=list)
 
 
+LICENSE_LOGIN_MAX_ATTEMPTS = 5
+LICENSE_LOGIN_LOCK_MINUTES = 15
+
+
+def _license_audit_login(event_type: str, email: Optional[str], data: Dict[str, Any], request: Optional[Request]) -> None:
+    try:
+        LICENSE_MANAGER.record_audit(
+            event_type,
+            email,
+            data,
+            context={"actor_ip": _client_ip(request)},
+        )
+    except Exception as exc:
+        print(f"[license] audit login event failed: {exc}")
+
+
+def _register_license_login_failure(user, reason: str, request: Optional[Request]) -> None:
+    attempts = None
+    locked_until = None
+    try:
+        now = datetime.now(timezone.utc)
+        with engine.begin() as conn:
+            row = conn.execute(
+                sa.text("""
+                    UPDATE harness_users
+                    SET failed_login_attempts = failed_login_attempts + 1,
+                        locked_until = CASE
+                            WHEN failed_login_attempts + 1 >= :max_attempts THEN :lock_until
+                            ELSE locked_until
+                        END
+                    WHERE id = CAST(:uid AS UUID)
+                    RETURNING failed_login_attempts, locked_until
+                """),
+                {
+                    "uid": user["id"],
+                    "max_attempts": LICENSE_LOGIN_MAX_ATTEMPTS,
+                    "lock_until": now + timedelta(minutes=LICENSE_LOGIN_LOCK_MINUTES),
+                },
+            ).mappings().first()
+            if row:
+                attempts = int(row["failed_login_attempts"] or 0)
+                locked_until = row["locked_until"]
+    except Exception as exc:
+        print(f"[license] failed to register login failure: {exc}")
+    _license_audit_login(
+        "LICENSE_ADMIN_LOGIN_FAILED",
+        user["email"],
+        {
+            "reason": reason,
+            "failed_attempts": attempts,
+            "locked_until": locked_until.isoformat() if locked_until else None,
+        },
+        request,
+    )
+
+
+def _license_login_success(user, step: int, request: Optional[Request]) -> bool:
+    try:
+        with engine.begin() as conn:
+            changed = conn.execute(
+                sa.text("""
+                    UPDATE harness_users
+                    SET mfa_last_used_step = :step,
+                        failed_login_attempts = 0,
+                        locked_until = NULL
+                    WHERE id = CAST(:uid AS UUID)
+                      AND (mfa_last_used_step IS NULL OR mfa_last_used_step < :step)
+                """),
+                {"uid": user["id"], "step": step},
+            ).rowcount
+        if not changed:
+            return False
+    except Exception as exc:
+        print(f"[license] failed to persist MFA step: {exc}")
+        return False
+    _license_audit_login(
+        "LICENSE_ADMIN_LOGIN",
+        user["email"],
+        {"mfa_step": step},
+        request,
+    )
+    return True
+
+
 @app.post("/api/v1/auth/login")
-def portal_login(payload: PortalLoginRequest):
+def portal_login(payload: PortalLoginRequest, request: Request):
     email = payload.email.strip().lower()
     with engine.connect() as conn:
         user = conn.execute(
             sa.text("""
-                SELECT id::text, email, full_name, role, status, password_hash, default_skills
+                SELECT id::text, email, full_name, role, status, password_hash, default_skills,
+                       mfa_enabled, mfa_totp_secret_vault, password_change_allowed,
+                       mfa_last_used_step, failed_login_attempts, locked_until
                 FROM harness_users WHERE email = :email
             """),
             {"email": email}
         ).mappings().fetchone()
+    if user and user["role"] == "LICENSE_ADMIN" and user["locked_until"]:
+        locked_until = user["locked_until"]
+        if locked_until.tzinfo is None:
+            locked_until = locked_until.replace(tzinfo=timezone.utc)
+        if locked_until > datetime.now(timezone.utc):
+            _license_audit_login(
+                "LICENSE_ADMIN_LOGIN_LOCKED",
+                user["email"],
+                {"locked_until": locked_until.isoformat()},
+                request,
+            )
+            raise HTTPException(
+                status_code=423,
+                detail={
+                    "code": "ACCOUNT_LOCKED",
+                    "message": "License operator account is temporarily locked",
+                    "locked_until": locked_until.isoformat(),
+                },
+            )
     if not user or not verify_password(payload.password, user["password_hash"]):
+        if user and user["role"] == "LICENSE_ADMIN":
+            _register_license_login_failure(user, "invalid_password", request)
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if user["status"] != "ACTIVE":
         raise HTTPException(status_code=403, detail="User not active")
+    if user["role"] == "LICENSE_ADMIN":
+        if not user["mfa_enabled"] or not user["mfa_totp_secret_vault"]:
+            raise HTTPException(status_code=403, detail="License operator MFA is not configured")
+        if not payload.totp_code:
+            raise HTTPException(status_code=401, detail={
+                "code": "MFA_REQUIRED",
+                "message": "TOTP code required for license operator",
+            })
+        secret = open_secret(user["mfa_totp_secret_vault"])
+        step = totp.matching_step(secret, payload.totp_code) if secret else None
+        if step is None:
+            _register_license_login_failure(user, "invalid_totp", request)
+            raise HTTPException(status_code=401, detail={
+                "code": "MFA_INVALID",
+                "message": "Invalid TOTP code",
+            })
+        if not _license_login_success(user, step, request):
+            _register_license_login_failure(user, "totp_replay", request)
+            raise HTTPException(status_code=401, detail={
+                "code": "MFA_REPLAY",
+                "message": "TOTP code has already been used",
+            })
     token = _issue_portal_token(user)
     return {
         "access_token": token,
@@ -2680,7 +2868,7 @@ def toggle_project_slot(
 
 
 @app.get("/api/v1/admin/license")
-def get_admin_license(auth: Dict[str, Any] = Depends(verify_portal_admin)):
+def get_admin_license(auth: Dict[str, Any] = Depends(verify_portal_admin_or_license)):
     with engine.connect() as conn:
         policy = get_policy(conn)
         return _license_payload(conn, policy)
@@ -2689,7 +2877,8 @@ def get_admin_license(auth: Dict[str, Any] = Depends(verify_portal_admin)):
 @app.put("/api/v1/admin/license")
 def put_admin_license(
     payload: LicenseUpdateRequest,
-    auth: Dict[str, Any] = Depends(verify_portal_admin),
+    request: Request,
+    auth: Dict[str, Any] = Depends(verify_license_admin),
 ):
     assert_license_operational()
     overrides = {
@@ -2708,21 +2897,26 @@ def put_admin_license(
         data = _license_payload(conn, policy)
     LICENSE_MANAGER.record_audit(
         "LICENSE_PLAN_CHANGED",
-        auth.get("email") or "admin",
+        auth.get("email") or "license-operator",
         {
             "plan_code": policy["plan_code"],
             "limits": {field: policy[field] for field in QUOTA_FIELDS},
         },
+        context={"actor_ip": _client_ip(request)},
     )
     return data
 
 
 @app.post("/api/v1/admin/license/reload")
-async def reload_admin_license(auth: Dict[str, Any] = Depends(verify_portal_admin)):
-    actor = auth.get("email") or "admin"
-    await asyncio.to_thread(LICENSE_MANAGER.reload, actor, True)
+async def reload_admin_license(
+    request: Request,
+    auth: Dict[str, Any] = Depends(verify_license_admin),
+):
+    actor = auth.get("email") or "license-operator"
+    context = {"actor_ip": _client_ip(request)}
+    await asyncio.to_thread(LICENSE_MANAGER.reload, actor, True, context)
     try:
-        await asyncio.to_thread(ACTIVATION_MANAGER.activate, actor, True)
+        await asyncio.to_thread(ACTIVATION_MANAGER.activate, actor, True, context)
     except Exception as exc:
         print(f"[license] activation after reload failed: {exc}")
     with engine.connect() as conn:
@@ -2732,9 +2926,13 @@ async def reload_admin_license(auth: Dict[str, Any] = Depends(verify_portal_admi
 
 
 @app.post("/api/v1/admin/license/activate")
-async def activate_admin_license(auth: Dict[str, Any] = Depends(verify_portal_admin)):
-    actor = auth.get("email") or "admin"
-    state = await asyncio.to_thread(ACTIVATION_MANAGER.activate, actor, True)
+async def activate_admin_license(
+    request: Request,
+    auth: Dict[str, Any] = Depends(verify_license_admin),
+):
+    actor = auth.get("email") or "license-operator"
+    context = {"actor_ip": _client_ip(request)}
+    state = await asyncio.to_thread(ACTIVATION_MANAGER.activate, actor, True, context)
     with engine.connect() as conn:
         policy = get_policy(conn)
         data = _license_payload(conn, policy)
@@ -2744,7 +2942,7 @@ async def activate_admin_license(auth: Dict[str, Any] = Depends(verify_portal_ad
 @app.get("/api/v1/admin/license/audit")
 def get_license_audit(
     limit: int = Query(default=100, ge=1, le=1000),
-    auth: Dict[str, Any] = Depends(verify_portal_admin),
+    auth: Dict[str, Any] = Depends(verify_portal_admin_or_license),
 ):
     with engine.connect() as conn:
         rows = conn.execute(
@@ -2834,6 +3032,14 @@ def add_project_member(project_id: str, payload: ProjectMemberRequest, backgroun
 
         if user["status"] == "DISABLED":
             raise HTTPException(status_code=403, detail="User disabled")
+        if user["role"] == "LICENSE_ADMIN":
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "LICENSE_ADMIN_NOT_PROJECT_MEMBER",
+                    "message": "The license operator is not a project user",
+                },
+            )
         if payload.password:
             conn.execute(
                 sa.text("UPDATE harness_users SET password_hash = :ph WHERE id = CAST(:uid AS UUID)"),
@@ -3332,13 +3538,21 @@ async def change_own_password(
     with engine.connect() as conn:
         user = conn.execute(
             sa.text("""
-                SELECT id::text, email, password_hash, status
+                SELECT id::text, email, password_hash, status, role, password_change_allowed
                 FROM harness_users WHERE id = CAST(:uid AS UUID)
             """),
             {"uid": auth["user_id"]}
         ).mappings().fetchone()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    if user["role"] == "LICENSE_ADMIN" or not user["password_change_allowed"]:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "PASSWORD_SEALED",
+                "message": "This account password is sealed; vendor-side break-glass is required",
+            },
+        )
     if not verify_password(payload.current_password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Current password is incorrect")
     if verify_password(payload.new_password, user["password_hash"]):
@@ -3369,12 +3583,13 @@ async def change_own_password(
 async def admin_reset_user_password(
     user_id: str,
     payload: AdminPasswordResetRequest,
+    request: Request,
     auth: Dict[str, Any] = Depends(verify_portal_admin),
 ):
     with engine.connect() as conn:
         user = conn.execute(
             sa.text("""
-                SELECT id::text, email, full_name, status
+                SELECT id::text, email, full_name, status, role, password_change_allowed
                 FROM harness_users WHERE id = CAST(:uid AS UUID)
             """),
             {"uid": user_id}
@@ -3383,6 +3598,23 @@ async def admin_reset_user_password(
         raise HTTPException(status_code=404, detail="User not found")
     if user["status"] == "DISABLED":
         raise HTTPException(status_code=403, detail="User disabled")
+    if user["role"] == "LICENSE_ADMIN" or not user["password_change_allowed"]:
+        try:
+            LICENSE_MANAGER.record_audit(
+                "LICENSE_ADMIN_PASSWORD_RESET_BLOCKED",
+                auth.get("email") or "admin",
+                {"target_user_id": user["id"], "target_email": user["email"]},
+                context={"actor_ip": _client_ip(request)},
+            )
+        except Exception as exc:
+            print(f"[license] audit blocked reset failed: {exc}")
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "PASSWORD_SEALED",
+                "message": "License operator password is sealed; vendor-side break-glass is required",
+            },
+        )
 
     generated = False
     if payload.generate_random or not payload.new_password:
@@ -3436,15 +3668,16 @@ def list_admin_users(
     search: Optional[str] = Query(default=None, max_length=200),
     auth: Dict[str, Any] = Depends(verify_portal_admin),
 ):
-    where = ""
+    where = "WHERE u.role <> 'LICENSE_ADMIN'"
     params: Dict[str, Any] = {}
     if search and search.strip():
-        where = "WHERE u.email ILIKE :like OR u.full_name ILIKE :like"
+        where += " AND (u.email ILIKE :like OR u.full_name ILIKE :like)"
         params["like"] = f"%{search.strip()}%"
     with engine.connect() as conn:
         users = conn.execute(
             sa.text(f"""
-                SELECT u.id::text, u.email, u.full_name, u.role, u.status, u.created_at
+                SELECT u.id::text, u.email, u.full_name, u.role, u.status, u.created_at,
+                       u.password_change_allowed, u.mfa_enabled
                 FROM harness_users u
                 {where}
                 ORDER BY u.email
@@ -3502,6 +3735,7 @@ def list_admin_users(
             "can_grant_skills": False,
         })
         item["is_admin"] = user["role"] == "ADMIN"
+        item["is_sealed"] = not bool(user["password_change_allowed"])
         result.append(item)
     return {"users": result}
 

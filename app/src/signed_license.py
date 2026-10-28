@@ -221,6 +221,7 @@ class LicenseManager:
         event_type: str,
         actor: Optional[str],
         data: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> None:
         conn.execute(sa.text("SELECT pg_advisory_xact_lock(hashtext('harness_license_audit'))"))
         last = conn.execute(
@@ -228,10 +229,17 @@ class LicenseManager:
         ).fetchone()
         prev_hash = last[0] if last else ZERO_HASH
         event_time = datetime.now(timezone.utc)
+        body_data = dict(data or {})
+        if context:
+            existing = body_data.get("context")
+            merged = dict(existing) if isinstance(existing, dict) else {}
+            merged.update({k: v for k, v in context.items() if v is not None})
+            if merged:
+                body_data["context"] = merged
         body = {
             "event_type": event_type,
             "actor": actor,
-            "data": data or {},
+            "data": body_data,
             "event_time": _iso(event_time),
         }
         event_hash = sha256_hex((prev_hash + canonical_bytes(body).decode("utf-8")).encode("utf-8"))
@@ -252,11 +260,22 @@ class LicenseManager:
             },
         )
 
-    def record_audit(self, event_type: str, actor: Optional[str], payload: Optional[Dict[str, Any]] = None) -> None:
+    def record_audit(
+        self,
+        event_type: str,
+        actor: Optional[str],
+        payload: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
         with self.engine.begin() as conn:
-            self._audit(conn, event_type, actor, payload)
+            self._audit(conn, event_type, actor, payload, context)
 
-    def reload(self, actor: str = "system", force: bool = False) -> Dict[str, Any]:
+    def reload(
+        self,
+        actor: str = "system",
+        force: bool = False,
+        audit_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         with self.lock:
             with self.engine.begin() as conn:
                 installation_id = self._installation_id(conn)
@@ -369,7 +388,7 @@ class LicenseManager:
                         "error": new_state["error_message"],
                         "installation_id": installation_id,
                         "policy_reset": policy_reset,
-                    })
+                    }, audit_context)
                     self._last_audit_status = new_state["status"]
                     self._last_audit_hash = new_state["license_hash"]
                 self.state = new_state

@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import shutil
+import sys
 import urllib.error
 import urllib.request
 
@@ -14,8 +15,16 @@ BASE = os.environ.get("HARNESS_BASE_URL", "http://127.0.0.1:8443")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 ADMIN_EMAIL = os.environ.get("HARNESS_E2E_ADMIN_EMAIL", "admin@local")
 ADMIN_PASSWORD = os.environ.get("HARNESS_E2E_ADMIN_PASSWORD", "admin")
+LICENSE_EMAIL = os.environ.get("HARNESS_E2E_LICENSE_OPERATOR_EMAIL", "license-operator@harness.local")
+LICENSE_PASSWORD = os.environ.get("HARNESS_E2E_LICENSE_OPERATOR_PASSWORD", "")
+LICENSE_TOTP_SECRET = os.environ.get("HARNESS_E2E_LICENSE_OPERATOR_TOTP_SECRET", "")
 LICENSE_DIR = pathlib.Path("/var/lib/harness/license")
 TEST_DIR = pathlib.Path("/var/lib/harness/license-test")
+
+for _candidate in ("/app", str(pathlib.Path(__file__).resolve().parents[1] / "app")):
+    if _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
+from src import totp as totp_lib
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
@@ -57,6 +66,27 @@ def db_exec(sql, **params):
         conn.execute(sa.text(sql), params)
 
 
+async def login_license_operator():
+    if not LICENSE_PASSWORD or not LICENSE_TOTP_SECRET:
+        raise AssertionError(
+            "HARNESS_E2E_LICENSE_OPERATOR_PASSWORD and HARNESS_E2E_LICENSE_OPERATOR_TOTP_SECRET are required"
+        )
+    db_exec(
+        """UPDATE harness_users
+           SET mfa_last_used_step = NULL, failed_login_attempts = 0, locked_until = NULL
+           WHERE email = :email""",
+        email=LICENSE_EMAIL,
+    )
+    st, body = await api("POST", "/api/v1/auth/login", {
+        "email": LICENSE_EMAIL,
+        "password": LICENSE_PASSWORD,
+        "totp_code": totp_lib.code(LICENSE_TOTP_SECRET),
+    })
+    assert st == 200, body
+    assert body["user"]["role"] == "LICENSE_ADMIN", body
+    return body["access_token"]
+
+
 def install_license(name: str) -> None:
     source = TEST_DIR / name
     if not source.exists():
@@ -64,8 +94,8 @@ def install_license(name: str) -> None:
     shutil.copyfile(source, LICENSE_DIR / "license.json")
 
 
-async def reload_license(admin: str):
-    return await api("POST", "/api/v1/admin/license/reload", bearer=admin)
+async def reload_license(token: str):
+    return await api("POST", "/api/v1/admin/license/reload", bearer=token)
 
 
 def assert_degraded(st, body, expected_status=None):
@@ -83,6 +113,7 @@ async def main():
         st, login = await api("POST", "/api/v1/auth/login", {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
         assert st == 200, login
         admin = login["access_token"]
+        license_token = await login_license_operator()
         st, original = await api("GET", "/api/v1/admin/license", bearer=admin)
         assert st == 200
 
@@ -97,37 +128,42 @@ async def main():
         installation = db_rows("SELECT installation_id::text AS installation_id FROM system_installation WHERE id = 1")[0]["installation_id"]
         assert str(signed["installation_id"]) == str(installation)
 
-        print("\n--- 2. Un Admin no puede elevar el plan firmado ---")
+        print("\n--- 2. Un Admin normal no puede mutar la licencia ---")
         st, denied = await api("PUT", "/api/v1/admin/license", {"plan_code": "PERSONAL_1"}, bearer=admin)
+        print("admin normal:", st, denied)
+        assert st == 403 and denied["detail"]["code"] == "LICENSE_ADMIN_REQUIRED"
+
+        print("\n--- 3. El operador no puede elevar el plan firmado ---")
+        st, denied = await api("PUT", "/api/v1/admin/license", {"plan_code": "PERSONAL_1"}, bearer=license_token)
         print("plan no incluido:", st, denied)
         assert st == 403 and denied["code"] == "LICENSE_PLAN_NOT_ENTITLED"
         st, denied = await api("PUT", "/api/v1/admin/license", {
             "plan_code": "ENTERPRISE_10", "max_active_projects": 999,
-        }, bearer=admin)
+        }, bearer=license_token)
         print("cuota por encima del techo:", st, denied)
         assert st == 403 and denied["code"] == "LICENSE_ENTITLEMENT_EXCEEDED"
 
-        print("\n--- 3. Licencia de pruebas multi-plan ---")
+        print("\n--- 4. Licencia de pruebas multi-plan ---")
         install_license("test-all-plans.json")
-        st, data = await reload_license(admin)
+        st, data = await reload_license(license_token)
         print("reload test-all-plans:", st, data.get("signed_license", {}).get("status"))
         assert st == 200 and data["signed_license"]["status"] == "VALID"
         assert set(data["signed_license"]["allowed_plans"]) == {
             "PERSONAL_1", "TEAM_3", "BUSINESS_5", "ENTERPRISE_10", "MAX_20"
         }
         for plan in ("PERSONAL_1", "TEAM_3", "MAX_20"):
-            st, data = await api("PUT", "/api/v1/admin/license", {"plan_code": plan}, bearer=admin)
+            st, data = await api("PUT", "/api/v1/admin/license", {"plan_code": plan}, bearer=license_token)
             print("plan", plan, st, data.get("limits"))
             assert st == 200 and data["plan_code"] == plan
         st, denied = await api("PUT", "/api/v1/admin/license", {
             "plan_code": "MAX_20", "max_engineers_per_project": 21,
-        }, bearer=admin)
+        }, bearer=license_token)
         print("cuota custom fuera de techo:", st, denied)
         assert st == 403 and denied["code"] == "LICENSE_ENTITLEMENT_EXCEEDED"
 
-        print("\n--- 4. Firma manipulada -> INVALID + degradado ---")
+        print("\n--- 5. Firma manipulada -> INVALID + degradado ---")
         install_license("test-tampered.json")
-        st, data = await reload_license(admin)
+        st, data = await reload_license(license_token)
         print("tampered:", st, data.get("signed_license", {}).get("status"), data.get("signed_license", {}).get("error_message"))
         assert st == 200 and data["signed_license"]["status"] == "INVALID"
         assert data["license_operational"] is False
@@ -136,19 +172,19 @@ async def main():
             "description": "should fail", "default_branch": "main",
         }, bearer=admin)
         assert_degraded(st, body, "INVALID")
-        st, body = await api("PUT", "/api/v1/admin/license", {"plan_code": "TEAM_3"}, bearer=admin)
+        st, body = await api("PUT", "/api/v1/admin/license", {"plan_code": "TEAM_3"}, bearer=license_token)
         assert_degraded(st, body, "INVALID")
 
         print("\n--- 5. Installation binding ---")
         install_license("test-installation-mismatch.json")
-        st, data = await reload_license(admin)
+        st, data = await reload_license(license_token)
         print("installation mismatch:", st, data.get("signed_license", {}).get("status"))
         assert st == 200 and data["signed_license"]["status"] == "INVALID"
         assert "installation_id" in data["signed_license"]["error_message"]
 
         print("\n--- 6. Expirada y gracia ---")
         install_license("test-expired.json")
-        st, data = await reload_license(admin)
+        st, data = await reload_license(license_token)
         print("expired:", st, data.get("signed_license", {}).get("status"))
         assert st == 200 and data["signed_license"]["status"] == "EXPIRED"
         assert data["license_operational"] is False
@@ -159,16 +195,16 @@ async def main():
         assert_degraded(st, body, "EXPIRED")
 
         install_license("test-grace.json")
-        st, data = await reload_license(admin)
+        st, data = await reload_license(license_token)
         print("grace:", st, data.get("signed_license", {}).get("status"))
         assert st == 200 and data["signed_license"]["status"] == "GRACE"
         assert data["license_operational"] is True
-        st, data = await api("PUT", "/api/v1/admin/license", {"plan_code": "ENTERPRISE_10"}, bearer=admin)
+        st, data = await api("PUT", "/api/v1/admin/license", {"plan_code": "ENTERPRISE_10"}, bearer=license_token)
         assert st == 200, data
 
         print("\n--- 7. Restauracion de produccion y auditoria ---")
         install_license("license.production.json")
-        st, data = await reload_license(admin)
+        st, data = await reload_license(license_token)
         print("production:", st, data.get("signed_license", {}).get("status"), data.get("plan_code"))
         assert st == 200 and data["signed_license"]["status"] == "VALID"
         assert data["plan_code"] == "ENTERPRISE_10"
@@ -211,7 +247,7 @@ async def main():
         if admin:
             try:
                 install_license("license.production.json")
-                await reload_license(admin)
+                await reload_license(license_token)
             except Exception as exc:
                 print("no se pudo restaurar la licencia de produccion:", exc)
             if original:
@@ -219,7 +255,7 @@ async def main():
                     st, _ = await api("PUT", "/api/v1/admin/license", {
                         "plan_code": original["plan_code"],
                         **original["limits"],
-                    }, bearer=admin)
+                    }, bearer=license_token)
                     print("policy restaurada:", st)
                 except Exception as exc:
                     print("no se pudo restaurar policy:", exc)

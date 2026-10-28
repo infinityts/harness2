@@ -266,6 +266,7 @@ WAR_ROOM_HTML = r"""<!doctype html>
         <form id="loginForm" class="stack" style="gap:12px">
           <div class="field"><label for="loginEmail">Email</label><input id="loginEmail" type="email" autocomplete="username" placeholder="dev1@empresa.com" required></div>
           <div class="field"><label for="loginPassword">Contraseña</label><input id="loginPassword" type="password" autocomplete="current-password" placeholder="••••••••" required></div>
+          <div class="field"><label for="loginTotp">Código MFA <span class="muted">(operador de licencia)</span></label><input id="loginTotp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456"></div>
           <button id="loginBtn" class="btn primary" type="submit" style="width:100%;padding:11px">Entrar al Portal</button>
         </form>
       </div>
@@ -483,6 +484,7 @@ WAR_ROOM_HTML = r"""<!doctype html>
             <div class="spacer"></div>
             <span id="licenseOverLimit" class="pill bad hidden">Over limit</span>
           </div>
+          <div id="licenseGovernanceNote" class="card" style="padding:12px 14px;font-size:13px"></div>
           <div class="card stack">
             <div class="card" style="padding:14px">
               <div class="row"><span id="licenseSignedStatus" class="pill">MISSING</span><b id="licenseSignedCustomer" style="flex:1"></b><span id="licenseAuditState" class="pill">Audit —</span></div>
@@ -658,6 +660,11 @@ function setLoginTab(which) {
 function capital(v) { return String(v || "?").slice(0, 2).toUpperCase(); }
 
 function navItems() {
+  if (state.role === "LICENSE_ADMIN") {
+    return [
+      { id:"license", icon:"▣", label:"Licencia y Pool", bottom:"Licencia" },
+    ];
+  }
   if (state.role === "ADMIN") {
     return [
       { id:"projects", icon:"▦", label:"Proyectos", bottom:"Proyectos" },
@@ -710,16 +717,20 @@ async function doEmailLogin(event) {
   event.preventDefault();
   const email = $("loginEmail").value.trim();
   const password = $("loginPassword").value;
+  const totpCode = $("loginTotp").value.trim();
   if (!email || !password) { showLogin("Completa email y contraseña."); return; }
   $("loginBtn").disabled = true;
   try {
-    const data = await api("/api/v1/auth/login", { method:"POST", body:JSON.stringify({ email, password }) });
+    const body = { email, password };
+    if (totpCode) body.totp_code = totpCode;
+    const data = await api("/api/v1/auth/login", { method:"POST", body:JSON.stringify(body) });
     state.token = data.access_token;
     state.adminKey = null;
     state.user = data.user;
     state.role = data.user.role;
     sessionStorage.setItem("harness.token", state.token);
     $("loginPassword").value = "";
+    $("loginTotp").value = "";
     await enterApp();
   } catch (err) {
     showLogin(err.message);
@@ -765,15 +776,19 @@ async function enterApp() {
   $("appView").classList.remove("hidden");
   $("userLabel").textContent = state.user.full_name || state.user.email || "Usuario";
   $("userInitials").textContent = capital(state.user.full_name || state.user.email);
-  $("passwordBtn").classList.toggle("hidden", !state.token);
+  $("passwordBtn").classList.toggle("hidden", !state.token || state.role === "LICENSE_ADMIN");
   $("logoutBtn").classList.remove("hidden");
   buildNav();
-  await refreshProjects();
-  if (state.role === "ADMIN") {
-    $("viewProjects").classList.remove("hidden");
-    setView("projects");
+  if (state.role === "LICENSE_ADMIN") {
+    setView("license");
   } else {
-    setView("myprojects");
+    await refreshProjects();
+    if (state.role === "ADMIN") {
+      $("viewProjects").classList.remove("hidden");
+      setView("projects");
+    } else {
+      setView("myprojects");
+    }
   }
   if (refreshTimer) clearInterval(refreshTimer);
   refreshTimer = state.role === "ADMIN"
@@ -2234,9 +2249,23 @@ function renderLicense(data) {
     act.last_error || "",
   ].filter(Boolean).join(" · ");
   const operational = Boolean(data.license_operational && data.activation_operational);
-  $("licenseApply").disabled = !operational;
-  $("licensePlan").disabled = !operational;
-  $("licenseActivate").disabled = !data.license_operational;
+  const canMutate = state.role === "LICENSE_ADMIN";
+  const governance = $("licenseGovernanceNote");
+  if (governance) {
+    governance.textContent = canMutate
+      ? "Operador de licencia con MFA. Cada cambio de plan, cuota o activación queda auditado con actor e IP."
+      : "Modo lectura. Solo la cuenta LICENSE_ADMIN con MFA puede cambiar el plan, las cuotas o la activación.";
+    governance.className = `card ${canMutate ? "ok" : ""}`;
+    governance.style.padding = "12px 14px";
+    governance.style.fontSize = "13px";
+  }
+  ["licensePlan", "licenseActiveProjects", "licenseHermesSessions", "licenseEngineersProject",
+   "licenseEngineersTotal", "licenseUsers", "licenseParallelJobs"].forEach(id => {
+    const element = $(id);
+    if (element) element.disabled = !operational || !canMutate;
+  });
+  $("licenseApply").disabled = !operational || !canMutate;
+  $("licenseActivate").disabled = !data.license_operational || !canMutate;
   const audit = data.audit_chain || {};
   $("licenseAuditState").textContent = audit.valid ? `Audit OK (${audit.events_checked})` : `Audit roto en #${audit.broken_at}`;
   $("licenseAuditState").className = `pill ${audit.valid ? "ok" : "bad"}`;
@@ -2292,7 +2321,7 @@ async function applyLicense() {
   } catch (err) {
     toast(err.message, "bad");
   } finally {
-    $("licenseApply").disabled = false;
+    $("licenseApply").disabled = state.role !== "LICENSE_ADMIN";
   }
 }
 
@@ -2305,7 +2334,7 @@ async function activateLicense() {
   } catch (err) {
     toast(err.message, "bad");
   } finally {
-    $("licenseActivate").disabled = false;
+    $("licenseActivate").disabled = state.role !== "LICENSE_ADMIN";
   }
 }
 

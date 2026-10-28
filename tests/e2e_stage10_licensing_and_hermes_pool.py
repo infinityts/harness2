@@ -25,11 +25,19 @@ WS_BASE = BASE.replace("http", "ws", 1)
 DATABASE_URL = os.environ.get("DATABASE_URL")
 ADMIN_EMAIL = os.environ.get("HARNESS_E2E_ADMIN_EMAIL", "admin@local")
 ADMIN_PASSWORD = os.environ.get("HARNESS_E2E_ADMIN_PASSWORD", "admin")
+LICENSE_EMAIL = os.environ.get("HARNESS_E2E_LICENSE_OPERATOR_EMAIL", "license-operator@harness.local")
+LICENSE_PASSWORD = os.environ.get("HARNESS_E2E_LICENSE_OPERATOR_PASSWORD", "")
+LICENSE_TOTP_SECRET = os.environ.get("HARNESS_E2E_LICENSE_OPERATOR_TOTP_SECRET", "")
 REPOS = pathlib.Path("/var/lib/harness/repos")
 WORKTREES = pathlib.Path("/var/lib/harness/worktrees")
 BRIDGE = "/app/client/harness_mcp_bridge.py"
 LICENSE_DIR = pathlib.Path("/var/lib/harness/license")
 TEST_LICENSE_DIR = pathlib.Path("/var/lib/harness/license-test")
+
+for _candidate in ("/app", str(pathlib.Path(__file__).resolve().parents[1] / "app")):
+    if _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
+from src import totp as totp_lib
 
 PROJECT_A = "stage10-lic-a"
 PROJECT_B = "stage10-lic-b"
@@ -80,6 +88,28 @@ def db_rows(sql, **params):
 def db_exec(sql, **params):
     with engine.begin() as conn:
         conn.execute(sa.text(sql), params)
+
+
+async def login_license_operator():
+    if not LICENSE_PASSWORD or not LICENSE_TOTP_SECRET:
+        raise AssertionError(
+            "HARNESS_E2E_LICENSE_OPERATOR_PASSWORD and HARNESS_E2E_LICENSE_OPERATOR_TOTP_SECRET are required"
+        )
+    # Los E2E pueden correr en el mismo paso TOTP; se limpia el anti-replay solo en test.
+    db_exec(
+        """UPDATE harness_users
+           SET mfa_last_used_step = NULL, failed_login_attempts = 0, locked_until = NULL
+           WHERE email = :email""",
+        email=LICENSE_EMAIL,
+    )
+    st, body = await api("POST", "/api/v1/auth/login", {
+        "email": LICENSE_EMAIL,
+        "password": LICENSE_PASSWORD,
+        "totp_code": totp_lib.code(LICENSE_TOTP_SECRET),
+    })
+    assert st == 200, body
+    assert body["user"]["role"] == "LICENSE_ADMIN", body
+    return body["access_token"]
 
 
 class SmtpHandler(socketserver.StreamRequestHandler):
@@ -175,24 +205,24 @@ def close_ws():
     return _close()
 
 
-def activate_test_license(admin_token):
+def activate_test_license(token):
     test_license = TEST_LICENSE_DIR / "test-all-plans.json"
     if not test_license.exists():
         return False
     shutil.copyfile(test_license, LICENSE_DIR / "license.json")
-    st, data = http("POST", "/api/v1/admin/license/reload", None, bearer=admin_token)
+    st, data = http("POST", "/api/v1/admin/license/reload", None, bearer=token)
     assert st == 200, data
     assert data["signed_license"]["status"] == "VALID", data["signed_license"]
     assert len(data["signed_license"]["allowed_plans"]) >= 5
     return True
 
 
-def restore_production_license(admin_token):
+def restore_production_license(token):
     production = TEST_LICENSE_DIR / "license.production.json"
     if not production.exists():
         return
     shutil.copyfile(production, LICENSE_DIR / "license.json")
-    http("POST", "/api/v1/admin/license/reload", None, bearer=admin_token)
+    http("POST", "/api/v1/admin/license/reload", None, bearer=token)
 
 
 async def open_agent_ws(session_id, session_key):
@@ -318,6 +348,7 @@ async def main():
     st, login = await api("POST", "/api/v1/auth/login", {"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD})
     assert st == 200, login
     admin = login["access_token"]
+    license_token = await login_license_operator()
 
     st, original_license = await api("GET", "/api/v1/admin/license", bearer=admin)
     assert st == 200
@@ -338,8 +369,8 @@ async def main():
 
     try:
         print("\n--- 1. Plan ENTERPRISE_10 y usuarios de prueba ---")
-        assert activate_test_license(admin), "test-all-plans license not available"
-        st, lic = await api("PUT", "/api/v1/admin/license", {"plan_code": "ENTERPRISE_10"}, bearer=admin)
+        assert activate_test_license(license_token), "test-all-plans license not available"
+        st, lic = await api("PUT", "/api/v1/admin/license", {"plan_code": "ENTERPRISE_10"}, bearer=license_token)
         assert st == 200 and lic["plan_code"] == "ENTERPRISE_10"
 
         users = []
@@ -361,7 +392,7 @@ async def main():
         assert license_now["limits"]["max_registered_users"] == 30
 
         print("\n--- 2. PERSONAL_1: 1 proyecto, 1 ingeniero ---")
-        st, lic = await api("PUT", "/api/v1/admin/license", {"plan_code": "PERSONAL_1"}, bearer=admin)
+        st, lic = await api("PUT", "/api/v1/admin/license", {"plan_code": "PERSONAL_1"}, bearer=license_token)
         print("plan:", st, lic.get("plan_code"), lic.get("limits"))
         assert st == 200 and lic["plan_code"] == "PERSONAL_1"
 
@@ -389,7 +420,7 @@ async def main():
         assert st == 403 and "active projects (1/1)" in json.dumps(denied_project)
 
         print("\n--- 3. TEAM_3: 3 proyectos y 3 workers Hermes ---")
-        st, lic = await api("PUT", "/api/v1/admin/license", {"plan_code": "TEAM_3"}, bearer=admin)
+        st, lic = await api("PUT", "/api/v1/admin/license", {"plan_code": "TEAM_3"}, bearer=license_token)
         assert st == 200 and lic["limits"]["max_engineers_per_project"] == 3
 
         st, created_a = await api("POST", "/api/v1/projects", {
@@ -564,7 +595,7 @@ async def main():
                 proc.kill()
 
         print("\n--- 9. MAX_20 ---")
-        st, lic = await api("PUT", "/api/v1/admin/license", {"plan_code": "MAX_20"}, bearer=admin)
+        st, lic = await api("PUT", "/api/v1/admin/license", {"plan_code": "MAX_20"}, bearer=license_token)
         print("MAX_20:", st, lic.get("limits"))
         assert st == 200 and lic["limits"]["max_engineers_per_project"] == 20
         assert lic["limits"]["max_total_engineer_sessions"] == 60
@@ -581,11 +612,11 @@ async def main():
         await close_ws()
         cleanup()
         try:
-            restore_production_license(admin)
+            restore_production_license(license_token)
             st, _ = await api("PUT", "/api/v1/admin/license", {
                 "plan_code": ORIGINAL_LICENSE["plan_code"],
                 **ORIGINAL_LICENSE["limits"],
-            }, bearer=admin)
+            }, bearer=license_token)
             print("licencia restaurada:", st)
         except Exception as exc:
             print("no se pudo restaurar licencia:", exc)

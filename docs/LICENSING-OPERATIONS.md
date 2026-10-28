@@ -1,6 +1,6 @@
 # Licenciamiento Harness2 — Operación
 
-Documento consolidado de las etapas 10, 11 y 12.
+Documento consolidado de las etapas 10, 11, 12 y 13.
 
 ## Componentes
 
@@ -10,6 +10,7 @@ Documento consolidado de las etapas 10, 11 y 12.
 | Base de datos | `harness-db` | `system_license_policy`, `system_license_state`, `license_activation_state`, `license_audit_events`. |
 | Worker Hermes | `harness-hermes-worker` | Pool RAG por proyecto; no consume cupo de ingenieros. |
 | Servidor de licencias | `harness-license-server` | Proyecto Docker independiente; emite leases firmados y revoca activaciones. |
+| Operador de licencia | cuenta `LICENSE_ADMIN` | Segundo control local con MFA para mutar licencia/activación; no administra proyectos ni usuarios. |
 
 El servidor de licencias **no** vive en el compose principal. Se levanta desde
 `license-server/docker-compose.yml` y comparte la red externa `harness-net`.
@@ -30,6 +31,39 @@ El servidor de licencias **no** vive en el compose principal. Se levanta desde
 6. **Revocación**: el servidor puede revocar; el cliente pasa a `REVOKED` y
    bloquea escrituras sin usar la gracia.
 7. **Auditoría hash-chain** de todos los eventos de licencia/activación.
+8. **Separación de funciones**: solo una cuenta `LICENSE_ADMIN` con MFA puede
+   mutar la licencia; un `ADMIN` normal queda en modo lectura.
+
+## Gobierno de la cuenta de licencia
+
+La cuenta `license-operator@harness.local` es local a Harness2 y no sustituye la
+firma ni el servidor vendor-side. Se provisiona con:
+
+```bash
+podman exec harness-app python tools/provision_license_operator.py \
+  > /root/harness-license-operator.credentials.json
+chmod 600 /root/harness-license-operator.credentials.json
+```
+
+La salida contiene password y secreto TOTP una sola vez. La cuenta:
+
+- tiene `password_change_allowed = false` y no se puede resetear desde el portal;
+- exige TOTP en cada login;
+- bloquea 15 minutos tras 5 intentos fallidos;
+- rechaza reutilización del mismo código TOTP;
+- no puede crear proyectos, usuarios ni sesiones;
+- queda auditada con actor e IP.
+
+Rotación/break-glass:
+
+```bash
+podman exec harness-app python tools/provision_license_operator.py --rotate \
+  > /root/harness-license-operator.credentials.json
+chmod 600 /root/harness-license-operator.credentials.json
+```
+
+El script rechaza crear un segundo `LICENSE_ADMIN`. Detalle completo en
+`docs/STAGE13-LICENSE-ADMIN.md`.
 
 ## Planes
 
@@ -100,12 +134,26 @@ curl -s http://127.0.0.1:8444/api/v1/admin/license \
 
 ### Renovar activación
 
-Desde Portal → **Licencia y Pool** → **Activar / Renovar**, o:
+Solo `LICENSE_ADMIN` (con TOTP) puede renovar. Desde Portal → **Licencia y Pool**
+→ **Activar / Renovar**, o:
 
 ```bash
 curl -X POST http://127.0.0.1:8444/api/v1/admin/license/activate \
-  -H "Authorization: Bearer <portal_admin_token>"
+  -H "Authorization: Bearer <license_operator_token>"
 ```
+
+Un `ADMIN` normal recibe `403 LICENSE_ADMIN_REQUIRED`.
+
+### Cambiar plan o cuotas
+
+```bash
+curl -X PUT http://127.0.0.1:8444/api/v1/admin/license \
+  -H "Authorization: Bearer <license_operator_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"plan_code":"ENTERPRISE_10","max_active_projects":10}'
+```
+
+El operador no puede salir de `allowed_plans` ni superar los techos firmados.
 
 ### Revocar / restaurar
 
@@ -151,6 +199,10 @@ nunca se monta en Harness2.
 | --- | --- | --- |
 | `LICENSE_DEGRADED` | licencia inválida/expirada | revisar `signed_license.error_message` y `/admin/license/audit`. |
 | `LICENSE_ACTIVATION_REQUIRED` | sin lease o revocado | revisar servidor, token y `license_activation_state`. |
+| `LICENSE_ADMIN_REQUIRED` | un `ADMIN` normal intentó mutar licencia | iniciar sesión como `LICENSE_ADMIN` con TOTP. |
+| `PASSWORD_SEALED` | intento de cambiar/resetear la password del operador | usar `provision_license_operator.py --rotate` en el host. |
+| `ACCOUNT_LOCKED` | 5 intentos MFA/password fallidos | esperar 15 minutos o rotar credenciales vendor-side. |
+| `MFA_REQUIRED` / `MFA_INVALID` / `MFA_REPLAY` | login de operador sin TOTP, TOTP incorrecto o reutilizado | usar el código actual y no reutilizarlo. |
 | `OFFLINE_GRACE` | servidor caído/mantenimiento | restaurar servidor o renovar antes de que termine la gracia. |
 | `REVOKED` | revocación vendor | restaurar en el servidor y activar. |
 | `ERROR stored lease signature is invalid` | manipulación en base | renovar contra el servidor; investigar auditoría. |
@@ -161,6 +213,7 @@ nunca se monta en Harness2.
 - `docs/STAGE10-LICENSING-HERMES-POOL.md`
 - `docs/STAGE11-SIGNED-LICENSE.md`
 - `docs/STAGE12-HYBRID-ACTIVATION.md`
+- `docs/STAGE13-LICENSE-ADMIN.md`
 - `license-server/README.md`
 - `docs/diagrams/stage11-signed-license-icons.html`
 - `docs/diagrams/stage12-hybrid-activation-icons.html`
@@ -170,11 +223,12 @@ nunca se monta en Harness2.
 Estos documentos se ingestan en el RAG del proyecto `harness-self` con
 `source_uri` `repo://docs/...` y `repo://license-server/README.md`, usando el
 Secret Scrubber, chunking y embeddings del servidor. La ingesta es idempotente
-por checksum.
+por checksum. La Etapa 13 agrega `repo://docs/STAGE13-LICENSE-ADMIN.md`.
 
 ## Límite
 
 En on-premise con root, el cliente puede parchear la app. La combinación de
-firma, binding, lease corto, gracia, revocación y auditoría eleva el costo y
-deja evidencia, pero no es DRM absoluto. Para enforcement fuerte, el servidor de
-licencias debe estar fuera de la infraestructura del cliente.
+firma, binding, lease corto, gracia, revocación, cuenta `LICENSE_ADMIN` sellada
+con MFA y auditoría eleva el costo y deja evidencia, pero no es DRM absoluto. Para
+enforcement fuerte, el servidor de licencias debe estar fuera de la
+infraestructura del cliente.

@@ -22,6 +22,7 @@
 - [Etapa 10 — Licencias y pool Hermes](STAGE10-LICENSING-HERMES-POOL.md)
 - [Etapa 11 — Licencia firmada y auditoría](STAGE11-SIGNED-LICENSE.md)
 - [Etapa 12 — Activación online híbrida](STAGE12-HYBRID-ACTIVATION.md)
+- [Etapa 13 — LICENSE_ADMIN sellado con MFA](STAGE13-LICENSE-ADMIN.md)
 - [Servidor de licencias](../license-server/README.md)
 
 ## Diagramas
