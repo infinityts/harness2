@@ -5,6 +5,8 @@ from typing import List, Dict, Any, Optional
 import sqlalchemy as sa
 
 from src.indexer import compute_embedding_768
+from src.token_budget import estimate_tokens, get_profile
+from src.task_memory import record_memory
 
 
 class ContractViolation(Exception):
@@ -29,6 +31,16 @@ def _dedupe(items: List[str]) -> List[str]:
     return out
 
 
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    return [value]
+
+
 def _infer_skills(files: List[str]) -> List[str]:
     inferred = set()
     for f in files:
@@ -43,6 +55,147 @@ def _infer_skills(files: List[str]) -> List[str]:
         elif f.endswith(".sql"):
             inferred.add("sql")
     return sorted(inferred) or ["python"]
+
+
+def _fetch_symbol_candidates(conn, repo_name: str, files: List[str], qvec_str: str, limit: int = 32) -> List[Dict[str, Any]]:
+    if not files:
+        return []
+    rows = conn.execute(
+        sa.text("""
+            SELECT m.file_path, v.symbol_name, v.symbol_signature, v.code_snippet
+            FROM code_ast_vectors v
+            JOIN repo_file_map m ON m.id = v.file_id
+            WHERE m.repo_name = :rname AND m.file_path = ANY(:files)
+            ORDER BY v.embedding <=> CAST(:qvec AS vector)
+            LIMIT :limit
+        """),
+        {"rname": repo_name, "files": files, "qvec": qvec_str, "limit": limit},
+    ).mappings().all()
+    return [dict(row) for row in rows]
+
+
+def _symbols_for_files(candidates: List[Dict[str, Any]], files: List[str], max_per_file: int = 3) -> List[str]:
+    counts: Dict[str, int] = {}
+    out: List[str] = []
+    wanted = {_normalize_path(f) for f in files}
+    for row in candidates:
+        path = _normalize_path(row["file_path"])
+        if path not in wanted:
+            continue
+        if counts.get(path, 0) >= max_per_file:
+            continue
+        symbol = f"{path}::{row['symbol_name']}"
+        if symbol not in out:
+            out.append(symbol)
+            counts[path] = counts.get(path, 0) + 1
+    return out
+
+
+def _skill_tokens(conn, skills: List[str]) -> int:
+    if not skills:
+        return 0
+    return int(conn.execute(
+        sa.text("""
+            SELECT COALESCE(SUM(compiled_tokens), 0)
+            FROM harness_skills
+            WHERE slug = ANY(:skills) AND status = 'PUBLISHED'
+        """),
+        {"skills": skills},
+    ).scalar_one() or 0)
+
+
+def _estimate_task_tokens(
+    conn,
+    task: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    profile: Dict[str, Any],
+    requirement_prompt: str,
+) -> int:
+    chars_per_token = float(profile.get("chars_per_token") or 3.6)
+    contract_text = json.dumps({
+        "requirement_prompt": requirement_prompt,
+        "task": task,
+    }, ensure_ascii=False)
+    base = estimate_tokens(contract_text, chars_per_token) + 1200
+    base += _skill_tokens(conn, task.get("required_skills") or [])
+    allowed_symbols = set(task.get("allowed_symbols") or [])
+    for row in candidates:
+        symbol = f"{_normalize_path(row['file_path'])}::{row['symbol_name']}"
+        if symbol in allowed_symbols:
+            base += estimate_tokens(row.get("code_snippet") or "", chars_per_token)
+    # Reserva para documentacion RAG y salida de herramientas dentro de la tarea.
+    base += 1500
+    return max(1, int(base))
+
+
+def _default_acceptance(task: Dict[str, Any], files: List[str]) -> List[str]:
+    kind = task.get("task_kind") or ""
+    if kind == "VERIFY" or any(k in str(task.get("title", "")).lower() for k in ("verif", "test", "integration", "valid")):
+        return [
+            "Los tests de integracion/relevantes pasan",
+            "No se modifican archivos fuera del contrato",
+            "El handoff documenta resultados y riesgos residuales",
+        ]
+    return [
+        f"El cambio implementa el objetivo en {', '.join(files) or 'el alcance definido'}",
+        "El codigo compila y los tests relevantes pasan",
+        "No se modifican archivos fuera de allowed_files",
+    ]
+
+
+def _normalize_contract_task(
+    conn,
+    task: Dict[str, Any],
+    idx: int,
+    repo_name: str,
+    primary_file: str,
+    required_skills: List[str],
+    profile: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    requirement_prompt: str,
+) -> Dict[str, Any]:
+    afiles = _dedupe([_normalize_path(f) for f in (task.get("allowed_files") or [primary_file])])
+    if not afiles:
+        afiles = [primary_file]
+    title = task.get("title") or f"Paso {idx}"
+    task_kind = task.get("task_kind") or (
+        "VERIFY" if any(k in title.lower() for k in ("verif", "test", "integration", "valid")) else "IMPLEMENT"
+    )
+    default_tests = []
+    py_files = [f for f in afiles if f.endswith(".py")]
+    if py_files:
+        default_tests = ["python -m compileall " + " ".join(py_files)]
+    normalized = {
+        "step": idx,
+        "title": title,
+        "required_skills": _as_list(task.get("required_skills") or required_skills),
+        "allowed_files": afiles,
+        "allow_dependency_changes": bool(task.get("allow_dependency_changes", False)),
+        "task_kind": task_kind,
+        "description": task.get("description") or (
+            f"{requirement_prompt}\n\nTarea {idx}: {title}. "
+            f"Alcance permitido: {', '.join(afiles)}."
+        ),
+        "task_context": task.get("task_context") or (
+            f"Parte del plan para: {requirement_prompt}. "
+            "Ejecuta solo este slice y deja un handoff con decisiones, archivos y tests."
+        ),
+        "acceptance_criteria": _as_list(task.get("acceptance_criteria")) or _default_acceptance(
+            {**task, "task_kind": task_kind, "title": title}, afiles
+        ),
+        "test_commands": _as_list(task.get("test_commands")) or default_tests,
+        "allowed_symbols": _as_list(task.get("allowed_symbols")) or _symbols_for_files(candidates, afiles),
+        "depends_on_steps": _as_list(task.get("depends_on_steps")),
+    }
+    normalized["estimated_input_tokens"] = int(
+        task.get("estimated_input_tokens")
+        or _estimate_task_tokens(conn, normalized, candidates, profile, requirement_prompt)
+    )
+    normalized["max_input_tokens"] = int(task.get("max_input_tokens") or profile.get("max_input_tokens") or 20000)
+    normalized["budget_status"] = (
+        "OK" if normalized["estimated_input_tokens"] <= normalized["max_input_tokens"] else "NEEDS_SPLIT"
+    )
+    return normalized
 
 
 def _plan_metrics(conn, repo_name: str, plan: Dict[str, Any], expected_skills: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -112,6 +265,7 @@ def generate_dual_plans_and_synthesize(
     plan_a_override: Optional[Dict[str, Any]] = None,
     plan_b_override: Optional[Dict[str, Any]] = None,
     project_id: Optional[str] = None,
+    model_profile: str = "local-32k",
 ) -> Dict[str, Any]:
     """
     Genera obligatoriamente Plan A y Plan B sobre el mapa real del repositorio,
@@ -141,6 +295,8 @@ def generate_dual_plans_and_synthesize(
     secondary_files = [f for f in candidate_files[1:3]] or [primary_file]
 
     required_skills = list(required_skills_hint or []) or _infer_skills(candidate_files)
+    profile = get_profile(conn, model_profile)
+    symbol_candidates = _fetch_symbol_candidates(conn, repo_name, candidate_files, q_vec_str, limit=40)
 
     # 2. Plan A (Conservador: minima superficie de cambio, 1 archivo por tarea)
     plan_a = plan_a_override or {
@@ -175,7 +331,8 @@ def generate_dual_plans_and_synthesize(
                 "title": f"[Verify/Integration] Validar contratos e integracion en {', '.join(secondary_files)}",
                 "required_skills": required_skills,
                 "allowed_files": secondary_files,
-                "allow_dependency_changes": False
+                "allow_dependency_changes": False,
+                "depends_on_steps": [1]
             }
         ]
     }
@@ -185,6 +342,29 @@ def generate_dual_plans_and_synthesize(
         raise ValueError("Plan A no contiene tareas.")
     if not (plan_b.get("tasks") or []):
         raise ValueError("Plan B no contiene tareas.")
+
+    plan_a["tasks"] = [
+        _normalize_contract_task(
+            conn, t, idx, repo_name, primary_file, required_skills,
+            profile, symbol_candidates, requirement_prompt,
+        )
+        for idx, t in enumerate(plan_a["tasks"], start=1)
+    ]
+    plan_b["tasks"] = [
+        _normalize_contract_task(
+            conn, t, idx, repo_name, primary_file, required_skills,
+            profile, symbol_candidates, requirement_prompt,
+        )
+        for idx, t in enumerate(plan_b["tasks"], start=1)
+    ]
+    plan_a["model_profile"] = profile["name"]
+    plan_b["model_profile"] = profile["name"]
+    plan_a["estimated_context_per_task"] = max(
+        (t.get("estimated_input_tokens") or 0) for t in plan_a["tasks"]
+    )
+    plan_b["estimated_context_per_task"] = max(
+        (t.get("estimated_input_tokens") or 0) for t in plan_b["tasks"]
+    )
 
     metrics_a = _plan_metrics(conn, repo_name, plan_a, required_skills)
     metrics_b = _plan_metrics(conn, repo_name, plan_b, required_skills)
@@ -220,19 +400,37 @@ def generate_dual_plans_and_synthesize(
             alternatives = [f for f in candidate_files if f not in used_files]
             if alternatives:
                 afiles = [alternatives[0]]
+                t = {
+                    **t,
+                    "allowed_symbols": _symbols_for_files(symbol_candidates, afiles),
+                    "estimated_input_tokens": _estimate_task_tokens(
+                        conn,
+                        {**t, "allowed_files": afiles, "allowed_symbols": _symbols_for_files(symbol_candidates, afiles)},
+                        symbol_candidates,
+                        profile,
+                        requirement_prompt,
+                    ),
+                }
+                t["budget_status"] = "OK" if t["estimated_input_tokens"] <= int(t.get("max_input_tokens") or profile["max_input_tokens"]) else "NEEDS_SPLIT"
         used_files.update(afiles)
+        depends_on_steps = _as_list(t.get("depends_on_steps") or [])
+        if not depends_on_steps and idx > 1 and (t.get("task_kind") == "VERIFY"):
+            depends_on_steps = [idx - 1]
         unified_tasks.append({
+            **t,
             "step": idx,
-            "title": t.get("title") or f"Paso {idx}",
-            "required_skills": list(t.get("required_skills") or required_skills),
+            "required_skills": _as_list(t.get("required_skills") or required_skills),
             "allowed_files": afiles,
-            "allow_dependency_changes": bool(t.get("allow_dependency_changes", False))
+            "depends_on_steps": depends_on_steps,
+            "allow_dependency_changes": bool(t.get("allow_dependency_changes", False)),
         })
 
     master_plan_c = {
         "synthesis_strategy": "HYBRID_CONSERVATIVE_MODULAR",
         "repo_name": repo_name,
         "project_id": project_id,
+        "model_profile": profile["name"],
+        "plan_budget_tokens": int(profile["max_input_tokens"]),
         "scores": {
             "plan_a": score_a,
             "plan_b": score_b,
@@ -247,10 +445,12 @@ def generate_dual_plans_and_synthesize(
         sa.text("""
             INSERT INTO feature_consensus_plans (
                 id, requested_by, requirement_prompt, plan_a_json, plan_b_json,
-                arbiter_justification, master_plan_c_json, status, project_id
+                arbiter_justification, master_plan_c_json, status, project_id,
+                model_profile, plan_budget_tokens, plan_metrics
             ) VALUES (
                 CAST(:pid AS UUID), :req_by, :prompt, CAST(:pa AS JSONB), CAST(:pb AS JSONB),
-                :just, CAST(:pc AS JSONB), 'APPROVED', CAST(:project_id AS UUID)
+                :just, CAST(:pc AS JSONB), 'APPROVED', CAST(:project_id AS UUID),
+                :model_profile, :plan_budget, CAST(:plan_metrics AS JSONB)
             )
         """),
         {
@@ -261,23 +461,49 @@ def generate_dual_plans_and_synthesize(
             "pb": json.dumps(plan_b),
             "just": justification,
             "pc": json.dumps(master_plan_c),
-            "project_id": project_id
+            "project_id": project_id,
+            "model_profile": profile["name"],
+            "plan_budget": int(profile["max_input_tokens"]),
+            "plan_metrics": json.dumps({
+                "task_count": len(unified_tasks),
+                "max_input_tokens": int(profile["max_input_tokens"]),
+                "max_estimated_input_tokens": max(
+                    (t.get("estimated_input_tokens") or 0) for t in unified_tasks
+                ),
+                "needs_split": any(t.get("budget_status") == "NEEDS_SPLIT" for t in unified_tasks),
+                "chars_per_token": profile.get("chars_per_token"),
+            }),
         }
     )
 
+    task_ids = {t["step"]: str(uuid.uuid4()) for t in unified_tasks}
     created_tasks = []
     for t in unified_tasks:
-        tid = str(uuid.uuid4())
+        tid = task_ids[t["step"]]
         branch_name = f"harness/plan-{short_plan}/task-{t['step']}"
+        depends_on = []
+        for step in (t.get("depends_on_steps") or []):
+            try:
+                step_key = int(step)
+            except (TypeError, ValueError):
+                continue
+            if step_key in task_ids and step_key != t["step"]:
+                depends_on.append(task_ids[step_key])
         conn.execute(
             sa.text("""
                 INSERT INTO harness_tasks (
                     id, plan_id, title, required_skills, git_branch,
-                    allowed_files, allow_dependency_changes, status, created_at
+                    allowed_files, allow_dependency_changes, status, created_at,
+                    description, task_context, acceptance_criteria, test_commands,
+                    depends_on, allowed_symbols, estimated_input_tokens, max_input_tokens,
+                    context_manifest, memory_epoch, task_kind, budget_status, updated_at
                 ) VALUES (
                     CAST(:tid AS UUID), CAST(:pid AS UUID), :title,
                     CAST(:skills AS JSONB), :branch, CAST(:afiles AS JSONB), :allow_dep,
-                    'PENDING', clock_timestamp()
+                    'PENDING', clock_timestamp(),
+                    :description, :task_context, CAST(:acceptance AS JSONB), CAST(:tests AS JSONB),
+                    CAST(:depends_on AS JSONB), CAST(:symbols AS JSONB), :estimated, :max_input,
+                    CAST(:manifest AS JSONB), 0, :task_kind, :budget_status, NOW()
                 )
             """),
             {
@@ -287,7 +513,23 @@ def generate_dual_plans_and_synthesize(
                 "skills": json.dumps(t["required_skills"]),
                 "branch": branch_name,
                 "afiles": json.dumps(t["allowed_files"]),
-                "allow_dep": t["allow_dependency_changes"]
+                "allow_dep": t["allow_dependency_changes"],
+                "description": t.get("description"),
+                "task_context": t.get("task_context"),
+                "acceptance": json.dumps(t.get("acceptance_criteria") or []),
+                "tests": json.dumps(t.get("test_commands") or []),
+                "depends_on": json.dumps(depends_on),
+                "symbols": json.dumps(t.get("allowed_symbols") or []),
+                "estimated": int(t.get("estimated_input_tokens") or 0),
+                "max_input": int(t.get("max_input_tokens") or profile["max_input_tokens"]),
+                "manifest": json.dumps({
+                    "model_profile": profile["name"],
+                    "estimated_input_tokens": int(t.get("estimated_input_tokens") or 0),
+                    "max_input_tokens": int(t.get("max_input_tokens") or profile["max_input_tokens"]),
+                    "budget_status": t.get("budget_status") or "OK",
+                }),
+                "task_kind": t.get("task_kind") or "IMPLEMENT",
+                "budget_status": t.get("budget_status") or "OK",
             }
         )
         created_tasks.append({
@@ -296,6 +538,16 @@ def generate_dual_plans_and_synthesize(
             "required_skills": t["required_skills"],
             "git_branch": branch_name,
             "allowed_files": t["allowed_files"],
+            "allowed_symbols": t.get("allowed_symbols") or [],
+            "description": t.get("description"),
+            "task_context": t.get("task_context"),
+            "acceptance_criteria": t.get("acceptance_criteria") or [],
+            "test_commands": t.get("test_commands") or [],
+            "depends_on": depends_on,
+            "estimated_input_tokens": int(t.get("estimated_input_tokens") or 0),
+            "max_input_tokens": int(t.get("max_input_tokens") or profile["max_input_tokens"]),
+            "budget_status": t.get("budget_status") or "OK",
+            "task_kind": t.get("task_kind") or "IMPLEMENT",
             "status": "PENDING"
         })
 
@@ -321,9 +573,13 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
     pending_rows = conn.execute(
         sa.text("""
             SELECT t.id::text AS task_id, t.plan_id::text AS plan_id, t.title,
-                   t.required_skills, t.git_branch, t.allowed_files,
+                   t.required_skills, t.git_branch, t.allowed_files, t.allowed_symbols,
+                   t.description, t.task_context, t.acceptance_criteria, t.test_commands,
+                   t.depends_on, t.estimated_input_tokens, t.max_input_tokens,
+                   t.handoff_summary, t.context_manifest, t.memory_epoch, t.task_kind,
+                   t.budget_status,
                    p.master_plan_c_json->>'repo_name' AS repo_name,
-                   p.project_id::text AS project_id
+                   p.project_id::text AS project_id, p.requirement_prompt
             FROM harness_tasks t
             JOIN feature_consensus_plans p ON p.id = t.plan_id
             WHERE t.status = 'PENDING'
@@ -339,6 +595,18 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
         repo_name = task["repo_name"]
         if not repo_name:
             continue
+        depends_on = [str(x) for x in (task.get("depends_on") or [])]
+        if depends_on:
+            ready = conn.execute(
+                sa.text("""
+                    SELECT count(*) FROM harness_tasks
+                    WHERE id = ANY(CAST(:deps AS UUID[]))
+                      AND status = 'MERGED'
+                """),
+                {"deps": depends_on},
+            ).scalar_one()
+            if int(ready or 0) < len(depends_on):
+                continue
         conn.execute(sa.text("SELECT pg_advisory_xact_lock(hashtext(:rname))"), {"rname": repo_name})
 
         # 1. Verificar si alguno de los archivos permitidos esta bloqueado por otra tarea.
@@ -423,6 +691,20 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
             "required_skills": task["required_skills"] or [],
             "git_branch": task["git_branch"],
             "allowed_files": allowed_files,
+            "allowed_symbols": task.get("allowed_symbols") or [],
+            "description": task.get("description"),
+            "task_context": task.get("task_context"),
+            "acceptance_criteria": task.get("acceptance_criteria") or [],
+            "test_commands": task.get("test_commands") or [],
+            "depends_on": task.get("depends_on") or [],
+            "estimated_input_tokens": task.get("estimated_input_tokens") or 0,
+            "max_input_tokens": task.get("max_input_tokens") or 0,
+            "handoff_summary": task.get("handoff_summary"),
+            "context_manifest": task.get("context_manifest") or {},
+            "memory_epoch": task.get("memory_epoch") or 0,
+            "task_kind": task.get("task_kind") or "IMPLEMENT",
+            "budget_status": task.get("budget_status") or "OK",
+            "requirement_prompt": task.get("requirement_prompt"),
             "repo_name": repo_name,
             "assigned_to": {
                 "session_id": agent["session_id"],
@@ -525,11 +807,22 @@ def fail_task_checkpoint(
             UPDATE harness_tasks
             SET failed_attempts_memory = failed_attempts_memory || CAST(:entry AS JSONB),
                 status = :new_status,
-                assigned_session_id = CASE WHEN :release THEN NULL ELSE assigned_session_id END
+                assigned_session_id = CASE WHEN :release THEN NULL ELSE assigned_session_id END,
+                updated_at = NOW()
             WHERE id = CAST(:tid AS UUID)
         """),
         {"entry": json.dumps(entry), "new_status": new_status, "release": release, "tid": task_id}
     )
+    try:
+        record_memory(
+            conn, task_id, "FAILURE", error_reason,
+            details={"barrier": "TASK_CHECKPOINT", "git_diff_summary": git_diff_summary},
+            files=(git_diff_summary or "").split(", ") if git_diff_summary else [],
+            session_id=session_id,
+            created_by="fail-checkpoint",
+        )
+    except Exception as exc:
+        print(f"[memory] no se pudo registrar fallo: {exc}")
 
     if release:
         conn.execute(

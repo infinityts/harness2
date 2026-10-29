@@ -372,13 +372,21 @@ def tool_get_active_contract_and_task(args=None):
 def tool_request_context_pack(args):
     repo_name = args.get("repo_name")
     query = args.get("query")
-    if not repo_name or not query:
-        raise ValueError("repo_name y query son obligatorios")
+    if not query:
+        raise ValueError("query es obligatorio")
+    if not repo_name and not args.get("task_id"):
+        raise ValueError("repo_name o task_id es obligatorio")
     body = {
-        "repo_name": repo_name,
         "query": query,
         "token_budget": int(args.get("token_budget", 2000)),
+        "include_handoff": bool(args.get("include_handoff", True)),
     }
+    if repo_name:
+        body["repo_name"] = repo_name
+    if args.get("task_id"):
+        body["task_id"] = args["task_id"]
+    if args.get("model_profile"):
+        body["model_profile"] = args["model_profile"]
     if args.get("allowed_files"):
         body["allowed_files"] = args["allowed_files"]
     status, data = api("POST", "/api/v1/context/pack", body)
@@ -412,6 +420,8 @@ def tool_submit_task_changes(args):
         "file_changes": args.get("file_changes"),
         "unified_diff": args.get("unified_diff"),
         "commit_message": args.get("commit_message", "harness bridge submit"),
+        "summary": args.get("summary"),
+        "tests": args.get("tests") or [],
     }, timeout=180)
     purged = False
     if status == 200 and isinstance(data, dict) and data.get("status") in ("MERGED", "VALIDATING"):
@@ -443,6 +453,78 @@ def tool_report_checkpoint_failure(args):
             bridge_state["purge_requested"] = False
         _send_heartbeat_now()
     return {"http_status": status, "result": data}
+
+
+def tool_get_task_contract(args):
+    task_id = (args or {}).get("task_id")
+    if not task_id:
+        status, data = api("GET", "/api/v1/tasks")
+        if status != 200:
+            raise RuntimeError(f"tasks HTTP {status}: {data}")
+        active = next((t for t in data.get("tasks", []) if t.get("status") in ("IN_PROGRESS", "VALIDATING", "CONFLICT")), None)
+        if not active:
+            raise RuntimeError("No hay tarea activa; pasa task_id")
+        task_id = active["id"]
+    status, data = api("GET", f"/api/v1/tasks/{task_id}/contract")
+    if status != 200:
+        raise RuntimeError(f"task contract HTTP {status}: {data}")
+    return data
+
+
+def tool_checkpoint_task(args):
+    task_id = (args or {}).get("task_id")
+    if not task_id:
+        raise ValueError("task_id es obligatorio")
+    body = {
+        "summary": args.get("summary") or "Checkpoint de contexto",
+        "decisions": args.get("decisions") or [],
+        "files": args.get("files") or [],
+        "tests": args.get("tests") or [],
+        "next_steps": args.get("next_steps") or [],
+        "details": args.get("details") or {},
+        "reset_context": bool(args.get("reset_context", True)),
+        "token_estimate": int(args.get("token_estimate", 0)),
+    }
+    status, data = api("POST", f"/api/v1/tasks/{task_id}/checkpoint", body)
+    if status != 200:
+        raise RuntimeError(f"checkpoint HTTP {status}: {data}")
+    if body["reset_context"]:
+        with state_lock:
+            bridge_state["current_context_tokens"] = 0
+            bridge_state["purge_requested"] = False
+        _send_heartbeat_now()
+    return data
+
+
+def tool_resume_task(args):
+    task_id = (args or {}).get("task_id")
+    if not task_id:
+        raise ValueError("task_id es obligatorio")
+    status, data = api("POST", f"/api/v1/tasks/{task_id}/resume")
+    if status != 200:
+        raise RuntimeError(f"resume HTTP {status}: {data}")
+    with state_lock:
+        bridge_state["current_context_tokens"] = 0
+        bridge_state["purge_requested"] = False
+    _send_heartbeat_now()
+    return data
+
+
+def tool_report_context_usage(args):
+    tokens = int((args or {}).get("current_context_tokens", 0))
+    max_tokens = int((args or {}).get("max_context_tokens", 0) or 0)
+    with state_lock:
+        bridge_state["current_context_tokens"] = max(0, tokens)
+        if max_tokens > 0:
+            bridge_state["max_context_tokens"] = max_tokens
+    _send_heartbeat_now()
+    return {
+        "current_context_tokens": bridge_state["current_context_tokens"],
+        "max_context_tokens": bridge_state["max_context_tokens"],
+        "context_pct": round(
+            (bridge_state["current_context_tokens"] / bridge_state["max_context_tokens"]) * 100, 1
+        ) if bridge_state["max_context_tokens"] else 0.0,
+    }
 
 
 def tool_send_peer_message(args):
@@ -513,6 +595,10 @@ def tool_rag_list(args=None):
 
 TOOL_FUNCS = {
     "harness_get_active_contract_and_task": tool_get_active_contract_and_task,
+    "harness_get_task_contract": tool_get_task_contract,
+    "harness_checkpoint_task": tool_checkpoint_task,
+    "harness_resume_task": tool_resume_task,
+    "harness_report_context_usage": tool_report_context_usage,
     "harness_request_context_pack": tool_request_context_pack,
     "harness_validate_symbols": tool_validate_symbols,
     "harness_submit_task_changes": tool_submit_task_changes,
@@ -538,10 +624,13 @@ TOOLS = [
             "properties": {
                 "repo_name": {"type": "string"},
                 "query": {"type": "string"},
-                "token_budget": {"type": "integer", "minimum": 300, "maximum": 16000},
+                "token_budget": {"type": "integer", "minimum": 300, "maximum": 64000},
                 "allowed_files": {"type": "array", "items": {"type": "string"}},
+                "task_id": {"type": "string"},
+                "model_profile": {"type": "string"},
+                "include_handoff": {"type": "boolean"},
             },
-            "required": ["repo_name", "query"],
+            "required": ["query"],
         },
     },
     {
@@ -566,6 +655,8 @@ TOOLS = [
                 "file_changes": {"type": "object", "additionalProperties": {"type": "string"}},
                 "unified_diff": {"type": "string"},
                 "commit_message": {"type": "string"},
+                "summary": {"type": "string"},
+                "tests": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["task_id"],
         },
@@ -641,6 +732,55 @@ TOOLS = [
         "name": "harness_rag_list",
         "description": "Lista los documentos RAG del proyecto de esta sesion.",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "harness_get_task_contract",
+        "description": "Devuelve el contrato completo de una tarea: objetivo, alcance, aceptacion, tests, dependencias, presupuesto y memoria.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string"}},
+            "required": [],
+        },
+    },
+    {
+        "name": "harness_checkpoint_task",
+        "description": "Persiste un checkpoint/handoff de la tarea y opcionalmente limpia el contexto de trabajo.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "summary": {"type": "string"},
+                "decisions": {"type": "array", "items": {"type": "string"}},
+                "files": {"type": "array", "items": {"type": "string"}},
+                "tests": {"type": "array", "items": {"type": "string"}},
+                "next_steps": {"type": "array", "items": {"type": "string"}},
+                "details": {"type": "object"},
+                "reset_context": {"type": "boolean"},
+                "token_estimate": {"type": "integer", "minimum": 0},
+            },
+            "required": ["task_id", "summary"],
+        },
+    },
+    {
+        "name": "harness_resume_task",
+        "description": "Reanuda una tarea desde su handoff persistente y devuelve contrato, dependencias y memoria.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string"}},
+            "required": ["task_id"],
+        },
+    },
+    {
+        "name": "harness_report_context_usage",
+        "description": "Reporta tokens reales del runtime local para que Harness aplique el presupuesto y la politica de compactacion.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "current_context_tokens": {"type": "integer", "minimum": 0},
+                "max_context_tokens": {"type": "integer", "minimum": 1},
+            },
+            "required": ["current_context_tokens"],
+        },
     },
 ]
 

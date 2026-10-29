@@ -66,6 +66,8 @@ from src.licensing import (
 from src.signed_license import LicenseManager
 from src.license_activation import ActivationManager
 from src import totp
+from src.token_budget import context_budget, estimate_tokens as estimate_token_budget, fit_text, get_profile, resolve_profile
+from src import task_memory
 from src.hermes_pool import (
     claim_job,
     complete_job,
@@ -152,6 +154,7 @@ class SessionRegisterRequest(BaseModel):
     llm_provider: str = Field(..., min_length=2, max_length=100)
     skills: List[str] = Field(default_factory=list)
     max_context_tokens: int = Field(default=32000, gt=1024)
+    model_profile: Optional[str] = Field(default=None, max_length=80)
 
 
 def hash_token(token: str) -> str:
@@ -399,6 +402,23 @@ def assert_task_project_access(auth: Dict[str, Any], task_id: str) -> None:
         raise HTTPException(status_code=403, detail="Cross-Project Isolation Violation")
 
 
+def assert_plan_project_access(auth: Dict[str, Any], plan_id: str) -> None:
+    if auth.get("role") != "agent":
+        return
+    project_id = auth.get("project_id")
+    if not project_id:
+        return
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.text("SELECT project_id::text FROM feature_consensus_plans WHERE id = CAST(:pid AS UUID)"),
+            {"pid": plan_id},
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="plan not found")
+    if row[0] and row[0] != project_id:
+        raise HTTPException(status_code=403, detail="Cross-Project Isolation Violation")
+
+
 def cleanup_disconnected_sessions(conn, session_ids: List[str], target_status: str = "OFFLINE"):
     """Pasa sesiones a OFFLINE/REVOKED y libera tareas y bloqueos de archivos en una sola transaccion."""
     if not session_ids:
@@ -588,6 +608,12 @@ def health_check():
 async def register_agent_session(payload: SessionRegisterRequest):
     session_id = str(uuid.uuid4())
     now_ts = int(datetime.now(timezone.utc).timestamp())
+    try:
+        with engine.connect() as conn:
+            profile = resolve_profile(conn, payload.model_profile, payload.max_context_tokens)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    max_tokens = int(profile["context_window_tokens"]) if payload.model_profile else int(payload.max_context_tokens)
     jwt_payload = {
         "sub": session_id,
         "user": payload.engineer_username,
@@ -604,10 +630,11 @@ async def register_agent_session(payload: SessionRegisterRequest):
             sa.text("""
                 INSERT INTO agent_sessions (
                     id, engineer_username, agent_tool, llm_provider,
-                    session_key_hash, skills, status, max_context_tokens, current_context_tokens
+                    session_key_hash, skills, status, max_context_tokens, current_context_tokens,
+                    model_profile
                 ) VALUES (
                     CAST(:id AS UUID), :user, :tool, :provider,
-                    :khash, CAST(:skills AS JSONB), 'ONLINE', :max_tok, 0
+                    :khash, CAST(:skills AS JSONB), 'ONLINE', :max_tok, 0, :model_profile
                 )
             """),
             {
@@ -617,7 +644,8 @@ async def register_agent_session(payload: SessionRegisterRequest):
                 "provider": payload.llm_provider,
                 "khash": key_hash,
                 "skills": json.dumps(payload.skills),
-                "max_tok": payload.max_context_tokens
+                "max_tok": max_tokens,
+                "model_profile": profile["name"],
             }
         )
 
@@ -637,6 +665,8 @@ async def register_agent_session(payload: SessionRegisterRequest):
         "session_id": session_id,
         "session_key": session_key,
         "status": "ONLINE",
+        "max_context_tokens": max_tokens,
+        "model_profile": profile["name"],
         "ws_url": f"/ws/agent/{session_id}"
     }
 
@@ -650,7 +680,8 @@ def list_sessions():
                        s.skills, s.status, s.current_context_tokens, s.max_context_tokens,
                        s.system_contract_rules, s.last_heartbeat, s.connected_at,
                        s.project_id::text AS project_id, p.project_slug, s.is_headless_worker,
-                       s.session_kind, s.worker_role
+                       s.session_kind, s.worker_role, s.model_profile,
+                       s.context_compactions, s.last_compacted_at
                 FROM agent_sessions s
                 LEFT JOIN harness_projects p ON p.id = s.project_id
                 ORDER BY s.connected_at DESC
@@ -667,7 +698,10 @@ def confirm_context_purged(session_id: str, auth: Dict[str, Any] = Depends(verif
         res = conn.execute(
             sa.text("""
                 UPDATE agent_sessions
-                SET current_context_tokens = 0, last_heartbeat = NOW()
+                SET current_context_tokens = 0,
+                    context_compactions = context_compactions + 1,
+                    last_compacted_at = NOW(),
+                    last_heartbeat = NOW()
                 WHERE id = CAST(:sid AS UUID) AND status IN ('ONLINE', 'BUSY')
             """),
             {"sid": session_id}
@@ -894,12 +928,15 @@ class RepoIndexRequest(BaseModel):
 
 
 class ContextPackRequest(BaseModel):
-    repo_name: str = Field(..., min_length=2, max_length=150)
+    repo_name: Optional[str] = Field(default=None, min_length=2, max_length=150)
     query: str = Field(..., min_length=1, max_length=4000)
     allowed_files: Optional[List[str]] = None
-    token_budget: int = Field(default=2000, ge=300, le=16000)
+    token_budget: int = Field(default=2000, ge=300, le=64000)
     top_k: int = Field(default=5, ge=1, le=20)
     include_docs: bool = True
+    task_id: Optional[str] = None
+    model_profile: Optional[str] = Field(default=None, max_length=80)
+    include_handoff: bool = True
 
 
 class SymbolValidationRequest(BaseModel):
@@ -962,17 +999,48 @@ def get_repository_quick_map(repo_name: str, auth: Dict[str, Any] = Depends(veri
 
 @app.post("/api/v1/context/pack", dependencies=[Depends(verify_auth)])
 def build_surgical_context_pack(payload: ContextPackRequest, auth: Dict[str, Any] = Depends(verify_auth)):
-    assert_repo_access(auth, payload.repo_name)
-    """
-    Construye un Context Pack quirurgico (< token_budget) combinando:
-    1. El Mapa Rapido de archivos relevantes.
-    2. Los fragmentos exactos AST mas cercanos en pgvector (HNSW cosine distance).
-    """
-    q_vec = compute_embedding_768(payload.query)
-    q_vec_str = "[" + ",".join(str(x) for x in q_vec) + "]"
+    contract = None
+    task = None
+    handoff = None
+    repo_name = payload.repo_name
+    allowed_files = list(payload.allowed_files or [])
+    allowed_symbols: List[str] = []
+    profile_name = payload.model_profile
 
     with engine.connect() as conn:
-        # 1. Mapa rapido de archivos del repo
+        if payload.task_id:
+            assert_task_project_access(auth, payload.task_id)
+            try:
+                contract = task_memory.task_contract(conn, payload.task_id, include_memory=True)
+            except LookupError:
+                raise HTTPException(status_code=404, detail="task not found")
+            task = contract["task"]
+            repo_name = repo_name or contract["plan"].get("repo_name")
+            allowed_files = allowed_files or list(task.get("allowed_files") or [])
+            allowed_symbols = list(task.get("allowed_symbols") or [])
+            manifest = task.get("context_manifest") or {}
+            profile_name = profile_name or manifest.get("model_profile")
+            if payload.include_handoff:
+                handoff = contract.get("handoff")
+        if not repo_name:
+            raise HTTPException(status_code=400, detail="repo_name or task_id is required")
+        assert_repo_access(auth, repo_name)
+        try:
+            profile = get_profile(conn, profile_name or "local-32k")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        budget = context_budget(profile, payload.token_budget)
+        if payload.task_id and payload.token_budget <= 2000:
+            budget = context_budget(
+                profile,
+                min(int(task.get("max_input_tokens") or budget), int(profile["max_input_tokens"])),
+            )
+        if task:
+            budget = max(300, min(budget, int(task.get("max_input_tokens") or budget)))
+
+        q_vec = compute_embedding_768(payload.query)
+        q_vec_str = "[" + ",".join(str(x) for x in q_vec) + "]"
+
         map_rows = conn.execute(
             sa.text("""
                 SELECT file_path, quick_summary, locked_by_task_id::text AS locked_by_task_id
@@ -980,21 +1048,42 @@ def build_surgical_context_pack(payload: ContextPackRequest, auth: Dict[str, Any
                 WHERE repo_name = :rname
                 ORDER BY file_path ASC
             """),
-            {"rname": payload.repo_name}
+            {"rname": repo_name}
         ).mappings().all()
-        project = conn.execute(
-            sa.text("SELECT id::text FROM harness_projects WHERE project_slug = :rname"),
-            {"rname": payload.repo_name}
-        ).fetchone()
+        project_id = contract["plan"]["project_id"] if contract else None
+        if not project_id:
+            project = conn.execute(
+                sa.text("SELECT id::text FROM harness_projects WHERE project_slug = :rname"),
+                {"rname": repo_name}
+            ).fetchone()
+            project_id = project[0] if project else None
         doc_rows = []
-        if payload.include_docs and project:
+        if payload.include_docs and project_id:
             doc_rows = search_documents(
-                conn, project[0], payload.query,
+                conn, project_id, payload.query,
                 limit=max(payload.top_k, 8), qvec=q_vec,
             )
 
-        # 2. Busqueda vectorial HNSW en code_ast_vectors
-        if payload.allowed_files:
+        if allowed_symbols and any("::" in item for item in allowed_symbols):
+            symbol_names = [item.split("::", 1)[1] for item in allowed_symbols if "::" in item]
+            symbol_files = [item.split("::", 1)[0] for item in allowed_symbols if "::" in item]
+            vec_rows = conn.execute(
+                sa.text("""
+                    SELECT m.file_path, v.symbol_name, v.symbol_signature,
+                           v.start_line, v.end_line, v.code_snippet,
+                           ROUND((1 - (v.embedding <=> CAST(:qvec AS vector)))::numeric, 4) AS similarity
+                    FROM code_ast_vectors v
+                    JOIN repo_file_map m ON m.id = v.file_id
+                    WHERE m.repo_name = :rname
+                      AND m.file_path = ANY(:afiles)
+                      AND v.symbol_name = ANY(:symbols)
+                    ORDER BY v.embedding <=> CAST(:qvec AS vector) ASC
+                    LIMIT :topk
+                """),
+                {"qvec": q_vec_str, "rname": repo_name, "afiles": symbol_files or allowed_files,
+                 "symbols": symbol_names, "topk": max(payload.top_k, len(symbol_names))}
+            ).mappings().all()
+        elif allowed_files:
             vec_rows = conn.execute(
                 sa.text("""
                     SELECT m.file_path, v.symbol_name, v.symbol_signature,
@@ -1007,7 +1096,7 @@ def build_surgical_context_pack(payload: ContextPackRequest, auth: Dict[str, Any
                     ORDER BY v.embedding <=> CAST(:qvec AS vector) ASC
                     LIMIT :topk
                 """),
-                {"qvec": q_vec_str, "rname": payload.repo_name, "afiles": payload.allowed_files, "topk": payload.top_k}
+                {"qvec": q_vec_str, "rname": repo_name, "afiles": allowed_files, "topk": payload.top_k}
             ).mappings().all()
         else:
             vec_rows = conn.execute(
@@ -1021,54 +1110,72 @@ def build_surgical_context_pack(payload: ContextPackRequest, auth: Dict[str, Any
                     ORDER BY v.embedding <=> CAST(:qvec AS vector) ASC
                     LIMIT :topk
                 """),
-                {"qvec": q_vec_str, "rname": payload.repo_name, "topk": payload.top_k}
+                {"qvec": q_vec_str, "rname": repo_name, "topk": payload.top_k}
             ).mappings().all()
 
-    # Empaquetado respetando estrictamente el presupuesto de tokens (~4 caracteres por token).
-    # Hasta 28% para documentacion y el resto para mapa/AST.
-    char_budget = payload.token_budget * 4
-    docs_budget_chars = int(char_budget * 0.28) if payload.include_docs else 0
-    code_budget_chars = char_budget - docs_budget_chars
-    used_chars = 0
-    used_doc_chars = 0
+    chars_per_token = float(profile.get("chars_per_token") or 3.6)
+    contract_json = json.dumps(task, ensure_ascii=False, default=str) if task else ""
+    handoff_json = json.dumps(handoff, ensure_ascii=False, default=str) if handoff else ""
+    contract_tokens = estimate_token_budget(contract_json, chars_per_token) if contract_json else 0
+    handoff_tokens = estimate_token_budget(handoff_json, chars_per_token) if handoff_json else 0
+    if contract_tokens + handoff_tokens + 600 > budget:
+        budget = min(
+            int(profile["max_input_tokens"]),
+            contract_tokens + handoff_tokens + 600,
+        )
+    docs_budget = int(budget * 0.25) if payload.include_docs else 0
+    map_budget = int(budget * 0.10)
+    ast_budget = max(0, budget - contract_tokens - handoff_tokens - docs_budget - map_budget)
 
     repo_overview = []
+    used_map = 0
     for r in map_rows:
         line = f"{r['quick_summary']} [LOCK={r['locked_by_task_id'] or 'FREE'}]"
-        if used_chars + len(line) > int(code_budget_chars * 0.35):
+        line_tokens = estimate_token_budget(line, chars_per_token)
+        if used_map + line_tokens > map_budget:
             break
         repo_overview.append(line)
-        used_chars += len(line)
+        used_map += line_tokens
 
     selected_snippets = []
+    used_ast = 0
     for vr in vec_rows:
-        snippet_text = vr["code_snippet"]
-        remaining = code_budget_chars - used_chars
-        if remaining <= 120:
+        remaining = ast_budget - used_ast
+        if remaining <= 40:
             break
-        if len(snippet_text) > remaining:
-            suffix = "\n# ... [truncated by token_budget]"
-            snippet_text = snippet_text[: max(0, remaining - len(suffix))] + suffix
-        used_chars += len(snippet_text)
+        snippet_text = fit_text(
+            vr["code_snippet"], remaining,
+            chars_per_token=chars_per_token,
+            suffix="\n# ... [truncated by token_budget]",
+        )
+        snippet_tokens = estimate_token_budget(snippet_text, chars_per_token)
+        if snippet_tokens > remaining:
+            snippet_text = fit_text(snippet_text, remaining, chars_per_token=chars_per_token)
+            snippet_tokens = estimate_token_budget(snippet_text, chars_per_token)
+        used_ast += snippet_tokens
         selected_snippets.append({
             "file_path": vr["file_path"],
             "symbol_name": vr["symbol_name"],
             "symbol_signature": vr["symbol_signature"],
             "lines": [vr["start_line"], vr["end_line"]],
             "similarity": float(vr["similarity"]),
-            "code_snippet": snippet_text
+            "code_snippet": snippet_text,
+            "token_estimate": snippet_tokens,
         })
 
     relevant_doc_chunks = []
+    used_docs = 0
     for doc in doc_rows:
-        text = doc["chunk_text"]
-        remaining = docs_budget_chars - used_doc_chars
-        if remaining <= 80:
+        remaining = docs_budget - used_docs
+        if remaining <= 40:
             break
-        if len(text) > remaining:
-            suffix = "\n[...truncated by documentation budget]"
-            text = text[: max(0, remaining - len(suffix))] + suffix
-        used_doc_chars += len(text)
+        text = fit_text(
+            doc["chunk_text"], remaining,
+            chars_per_token=chars_per_token,
+            suffix="\n[...truncated by documentation budget]",
+        )
+        text_tokens = estimate_token_budget(text, chars_per_token)
+        used_docs += text_tokens
         relevant_doc_chunks.append({
             "document_id": doc["document_id"],
             "source_uri": doc["source_uri"],
@@ -1077,20 +1184,43 @@ def build_surgical_context_pack(payload: ContextPackRequest, auth: Dict[str, Any
             "section_heading": doc["section_heading"],
             "similarity": float(doc["similarity"]),
             "chunk_text": text,
-            "token_estimate": int(doc["token_estimate"]),
+            "token_estimate": text_tokens,
         })
 
-    estimated_tokens = min(payload.token_budget, max(1, (used_chars + used_doc_chars) // 4))
+    total_tokens = min(budget, used_map + used_ast + used_docs + contract_tokens + handoff_tokens)
+    manifest = {
+        "model_profile": profile["name"],
+        "context_window_tokens": int(profile["context_window_tokens"]),
+        "max_input_tokens": int(profile["max_input_tokens"]),
+        "token_budget": int(budget),
+        "reserved_tokens": int(profile["reserved_tokens"]),
+        "chars_per_token": chars_per_token,
+        "sections": {
+            "contract": contract_tokens,
+            "handoff": handoff_tokens,
+            "repo_quick_map": used_map,
+            "ast": used_ast,
+            "documentation": used_docs,
+        },
+        "task_contract": bool(task),
+        "allowed_symbols": allowed_symbols,
+    }
     return {
-        "repo_name": payload.repo_name,
-        "token_budget": payload.token_budget,
-        "estimated_tokens_used": estimated_tokens,
-        "documentation_tokens_used": max(0, used_doc_chars // 4),
+        "repo_name": repo_name,
+        "task_id": payload.task_id,
+        "model_profile": profile["name"],
+        "token_budget": budget,
+        "estimated_tokens_used": total_tokens,
+        "documentation_tokens_used": used_docs,
         "include_docs": payload.include_docs,
-        "allowed_files_contract": payload.allowed_files or "READ_ONLY_UNRESTRICTED",
+        "manifest": manifest,
+        "allowed_files_contract": allowed_files or "READ_ONLY_UNRESTRICTED",
+        "allowed_symbols_contract": allowed_symbols or "READ_ONLY_UNRESTRICTED",
         "repo_quick_map": repo_overview,
         "surgical_ast_chunks": selected_snippets,
         "relevant_doc_chunks": relevant_doc_chunks,
+        "task_contract": task,
+        "handoff": handoff if payload.include_handoff else None,
     }
 
 
@@ -1168,6 +1298,7 @@ class PlanProposeRequest(BaseModel):
     plan_a_override: Optional[Dict[str, Any]] = None
     plan_b_override: Optional[Dict[str, Any]] = None
     project_id: Optional[str] = None
+    model_profile: Optional[str] = Field(default="local-32k", max_length=80)
 
 
 class TaskFailRequest(BaseModel):
@@ -1180,6 +1311,19 @@ class TaskSubmitRequest(BaseModel):
     file_changes: Optional[Dict[str, str]] = None
     unified_diff: Optional[str] = None
     commit_message: str = Field(default="", max_length=500)
+    summary: Optional[str] = Field(default=None, max_length=4000)
+    tests: List[str] = Field(default_factory=list)
+
+
+class TaskCheckpointRequest(BaseModel):
+    summary: str = Field(..., min_length=1, max_length=4000)
+    decisions: List[str] = Field(default_factory=list)
+    files: List[str] = Field(default_factory=list)
+    tests: List[str] = Field(default_factory=list)
+    next_steps: List[str] = Field(default_factory=list)
+    details: Optional[Dict[str, Any]] = None
+    reset_context: bool = True
+    token_estimate: int = Field(default=0, ge=0)
 
 
 @app.post("/api/v1/plans/propose", dependencies=[Depends(require_admin)])
@@ -1206,6 +1350,7 @@ async def propose_dual_plan(payload: PlanProposeRequest):
                 plan_a_override=payload.plan_a_override,
                 plan_b_override=payload.plan_b_override,
                 project_id=project_id,
+                model_profile=payload.model_profile or "local-32k",
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -1296,8 +1441,12 @@ def list_tasks(
         rows = conn.execute(
             sa.text(f"""
                 SELECT id::text, plan_id::text, assigned_session_id::text, title,
-                       required_skills, git_branch, allowed_files, allow_dependency_changes,
-                       failed_attempts_memory, status, created_at
+                       required_skills, git_branch, allowed_files, allowed_symbols,
+                       allow_dependency_changes, description, task_context,
+                       acceptance_criteria, test_commands, depends_on,
+                       estimated_input_tokens, max_input_tokens, handoff_summary,
+                       context_manifest, memory_epoch, task_kind, budget_status,
+                       failed_attempts_memory, status, created_at, updated_at
                 FROM harness_tasks{where}
                 ORDER BY created_at ASC
             """),
@@ -1310,6 +1459,136 @@ def list_tasks(
             tasks.append(item)
 
     return {"tasks": tasks}
+
+
+@app.get("/api/v1/plans/{plan_id}")
+def get_plan_detail(plan_id: str, auth: Dict[str, Any] = Depends(verify_auth)):
+    assert_plan_project_access(auth, plan_id)
+    with engine.connect() as conn:
+        plan = conn.execute(
+            sa.text("""
+                SELECT id::text, requested_by, requirement_prompt, plan_a_json, plan_b_json,
+                       arbiter_justification, master_plan_c_json, status, project_id::text,
+                       model_profile, plan_budget_tokens, plan_metrics, created_at
+                FROM feature_consensus_plans
+                WHERE id = CAST(:pid AS UUID)
+            """),
+            {"pid": plan_id},
+        ).mappings().first()
+        if not plan:
+            raise HTTPException(status_code=404, detail="plan not found")
+        tasks = conn.execute(
+            sa.text("""
+                SELECT id::text, plan_id::text, assigned_session_id::text, title, required_skills,
+                       git_branch, allowed_files, allowed_symbols, allow_dependency_changes,
+                       description, task_context, acceptance_criteria, test_commands, depends_on,
+                       estimated_input_tokens, max_input_tokens, handoff_summary, context_manifest,
+                       memory_epoch, task_kind, budget_status, failed_attempts_memory, status,
+                       created_at, updated_at
+                FROM harness_tasks
+                WHERE plan_id = CAST(:pid AS UUID)
+                ORDER BY created_at ASC, title ASC
+            """),
+            {"pid": plan_id},
+        ).mappings().all()
+        memory = task_memory.list_plan_memory(conn, plan_id, limit=20)
+    return {"plan": dict(plan), "tasks": [dict(t) for t in tasks], "memory": memory}
+
+
+@app.get("/api/v1/tasks/{task_id}/contract")
+def get_task_contract(task_id: str, auth: Dict[str, Any] = Depends(verify_auth)):
+    assert_task_project_access(auth, task_id)
+    with engine.connect() as conn:
+        try:
+            return task_memory.task_contract(conn, task_id, include_memory=True)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="task not found")
+
+
+@app.get("/api/v1/tasks/{task_id}/memory")
+def get_task_memory(
+    task_id: str,
+    limit: int = Query(default=50, ge=1, le=200),
+    auth: Dict[str, Any] = Depends(verify_auth),
+):
+    assert_task_project_access(auth, task_id)
+    with engine.connect() as conn:
+        try:
+            return {
+                "task_id": task_id,
+                "memory": task_memory.list_memory(conn, task_id, limit=limit),
+                "handoff": task_memory.latest_handoff(conn, task_id),
+            }
+        except Exception as exc:
+            print(f"[memory] {exc}")
+            raise HTTPException(status_code=404, detail="task not found")
+
+
+@app.post("/api/v1/tasks/{task_id}/checkpoint")
+async def checkpoint_task(
+    task_id: str,
+    payload: TaskCheckpointRequest,
+    auth: Dict[str, Any] = Depends(verify_auth),
+):
+    assert_task_project_access(auth, task_id)
+    session_id = auth.get("session_id") if auth["role"] == "agent" else None
+    try:
+        result = await asyncio.to_thread(
+            task_memory.checkpoint_task,
+            engine, task_id, session_id, payload.summary,
+            payload.decisions, payload.files, payload.tests, payload.next_steps,
+            payload.details, auth.get("email") or "agent", payload.reset_context,
+            payload.token_estimate,
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="task not found")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    await emit_war("TASK_CHECKPOINT", {
+        "task_id": task_id,
+        "memory_epoch": result["memory_epoch"],
+        "summary": payload.summary,
+    }, source_session_id=session_id)
+    return result
+
+
+@app.post("/api/v1/tasks/{task_id}/resume")
+async def resume_task(
+    task_id: str,
+    auth: Dict[str, Any] = Depends(verify_auth),
+):
+    assert_task_project_access(auth, task_id)
+    session_id = auth.get("session_id") if auth["role"] == "agent" else None
+    try:
+        result = await asyncio.to_thread(task_memory.resume_task, engine, task_id, session_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="task not found")
+    await emit_war("TASK_RESUMED", {
+        "task_id": task_id,
+        "has_handoff": bool(result.get("handoff")),
+        "memory_entries": len(result.get("memory") or []),
+    }, source_session_id=session_id)
+    return result
+
+
+@app.get("/api/v1/model-profiles")
+def list_model_profiles(auth: Dict[str, Any] = Depends(verify_auth)):
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.text("""
+                SELECT name, display_name, provider, model_id, context_window_tokens,
+                       max_input_tokens, max_output_tokens, reserved_tokens,
+                       chars_per_token, supports_tools, is_default
+                FROM harness_model_profiles
+                ORDER BY context_window_tokens ASC
+            """)
+        ).mappings().all()
+    profiles = []
+    for row in rows:
+        item = dict(row)
+        item["chars_per_token"] = float(item.get("chars_per_token") or 3.6)
+        profiles.append(item)
+    return {"profiles": profiles}
 
 
 @app.post("/api/v1/tasks/{task_id}/fail-checkpoint")
@@ -1427,6 +1706,25 @@ async def submit_task_endpoint(
                 await ws.send_json({"event": "CLEAR_LLM_CONTEXT", "task_id": task_id})
             except Exception:
                 pass
+
+    try:
+        handoff_summary = payload.summary or (
+            f"Tarea completada en commit {str(result.get('task_commit') or '')[:8]}. "
+            f"Archivos: {', '.join(result.get('changed_files') or []) or 'sin cambios'}."
+        )
+        task_memory.persist_success_memory(
+            engine, task_id, session_id, handoff_summary,
+            files=result.get("changed_files") or [],
+            tests=payload.tests,
+            details={
+                "task_commit": result.get("task_commit"),
+                "main_commit": result.get("main_commit"),
+                "author": result.get("author"),
+            },
+            created_by=auth.get("email") or "agent",
+        )
+    except Exception as exc:
+        print(f"[memory] no se pudo persistir handoff: {exc}")
 
     await emit_war(
         "TASK_MERGED",
@@ -2248,6 +2546,7 @@ class PortalSessionRequest(BaseModel):
     agent_tool: str = Field(..., pattern="^(opencode|claudecode|cursor|hermes|pi|custom)$")
     llm_provider: str = Field(..., min_length=2, max_length=100)
     max_context_tokens: int = Field(default=32000, gt=1024)
+    model_profile: Optional[str] = Field(default=None, max_length=80)
 
 
 class ProjectCreateRequest(BaseModel):
@@ -3186,6 +3485,12 @@ async def remove_project_member(project_id: str, user_id: str, auth: Dict[str, A
 async def create_portal_session(payload: PortalSessionRequest, auth: Dict[str, Any] = Depends(verify_portal)):
     assert_license_operational()
     uid = auth["user_id"]
+    try:
+        with engine.connect() as conn:
+            profile = resolve_profile(conn, payload.model_profile, payload.max_context_tokens)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    max_tokens = int(profile["context_window_tokens"]) if payload.model_profile else int(payload.max_context_tokens)
     with engine.connect() as conn:
         membership = conn.execute(
             sa.text("""
@@ -3253,11 +3558,11 @@ async def create_portal_session(payload: PortalSessionRequest, auth: Dict[str, A
                 INSERT INTO agent_sessions (
                     id, engineer_username, agent_tool, llm_provider, session_key_hash,
                     skills, status, max_context_tokens, current_context_tokens,
-                    user_id, project_id, session_key_vault, session_kind
+                    user_id, project_id, session_key_vault, session_kind, model_profile
                 ) VALUES (
                     CAST(:id AS UUID), :user, :tool, :provider, :khash,
                     CAST(:skills AS JSONB), 'ONLINE', :max_tok, 0,
-                    CAST(:uid AS UUID), CAST(:pid AS UUID), :vault, 'INTERACTIVE'
+                    CAST(:uid AS UUID), CAST(:pid AS UUID), :vault, 'INTERACTIVE', :model_profile
                 )
             """),
             {
@@ -3267,10 +3572,11 @@ async def create_portal_session(payload: PortalSessionRequest, auth: Dict[str, A
                 "provider": payload.llm_provider,
                 "khash": key_hash,
                 "skills": json.dumps(skills),
-                "max_tok": payload.max_context_tokens,
+                "max_tok": max_tokens,
                 "uid": uid,
                 "pid": payload.project_id,
                 "vault": vault,
+                "model_profile": profile["name"],
             }
         )
 
@@ -3303,7 +3609,8 @@ async def create_portal_session(payload: PortalSessionRequest, auth: Dict[str, A
         "project_slug": membership["project_slug"],
         "agent_tool": payload.agent_tool,
         "skills": skills,
-        "max_context_tokens": payload.max_context_tokens,
+        "max_context_tokens": max_tokens,
+        "model_profile": profile["name"],
         "replaced_session_ids": old_sessions,
         "ws_url": f"/ws/agent/{session_id}",
     }

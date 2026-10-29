@@ -114,7 +114,7 @@ async def main():
 
         print("\n--- 1. Migracion y cuenta sellada ---")
         version = db_rows("SELECT version_num FROM alembic_version")[0]["version_num"]
-        assert version == "0015", version
+        assert int(version) >= 15, version
         operator = operator_row()
         print("operator:", operator["email"], operator["role"], "mfa:", operator["mfa_enabled"])
         assert operator["role"] == "LICENSE_ADMIN"

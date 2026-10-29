@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Set, Optional
 
 import sqlalchemy as sa
+from src.task_memory import record_memory
 
 from src.indexer import REPOS_BASE_DIR, index_repository
 from src.repo_lock import repo_lock
@@ -214,11 +215,22 @@ def _record_failure(
             sa.text("""
                 UPDATE harness_tasks
                 SET failed_attempts_memory = failed_attempts_memory || CAST(:entry AS JSONB),
-                    status = :status
+                    status = :status,
+                    updated_at = NOW()
                 WHERE id = CAST(:tid AS UUID)
             """),
             {"entry": json.dumps(entry), "status": status, "tid": task_id}
         )
+        try:
+            record_memory(
+                conn, task_id, "FAILURE", message,
+                details={"barrier": barrier, "git_diff_summary": entry.get("git_diff_summary")},
+                files=files or [],
+                session_id=session_id,
+                created_by="git-guardian",
+            )
+        except Exception as exc:
+            print(f"[memory] no se pudo registrar fallo git: {exc}")
 
 
 def _release_agent(engine: sa.Engine, session_id: Optional[str]) -> None:

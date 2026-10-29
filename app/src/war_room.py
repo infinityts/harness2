@@ -40,7 +40,8 @@ def get_topology(engine: sa.Engine) -> Dict[str, Any]:
                    s.skills, s.status, s.current_context_tokens, s.max_context_tokens,
                    s.system_contract_rules, s.last_heartbeat, s.connected_at,
                    s.project_id::text AS project_id, p.project_slug,
-                   s.is_headless_worker, s.session_kind, s.worker_role
+                   s.is_headless_worker, s.session_kind, s.worker_role, s.model_profile,
+                   s.context_compactions, s.last_compacted_at
             FROM agent_sessions s
             LEFT JOIN harness_projects p ON p.id = s.project_id
             ORDER BY s.connected_at DESC
@@ -56,7 +57,11 @@ def get_topology(engine: sa.Engine) -> Dict[str, Any]:
 
         tasks = conn.execute(sa.text("""
             SELECT t.id::text, t.plan_id::text, t.title, t.status, t.assigned_session_id::text,
-                   t.git_branch, t.allowed_files, t.required_skills, t.created_at,
+                   t.git_branch, t.allowed_files, t.allowed_symbols, t.required_skills,
+                   t.description, t.task_context, t.acceptance_criteria, t.test_commands,
+                   t.depends_on, t.estimated_input_tokens, t.max_input_tokens,
+                   t.handoff_summary, t.memory_epoch, t.task_kind, t.budget_status,
+                   t.created_at,
                    p.project_id::text AS project_id, pr.project_slug
             FROM harness_tasks t
             LEFT JOIN feature_consensus_plans p ON p.id = t.plan_id

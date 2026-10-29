@@ -16,6 +16,10 @@
 
 - [Etapa 9 — RAG documental nativo](STAGE9-DOC-RAG.md)
 
+## Ejecución, contexto y memoria
+
+- [Etapa 14 — Task Contract v2 y Memory Kernel](STAGE14-TASK-CONTRACT-MEMORY.md)
+
 ## Licenciamiento y pool Hermes
 
 - [Operación consolidada de licenciamiento](LICENSING-OPERATIONS.md)
