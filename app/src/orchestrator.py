@@ -7,6 +7,7 @@ import sqlalchemy as sa
 from src.indexer import compute_embedding_768
 from src.token_budget import estimate_tokens, get_profile
 from src.task_memory import record_memory
+from src.tokenizer_registry import count_for_profile
 
 
 class ContractViolation(Exception):
@@ -112,17 +113,23 @@ def _estimate_task_tokens(
     requirement_prompt: str,
 ) -> int:
     chars_per_token = float(profile.get("chars_per_token") or 3.6)
+
+    def _count(text: str) -> int:
+        if profile.get("tokenizer_url") or profile.get("tokenizer_path") or profile.get("tokenizer_status") == "CALIBRATED":
+            return count_for_profile(profile, text)
+        return estimate_tokens(text, chars_per_token)
+
     contract_text = json.dumps({
         "requirement_prompt": requirement_prompt,
         "task": task,
     }, ensure_ascii=False)
-    base = estimate_tokens(contract_text, chars_per_token) + 1200
+    base = _count(contract_text) + 1200
     base += _skill_tokens(conn, task.get("required_skills") or [])
     allowed_symbols = set(task.get("allowed_symbols") or [])
     for row in candidates:
         symbol = f"{_normalize_path(row['file_path'])}::{row['symbol_name']}"
         if symbol in allowed_symbols:
-            base += estimate_tokens(row.get("code_snippet") or "", chars_per_token)
+            base += _count(row.get("code_snippet") or "")
     # Reserva para documentacion RAG y salida de herramientas dentro de la tarea.
     base += 1500
     return max(1, int(base))
@@ -577,12 +584,15 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
                    t.description, t.task_context, t.acceptance_criteria, t.test_commands,
                    t.depends_on, t.estimated_input_tokens, t.max_input_tokens,
                    t.handoff_summary, t.context_manifest, t.memory_epoch, t.task_kind,
-                   t.budget_status,
+                   t.budget_status, t.parent_task_id::text, t.split_index,
+                   t.split_count, t.split_reason, t.split_status,
                    p.master_plan_c_json->>'repo_name' AS repo_name,
                    p.project_id::text AS project_id, p.requirement_prompt
             FROM harness_tasks t
             JOIN feature_consensus_plans p ON p.id = t.plan_id
             WHERE t.status = 'PENDING'
+              AND t.budget_status NOT IN ('NEEDS_SPLIT', 'SPLIT')
+              AND t.split_status <> 'PARENT'
             ORDER BY t.created_at ASC
             FOR UPDATE OF t SKIP LOCKED
         """)
@@ -704,6 +714,11 @@ def dispatch_pending_tasks(conn, heartbeat_timeout: int, max_context_ratio: floa
             "memory_epoch": task.get("memory_epoch") or 0,
             "task_kind": task.get("task_kind") or "IMPLEMENT",
             "budget_status": task.get("budget_status") or "OK",
+            "parent_task_id": task.get("parent_task_id"),
+            "split_index": task.get("split_index") or 0,
+            "split_count": task.get("split_count") or 0,
+            "split_reason": task.get("split_reason"),
+            "split_status": task.get("split_status") or "NONE",
             "requirement_prompt": task.get("requirement_prompt"),
             "repo_name": repo_name,
             "assigned_to": {

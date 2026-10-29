@@ -510,6 +510,19 @@ def tool_resume_task(args):
     return data
 
 
+def tool_split_task(args):
+    task_id = (args or {}).get("task_id")
+    if not task_id:
+        raise ValueError("task_id es obligatorio")
+    body = {}
+    if args.get("max_input_tokens"):
+        body["max_input_tokens"] = int(args["max_input_tokens"])
+    status, data = api("POST", f"/api/v1/tasks/{task_id}/split", body)
+    if status != 200:
+        raise RuntimeError(f"split HTTP {status}: {data}")
+    return data
+
+
 def tool_report_context_usage(args):
     tokens = int((args or {}).get("current_context_tokens", 0))
     max_tokens = int((args or {}).get("max_context_tokens", 0) or 0)
@@ -598,6 +611,7 @@ TOOL_FUNCS = {
     "harness_get_task_contract": tool_get_task_contract,
     "harness_checkpoint_task": tool_checkpoint_task,
     "harness_resume_task": tool_resume_task,
+    "harness_split_task": tool_split_task,
     "harness_report_context_usage": tool_report_context_usage,
     "harness_request_context_pack": tool_request_context_pack,
     "harness_validate_symbols": tool_validate_symbols,
@@ -767,6 +781,18 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {"task_id": {"type": "string"}},
+            "required": ["task_id"],
+        },
+    },
+    {
+        "name": "harness_split_task",
+        "description": "Divide una tarea PENDING por simbolos y presupuesto en slices autocontenidos.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string"},
+                "max_input_tokens": {"type": "integer", "minimum": 300},
+            },
             "required": ["task_id"],
         },
     },

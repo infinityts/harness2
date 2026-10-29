@@ -41,9 +41,10 @@ def get_topology(engine: sa.Engine) -> Dict[str, Any]:
                    s.system_contract_rules, s.last_heartbeat, s.connected_at,
                    s.project_id::text AS project_id, p.project_slug,
                    s.is_headless_worker, s.session_kind, s.worker_role, s.model_profile,
-                   s.context_compactions, s.last_compacted_at
+                   s.context_compactions, s.last_compacted_at, mp.tokenizer_status
             FROM agent_sessions s
             LEFT JOIN harness_projects p ON p.id = s.project_id
+            LEFT JOIN harness_model_profiles mp ON mp.name = s.model_profile
             ORDER BY s.connected_at DESC
         """)).mappings().all()
 
@@ -61,6 +62,8 @@ def get_topology(engine: sa.Engine) -> Dict[str, Any]:
                    t.description, t.task_context, t.acceptance_criteria, t.test_commands,
                    t.depends_on, t.estimated_input_tokens, t.max_input_tokens,
                    t.handoff_summary, t.memory_epoch, t.task_kind, t.budget_status,
+                   t.parent_task_id::text, t.split_index, t.split_count,
+                   t.split_reason, t.split_status,
                    t.created_at,
                    p.project_id::text AS project_id, pr.project_slug
             FROM harness_tasks t

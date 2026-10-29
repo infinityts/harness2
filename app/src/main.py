@@ -68,6 +68,8 @@ from src.license_activation import ActivationManager
 from src import totp
 from src.token_budget import context_budget, estimate_tokens as estimate_token_budget, fit_text, get_profile, resolve_profile
 from src import task_memory
+from src.task_splitter import TaskSplitError, get_split_tree, split_task
+from src.tokenizer_registry import REGISTRY as TOKENIZER_REGISTRY
 from src.hermes_pool import (
     claim_job,
     complete_job,
@@ -1195,6 +1197,8 @@ def build_surgical_context_pack(payload: ContextPackRequest, auth: Dict[str, Any
         "token_budget": int(budget),
         "reserved_tokens": int(profile["reserved_tokens"]),
         "chars_per_token": chars_per_token,
+        "tokenizer_status": profile.get("tokenizer_status") or "HEURISTIC",
+        "tokenizer_kind": profile.get("tokenizer_kind") or "auto",
         "sections": {
             "contract": contract_tokens,
             "handoff": handoff_tokens,
@@ -1299,6 +1303,7 @@ class PlanProposeRequest(BaseModel):
     plan_b_override: Optional[Dict[str, Any]] = None
     project_id: Optional[str] = None
     model_profile: Optional[str] = Field(default="local-32k", max_length=80)
+    auto_split: bool = False
 
 
 class TaskFailRequest(BaseModel):
@@ -1324,6 +1329,28 @@ class TaskCheckpointRequest(BaseModel):
     details: Optional[Dict[str, Any]] = None
     reset_context: bool = True
     token_estimate: int = Field(default=0, ge=0)
+
+
+class TaskSplitRequest(BaseModel):
+    max_input_tokens: Optional[int] = Field(default=None, ge=300, le=200000)
+
+
+class TokenizerConfigRequest(BaseModel):
+    tokenizer_kind: str = Field(default="auto", max_length=40)
+    tokenizer_url: Optional[str] = Field(default=None, max_length=500)
+    tokenizer_model: Optional[str] = Field(default=None, max_length=150)
+    tokenizer_path: Optional[str] = Field(default=None, max_length=500)
+    tokenizer_timeout_ms: int = Field(default=2000, ge=200, le=60000)
+    chars_per_token: Optional[float] = Field(default=None, ge=1.0, le=10.0)
+
+
+class TokenizerCountRequest(BaseModel):
+    profile: str = Field(..., min_length=1, max_length=80)
+    text: str = Field(..., min_length=1, max_length=200000)
+
+
+class TokenizerCalibrateRequest(BaseModel):
+    sample: Optional[str] = Field(default=None, max_length=20000)
 
 
 @app.post("/api/v1/plans/propose", dependencies=[Depends(require_admin)])
@@ -1354,6 +1381,32 @@ async def propose_dual_plan(payload: PlanProposeRequest):
             )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+    auto_split_results = []
+    if payload.auto_split:
+        for task in result.get("created_tasks") or []:
+            if task.get("budget_status") != "NEEDS_SPLIT":
+                continue
+            try:
+                split_result = await asyncio.to_thread(
+                    split_task, engine, task["task_id"], None, payload.requested_by
+                )
+                auto_split_results.append(split_result)
+            except TaskSplitError as exc:
+                auto_split_results.append({
+                    "task_id": task["task_id"],
+                    "status": "NOT_SPLIT",
+                    "code": exc.code,
+                    "message": exc.message,
+                    "details": exc.details,
+                })
+            except Exception as exc:
+                auto_split_results.append({
+                    "task_id": task["task_id"],
+                    "status": "ERROR",
+                    "message": str(exc),
+                })
+        result["auto_split"] = auto_split_results
 
     await emit_war(
         "PLAN_APPROVED",
@@ -1446,6 +1499,7 @@ def list_tasks(
                        acceptance_criteria, test_commands, depends_on,
                        estimated_input_tokens, max_input_tokens, handoff_summary,
                        context_manifest, memory_epoch, task_kind, budget_status,
+                       parent_task_id::text, split_index, split_count, split_reason, split_status,
                        failed_attempts_memory, status, created_at, updated_at
                 FROM harness_tasks{where}
                 ORDER BY created_at ASC
@@ -1483,8 +1537,9 @@ def get_plan_detail(plan_id: str, auth: Dict[str, Any] = Depends(verify_auth)):
                        git_branch, allowed_files, allowed_symbols, allow_dependency_changes,
                        description, task_context, acceptance_criteria, test_commands, depends_on,
                        estimated_input_tokens, max_input_tokens, handoff_summary, context_manifest,
-                       memory_epoch, task_kind, budget_status, failed_attempts_memory, status,
-                       created_at, updated_at
+                       memory_epoch, task_kind, budget_status, parent_task_id::text,
+                       split_index, split_count, split_reason, split_status,
+                       failed_attempts_memory, status, created_at, updated_at
                 FROM harness_tasks
                 WHERE plan_id = CAST(:pid AS UUID)
                 ORDER BY created_at ASC, title ASC
@@ -1571,6 +1626,38 @@ async def resume_task(
     return result
 
 
+@app.post("/api/v1/tasks/{task_id}/split")
+async def split_task_endpoint(
+    task_id: str,
+    payload: TaskSplitRequest,
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    try:
+        result = await asyncio.to_thread(
+            split_task, engine, task_id, payload.max_input_tokens,
+            auth.get("email") or "admin",
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="task not found")
+    except TaskSplitError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message, **exc.details},
+        )
+    await emit_war("TASK_SPLIT", {
+        "task_id": task_id,
+        "split_count": result["split_count"],
+        "children": [c["task_id"] for c in result["children"]],
+    }, source_session_id=None)
+    return result
+
+
+@app.get("/api/v1/tasks/{task_id}/split-tree")
+def task_split_tree(task_id: str, auth: Dict[str, Any] = Depends(verify_auth)):
+    assert_task_project_access(auth, task_id)
+    return get_split_tree(engine, task_id)
+
+
 @app.get("/api/v1/model-profiles")
 def list_model_profiles(auth: Dict[str, Any] = Depends(verify_auth)):
     with engine.connect() as conn:
@@ -1578,7 +1665,9 @@ def list_model_profiles(auth: Dict[str, Any] = Depends(verify_auth)):
             sa.text("""
                 SELECT name, display_name, provider, model_id, context_window_tokens,
                        max_input_tokens, max_output_tokens, reserved_tokens,
-                       chars_per_token, supports_tools, is_default
+                       chars_per_token, supports_tools, is_default,
+                       tokenizer_kind, tokenizer_url, tokenizer_model, tokenizer_path,
+                       tokenizer_timeout_ms, tokenizer_status, tokenizer_calibration
                 FROM harness_model_profiles
                 ORDER BY context_window_tokens ASC
             """)
@@ -1587,8 +1676,108 @@ def list_model_profiles(auth: Dict[str, Any] = Depends(verify_auth)):
     for row in rows:
         item = dict(row)
         item["chars_per_token"] = float(item.get("chars_per_token") or 3.6)
+        if isinstance(item.get("tokenizer_calibration"), str):
+            try:
+                item["tokenizer_calibration"] = json.loads(item["tokenizer_calibration"])
+            except Exception:
+                item["tokenizer_calibration"] = {}
         profiles.append(item)
     return {"profiles": profiles}
+
+
+@app.get("/api/v1/model-profiles/{name}/tokenizer/health")
+def tokenizer_health(name: str, auth: Dict[str, Any] = Depends(verify_portal_admin)):
+    with engine.connect() as conn:
+        try:
+            profile = get_profile(conn, name)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+    result = TOKENIZER_REGISTRY.health(profile)
+    if result.get("ok") and result.get("status") in ("EXACT", "CALIBRATED"):
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    sa.text("""
+                        UPDATE harness_model_profiles
+                        SET tokenizer_status = :status
+                        WHERE name = :name
+                    """),
+                    {"status": result["status"], "name": name},
+                )
+        except Exception as exc:
+            print(f"[tokenizer] no se pudo persistir health: {exc}")
+    return result
+
+
+@app.post("/api/v1/model-profiles/{name}/tokenizer/calibrate")
+async def tokenizer_calibrate(
+    name: str,
+    payload: TokenizerCalibrateRequest,
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    try:
+        return await asyncio.to_thread(
+            TOKENIZER_REGISTRY.calibrate, engine, name, payload.sample
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="model profile not found")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"tokenizer calibration failed: {exc}")
+
+
+@app.post("/api/v1/model-profiles/{name}/tokenizer/config")
+def tokenizer_config(
+    name: str,
+    payload: TokenizerConfigRequest,
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(
+                sa.text("""
+                    UPDATE harness_model_profiles
+                    SET tokenizer_kind = :kind,
+                        tokenizer_url = :url,
+                        tokenizer_model = :model,
+                        tokenizer_path = :path,
+                        tokenizer_timeout_ms = :timeout_ms,
+                        chars_per_token = COALESCE(:chars_per_token, chars_per_token),
+                        tokenizer_status = 'HEURISTIC',
+                        tokenizer_calibration = CAST('{}' AS JSONB)
+                    WHERE name = :name
+                    RETURNING name, tokenizer_kind, tokenizer_url, tokenizer_model,
+                              tokenizer_path, tokenizer_timeout_ms, tokenizer_status,
+                              chars_per_token
+                """),
+                {
+                    "kind": payload.tokenizer_kind,
+                    "url": payload.tokenizer_url,
+                    "model": payload.tokenizer_model,
+                    "path": payload.tokenizer_path,
+                    "timeout_ms": payload.tokenizer_timeout_ms,
+                    "chars_per_token": payload.chars_per_token,
+                    "name": name,
+                },
+            ).mappings().first()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not row:
+        raise HTTPException(status_code=404, detail="model profile not found")
+    TOKENIZER_REGISTRY.clear(name)
+    return {"profile": dict(row)}
+
+
+@app.post("/api/v1/tokenizer/count")
+def tokenizer_count(
+    payload: TokenizerCountRequest,
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    with engine.connect() as conn:
+        try:
+            profile = get_profile(conn, payload.profile)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+    return TOKENIZER_REGISTRY.count_with_meta(profile, payload.text)
 
 
 @app.post("/api/v1/tasks/{task_id}/fail-checkpoint")

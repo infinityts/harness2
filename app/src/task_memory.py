@@ -139,6 +139,7 @@ def task_contract(conn, task_id: str, include_memory: bool = True) -> Dict[str, 
                    task_context, acceptance_criteria, test_commands, depends_on,
                    estimated_input_tokens, max_input_tokens, handoff_summary,
                    context_manifest, memory_epoch, task_kind, budget_status, status,
+                   parent_task_id::text, split_index, split_count, split_reason, split_status,
                    failed_attempts_memory, created_at, updated_at
             FROM harness_tasks
             WHERE id = CAST(:tid AS UUID)
@@ -157,6 +158,29 @@ def task_contract(conn, task_id: str, include_memory: bool = True) -> Dict[str, 
         ).mappings().first()
         if dep:
             dependencies.append(dict(dep))
+    parent = None
+    parent_id = contract.get("parent_task_id")
+    if parent_id:
+        parent_row = conn.execute(
+            sa.text("""
+                SELECT id::text, title, status, split_status, handoff_summary
+                FROM harness_tasks WHERE id = CAST(:tid AS UUID)
+            """),
+            {"tid": parent_id},
+        ).mappings().first()
+        parent = dict(parent_row) if parent_row else None
+    children = [
+        dict(row) for row in conn.execute(
+            sa.text("""
+                SELECT id::text, title, status, split_index, split_count, budget_status,
+                       estimated_input_tokens, allowed_symbols
+                FROM harness_tasks
+                WHERE parent_task_id = CAST(:tid AS UUID)
+                ORDER BY split_index ASC
+            """),
+            {"tid": task_id},
+        ).mappings().all()
+    ]
     memory = list_memory(conn, task_id, limit=20) if include_memory else []
     handoff = latest_handoff(conn, task_id) if include_memory else None
     return {
@@ -168,6 +192,8 @@ def task_contract(conn, task_id: str, include_memory: bool = True) -> Dict[str, 
             "requirement_prompt": task["requirement_prompt"],
         },
         "dependencies": dependencies,
+        "parent": parent,
+        "children": children,
         "handoff": handoff,
         "memory": memory,
     }

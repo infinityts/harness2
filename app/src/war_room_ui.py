@@ -419,6 +419,7 @@ WAR_ROOM_HTML = r"""<!doctype html>
                 <div class="stack" style="gap:9px">
                   <div class="field"><label for="warPlanProject">Proyecto</label><select id="warPlanProject"></select></div>
                   <div class="field"><label for="warPlanProfile">Perfil de modelo</label><select id="warPlanProfile"><option value="local-32k">Local 32k</option><option value="local-64k">Local 64k</option><option value="local-120k" selected>Local 120k</option><option value="cloud-128k">Cloud 128k</option></select></div>
+                  <label class="row" style="font-size:12px;gap:8px"><input id="warAutoSplit" type="checkbox" checked> Auto-split por símbolos si excede presupuesto</label>
                   <div class="field"><label for="warPrompt">Requerimiento</label><textarea id="warPrompt" rows="3" placeholder="Implementar mejora y validar contratos"></textarea></div>
                   <div class="row"><button id="proposeBtn" class="btn sm" type="button">Proponer Plan A/B/C</button><button id="dispatchBtn" class="btn sm primary" type="button">Dispatch</button></div>
                   <div id="planResult" class="result-box hidden"></div>
@@ -1386,7 +1387,7 @@ function renderWarTasks(t) {
     <div class="top"><b>${esc(task.title)}</b><span class="pill ${task.status === "CONFLICT" ? "bad" : task.status === "IN_PROGRESS" ? "warn" : "info"}">${esc(task.status)}</span></div>
     <div class="meta"><span class="mono">${esc(task.project_slug || "")}</span><span>${esc(task.git_branch || "sin branch")}</span><span>${esc((task.required_skills || []).join(", ") || "sin skills")}</span></div>
     <div class="meta"><span>Asignada: ${esc(task.assigned_session_id ? task.assigned_session_id.slice(0, 8) : "—")}</span><span>Files: ${esc((task.allowed_files || []).join(", ") || "—")}</span></div>
-    <div class="meta"><span>Contrato: ${esc(task.task_kind || "IMPLEMENT")}</span><span>Budget: ${esc(task.estimated_input_tokens || 0)} / ${esc(task.max_input_tokens || 0)} tokens</span><span class="pill ${task.budget_status === "NEEDS_SPLIT" ? "bad" : "ok"}">${esc(task.budget_status || "OK")}</span><span>Memoria: epoch ${esc(task.memory_epoch || 0)}</span></div>
+    <div class="meta"><span>Contrato: ${esc(task.task_kind || "IMPLEMENT")}</span><span>Budget: ${esc(task.estimated_input_tokens || 0)} / ${esc(task.max_input_tokens || 0)} tokens</span><span class="pill ${task.budget_status === "NEEDS_SPLIT" || task.budget_status === "SPLIT" ? "bad" : "ok"}">${esc(task.budget_status || "OK")}</span><span>Memoria: epoch ${esc(task.memory_epoch || 0)}</span>${task.split_status && task.split_status !== "NONE" ? `<span class="pill info">${esc(task.split_status)} ${esc(task.split_index || 0)}/${esc(task.split_count || 0)}</span>` : ""}</div>
     ${task.description ? `<div class="muted" style="font-size:12px">${esc(task.description)}</div>` : ""}
     ${(task.acceptance_criteria || []).length ? `<div class="muted" style="font-size:11px">Aceptación: ${task.acceptance_criteria.map(a => esc(a)).join(" · ")}</div>` : ""}
     ${task.handoff_summary ? `<div class="muted" style="font-size:11px">Handoff: ${esc(task.handoff_summary)}</div>` : ""}
@@ -1410,7 +1411,7 @@ function renderWarInspector() {
   box.innerHTML = `<div class="stack" style="gap:8px">
     <div class="row"><b style="flex:1">${esc(node.engineer_username)}</b>${node.is_headless_worker ? '<span class="pill info">HEADLESS DOC</span>' : ""}${sessionPill(node.status)}</div>
     <div class="muted mono" style="font-size:11px">${esc(node.session_id)}</div>
-    <div class="row"><span class="pill">${esc(TOOL_LABELS[node.agent_tool] || node.agent_tool)}</span><span class="pill">${esc(node.llm_provider || "—")}</span><span class="pill info">${esc(node.project_slug || "sin proyecto")}</span><span class="pill">${esc(node.model_profile || "local-32k")}</span></div>
+    <div class="row"><span class="pill">${esc(TOOL_LABELS[node.agent_tool] || node.agent_tool)}</span><span class="pill">${esc(node.llm_provider || "—")}</span><span class="pill info">${esc(node.project_slug || "sin proyecto")}</span><span class="pill">${esc(node.model_profile || "local-32k")}</span><span class="pill ${node.tokenizer_status === "EXACT" ? "ok" : node.tokenizer_status === "CALIBRATED" ? "warn" : ""}">${esc(node.tokenizer_status || "HEURISTIC")}</span></div>
     <div style="font-size:12px">Contexto: <b>${esc(node.current_context_tokens)}</b> / ${esc(node.max_context_tokens)} tokens · compactaciones: ${esc(node.context_compactions || 0)}</div>
     <div style="font-size:12px">Skills: ${(node.skills || []).map(s => `<span class="pill">${esc(s)}</span>`).join(" ") || '<span class="muted">—</span>'}</div>
     <div style="font-size:12px">Reglas: ${(node.system_contract_rules || []).map(s => `<span class="pill warn">${esc(s)}</span>`).join(" ") || '<span class="muted">—</span>'}</div>
@@ -1541,12 +1542,16 @@ async function proposePlan() {
       requirement_prompt: prompt,
       required_skills_hint: [],
       model_profile: $("warPlanProfile") ? $("warPlanProfile").value : "local-120k",
+      auto_split: $("warAutoSplit") ? $("warAutoSplit").checked : false,
     })});
     const tasks = data.created_tasks || [];
+    const splitInfo = (data.auto_split || []).map(s => s.status === "SPLIT"
+      ? `  split ${s.parent_task_id.slice(0, 8)} -> ${s.split_count} slices`
+      : `  split ${s.task_id?.slice(0, 8) || "?"}: ${s.code || s.status}`).join("\n");
     box.textContent = `Plan ${data.plan_id} · perfil ${data.master_plan_c?.model_profile || "local-32k"}\nTareas creadas: ${tasks.length}\n` + tasks.map(t =>
       `- ${t.title}\n  kind=${t.task_kind || "IMPLEMENT"} budget=${t.estimated_input_tokens || 0}/${t.max_input_tokens || 0} ${t.budget_status || "OK"}\n  aceptación: ${(t.acceptance_criteria || []).join(" | ")}`
-    ).join("\n");
-    logConsole("PLAN_PROPOSED", { plan_id:data.plan_id, tasks:data.created_tasks });
+    ).join("\n") + (splitInfo ? `\nAuto-split:\n${splitInfo}` : "");
+    logConsole("PLAN_PROPOSED", { plan_id:data.plan_id, tasks:data.created_tasks, auto_split:data.auto_split });
     await refreshTopology();
   } catch (err) {
     box.textContent = "Error: " + err.message;

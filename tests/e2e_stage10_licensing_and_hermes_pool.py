@@ -574,11 +574,12 @@ async def main():
         proc, names = mcp_session(session_a["session_id"], session_a["session_key"])
         try:
             print("tools:", sorted(names))
-            assert len(names) == 14
+            assert len(names) == 15
             assert {
                 "harness_rag_ingest", "harness_rag_search", "harness_rag_list",
                 "harness_get_task_contract", "harness_checkpoint_task",
                 "harness_resume_task", "harness_report_context_usage",
+                "harness_split_task",
             }.issubset(names)
             listed, err = mcp_call(proc, 3, "harness_rag_list", {})
             assert not err and any(d["source_uri"] == source for d in listed["documents"])

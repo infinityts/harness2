@@ -5,6 +5,7 @@ externo y aplica un margen de seguridad sobre caracteres. Para modelos locales
 con tokenizers propios, `chars_per_token` se puede ajustar en
 `harness_model_profiles`.
 """
+import json
 import math
 from typing import Any, Dict, Optional
 
@@ -49,6 +50,15 @@ def fit_text(
 def _profile_dict(row) -> Dict[str, Any]:
     item = dict(row)
     item["chars_per_token"] = float(item.get("chars_per_token") or DEFAULT_CHARS_PER_TOKEN)
+    calibration = item.get("tokenizer_calibration")
+    if isinstance(calibration, str):
+        try:
+            calibration = json.loads(calibration)
+        except Exception:
+            calibration = {}
+    if isinstance(calibration, dict) and calibration.get("chars_per_token"):
+        item["chars_per_token"] = float(calibration["chars_per_token"])
+    item["tokenizer_calibration"] = calibration or {}
     return item
 
 
@@ -58,7 +68,9 @@ def get_profile(conn, name: Optional[str] = None) -> Dict[str, Any]:
         sa.text("""
             SELECT name, display_name, provider, model_id, context_window_tokens,
                    max_input_tokens, max_output_tokens, reserved_tokens,
-                   chars_per_token, supports_tools, is_default
+                   chars_per_token, supports_tools, is_default,
+                   tokenizer_kind, tokenizer_url, tokenizer_model, tokenizer_path,
+                   tokenizer_timeout_ms, tokenizer_status, tokenizer_calibration
             FROM harness_model_profiles
             WHERE name = :name
         """),
@@ -74,7 +86,9 @@ def get_default_profile(conn) -> Dict[str, Any]:
         sa.text("""
             SELECT name, display_name, provider, model_id, context_window_tokens,
                    max_input_tokens, max_output_tokens, reserved_tokens,
-                   chars_per_token, supports_tools, is_default
+                   chars_per_token, supports_tools, is_default,
+                   tokenizer_kind, tokenizer_url, tokenizer_model, tokenizer_path,
+                   tokenizer_timeout_ms, tokenizer_status, tokenizer_calibration
             FROM harness_model_profiles
             WHERE is_default = true
             ORDER BY name
