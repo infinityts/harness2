@@ -418,7 +418,7 @@ WAR_ROOM_HTML = r"""<!doctype html>
                 <h3>Dual Plan + Dispatch</h3>
                 <div class="stack" style="gap:9px">
                   <div class="field"><label for="warPlanProject">Proyecto</label><select id="warPlanProject"></select></div>
-                  <div class="field"><label for="warPlanProfile">Perfil de modelo</label><select id="warPlanProfile"><option value="local-32k">Local 32k</option><option value="local-64k">Local 64k</option><option value="local-120k" selected>Local 120k</option><option value="cloud-128k">Cloud 128k</option></select></div>
+                  <div class="field"><label for="warPlanProfile">Perfil de modelo</label><select id="warPlanProfile"><option value="local-32k">Local 32k</option><option value="local-64k">Local 64k</option><option value="local-120k" selected>Local 120k</option><option value="cloud-128k">Cloud 128k</option><option value="minimax-m3.1-flash">MiniMax M3.1 Flash</option></select></div>
                   <label class="row" style="font-size:12px;gap:8px"><input id="warAutoSplit" type="checkbox" checked> Auto-split por símbolos si excede presupuesto</label>
                   <div class="field"><label for="warPrompt">Requerimiento</label><textarea id="warPrompt" rows="3" placeholder="Implementar mejora y validar contratos"></textarea></div>
                   <div class="row"><button id="proposeBtn" class="btn sm" type="button">Proponer Plan A/B/C</button><button id="dispatchBtn" class="btn sm primary" type="button">Dispatch</button></div>
@@ -601,7 +601,7 @@ WAR_ROOM_HTML = r"""<!doctype html>
 const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const STATUS_COLORS = { ONLINE:"#34d399", BUSY:"#fbbf24", OFFLINE:"#8fa3c4", REVOKED:"#f87171" };
-const TOOL_LABELS = { opencode:"OpenCode", claudecode:"Claude Code", cursor:"Cursor", hermes:"Hermes", pi:"Pi", custom:"Custom", "headless-worker":"Docs Curator" };
+const TOOL_LABELS = { opencode:"OpenCode", claudecode:"Claude Code", cursor:"Cursor", hermes:"Hermes", pi:"Pi", minimaxcode:"MiniMax Code", custom:"Custom", "headless-worker":"Docs Curator" };
 const SKILL_CATEGORY_LABELS = { backend:"Backend / APIs", frontend:"Frontend / UI", database:"Base de datos", documents:"Documentos", writing:"Redacción", qa:"QA / Testing", devops:"DevOps", security:"Seguridad", general:"General" };
 const state = {
   token: null, adminKey: null, user: null, role: null,
@@ -1139,8 +1139,8 @@ function renderMyProjects() {
       <div class="stack" style="gap:8px;margin-top:6px">
         <div class="grid-2">
           <div class="field"><label>Herramienta</label><select class="session-tool">${Object.entries(TOOL_LABELS).filter(([k]) => k !== "custom").map(([k,v]) => `<option value="${k}">${v}</option>`).join("")}</select></div>
-          <div class="field"><label>Proveedor LLM</label><select class="session-provider"><option value="cloud-llm">Cloud (preferido)</option><option value="local-llm">IA Local</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="custom">Custom</option></select></div>
-          <div class="field"><label>Perfil de modelo</label><select class="session-profile"><option value="">Auto por max_context</option><option value="local-32k">Local 32k</option><option value="local-64k">Local 64k</option><option value="local-120k">Local 120k</option><option value="cloud-128k">Cloud 128k</option></select></div>
+          <div class="field"><label>Proveedor LLM</label><select class="session-provider"><option value="cloud-llm">Cloud (preferido)</option><option value="local-llm">IA Local</option><option value="minimax">MiniMax</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="custom">Custom</option></select></div>
+          <div class="field"><label>Perfil de modelo</label><select class="session-profile"><option value="">Auto por max_context</option><option value="local-32k">Local 32k</option><option value="local-64k">Local 64k</option><option value="local-120k">Local 120k</option><option value="cloud-128k">Cloud 128k</option><option value="minimax-m3.1-flash">MiniMax M3.1 Flash</option></select></div>
           <div class="field"><label>max_context_tokens</label><input class="session-max" type="number" min="1024" value="32000"></div>
         </div>
         <button class="btn primary start-session-btn" data-project="${esc(p.id)}" type="button">Iniciar / Configurar Mi Sesión en este Proyecto</button>
@@ -1220,6 +1220,8 @@ function renderConfig(sessionId, bundle, slotEl) {
     <div class="stack" style="gap:10px">
       <div><div class="row" style="justify-content:space-between"><label class="muted" style="font-size:12px">Cursor MCP JSON</label>${copyButton("cfg-cursor-" + sessionId, "Copiar JSON para Cursor")}</div><textarea id="cfg-cursor-${esc(sessionId)}" readonly>${esc(bundle.cursor_mcp_json)}</textarea></div>
       <div><div class="row" style="justify-content:space-between"><label class="muted" style="font-size:12px">Claude Code MCP JSON</label>${copyButton("cfg-claude-" + sessionId, "Copiar JSON para Claude")}</div><textarea id="cfg-claude-${esc(sessionId)}" readonly>${esc(bundle.claudecode_mcp_json)}</textarea></div>
+      <div><div class="row" style="justify-content:space-between"><label class="muted" style="font-size:12px">MiniMax Code MCP JSON (.mcp.json)</label>${copyButton("cfg-minimax-" + sessionId, "Copiar JSON para MiniMax Code")}</div><textarea id="cfg-minimax-${esc(sessionId)}" readonly>${esc(bundle.minimaxcode_mcp_json || "")}</textarea></div>
+      <div><div class="row" style="justify-content:space-between"><label class="muted" style="font-size:12px">MiniMax Code setup</label>${copyButton("cfg-minimax-setup-" + sessionId, "Copiar setup MiniMax")}</div><textarea id="cfg-minimax-setup-${esc(sessionId)}" readonly>${esc(bundle.minimaxcode_setup || "")}</textarea></div>
       <div><div class="row" style="justify-content:space-between"><label class="muted" style="font-size:12px">OpenCode Config</label>${copyButton("cfg-opencode-" + sessionId, "Copiar Config OpenCode")}</div><textarea id="cfg-opencode-${esc(sessionId)}" readonly>${esc(bundle.opencode_json)}</textarea></div>
       <div><div class="row" style="justify-content:space-between"><label class="muted" style="font-size:12px">Hermes CLI env</label>${copyButton("cfg-hermes-" + sessionId, "Copiar Comando CLI Hermes")}</div><textarea id="cfg-hermes-${esc(sessionId)}" readonly>${esc(bundle.hermes_cli_env)}</textarea></div>
       <div><div class="row" style="justify-content:space-between"><label class="muted" style="font-size:12px">Descargar bridge</label>${copyButton("cfg-curl-" + sessionId, "Copiar curl")}</div><textarea id="cfg-curl-${esc(sessionId)}" readonly>${esc(bundle.bridge_download_command)}</textarea></div>

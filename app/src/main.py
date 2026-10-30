@@ -152,7 +152,7 @@ active_connections: Dict[str, WebSocket] = {}
 
 class SessionRegisterRequest(BaseModel):
     engineer_username: str = Field(..., min_length=2, max_length=100)
-    agent_tool: str = Field(..., pattern="^(opencode|claudecode|cursor|hermes|pi|custom)$")
+    agent_tool: str = Field(..., pattern="^(opencode|claudecode|cursor|hermes|pi|minimaxcode|custom)$")
     llm_provider: str = Field(..., min_length=2, max_length=100)
     skills: List[str] = Field(default_factory=list)
     max_context_tokens: int = Field(default=32000, gt=1024)
@@ -2732,7 +2732,7 @@ class PortalRegisterRequest(BaseModel):
 
 class PortalSessionRequest(BaseModel):
     project_id: str
-    agent_tool: str = Field(..., pattern="^(opencode|claudecode|cursor|hermes|pi|custom)$")
+    agent_tool: str = Field(..., pattern="^(opencode|claudecode|cursor|hermes|pi|minimaxcode|custom)$")
     llm_provider: str = Field(..., min_length=2, max_length=100)
     max_context_tokens: int = Field(default=32000, gt=1024)
     model_profile: Optional[str] = Field(default=None, max_length=80)
@@ -3836,12 +3836,23 @@ def portal_session_config_bundle(session_id: str, auth: Dict[str, Any] = Depends
     }
     cursor = {"mcpServers": {"harness": {"command": "python", "args": ["harness_mcp_bridge.py"], "env": env}}}
     claude = {"mcpServers": {"harness": {"command": "python", "args": ["harness_mcp_bridge.py"], "env": env}}}
+    minimaxcode = {"mcpServers": {"harness": {"command": "python", "args": ["harness_mcp_bridge.py"], "env": env}}}
     opencode = {"mcp": {"servers": {"harness": {
         "type": "local",
         "command": ["python", "harness_mcp_bridge.py"],
         "environment": env,
     }}}}
     hermes = "\n".join(f"export {key}={value}" for key, value in env.items())
+    minimaxcode_setup = "\n".join([
+        "# MiniMax Code CLI",
+        "npm install -g @minimax-ai/code",
+        "mcode login --region global",
+        "# Alternativa BYOK:",
+        "# export MCODE_PROVIDER_API_KEY=\"<MINIMAX_API_KEY>\"",
+        "# mcode provider set-minimax-key",
+        "# Guarda el bloque 'MiniMax Code MCP JSON' como .mcp.json en la raiz del proyecto.",
+        "# Luego ejecuta: mcode",
+    ])
     download = f"curl -fsSL {HARNESS_PUBLIC_URL}/api/v1/client/bridge.py -o harness_mcp_bridge.py"
 
     return {
@@ -3851,6 +3862,8 @@ def portal_session_config_bundle(session_id: str, auth: Dict[str, Any] = Depends
         "env": env,
         "cursor_mcp_json": json.dumps(cursor, indent=2),
         "claudecode_mcp_json": json.dumps(claude, indent=2),
+        "minimaxcode_mcp_json": json.dumps(minimaxcode, indent=2),
+        "minimaxcode_setup": minimaxcode_setup,
         "opencode_json": json.dumps(opencode, indent=2),
         "hermes_cli_env": hermes,
         "bridge_download_command": download,

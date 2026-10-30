@@ -21,6 +21,10 @@
 - [Etapa 14 — Task Contract v2 y Memory Kernel](STAGE14-TASK-CONTRACT-MEMORY.md)
 - [Etapa 15 — Splitter por símbolos y tokenizer multi-runtime](STAGE15-SPLITTER-TOKENIZERS.md)
 
+## Integraciones de agentes
+
+- [MiniMax Code en Harness2](MINIMAX-CODE.md)
+
 ## Licenciamiento y pool Hermes
 
 - [Operación consolidada de licenciamiento](LICENSING-OPERATIONS.md)
