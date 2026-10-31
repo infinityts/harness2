@@ -142,7 +142,7 @@ async def main():
         print("\n--- 5. UI enrollment ---")
         st, ui = await asyncio.to_thread(http_text, "/portal")
         assert st == 200
-        for marker in ("mfaEnrollPane", "Configura MFA", "enrollment_token"):
+        for marker in ("mfaEnrollPane", "Configuración de seguridad", "enrollment_token"):
             assert marker.lower() in ui.lower(), marker
 
         print("\nE2E MFA ENROLLMENT: OK")

@@ -244,71 +244,68 @@ WAR_ROOM_HTML = r"""<!doctype html>
     <section class="login-brand">
       <div class="brand-mark"><span class="dot"></span> Harness Control Plane</div>
       <div>
-        <h1>Un proyecto.<br>Una sesión.<br>Cero fugas.</h1>
-        <p>Gobierno de agentes, context packs quirúrgicos y War Room en tiempo real. Ingenieros y administradores en un solo lugar.</p>
+        <h1>Todo tu trabajo,<br>en un solo lugar.</h1>
+        <p>Accede a tus proyectos, revisa el avance y coordina a tu equipo desde un entorno seguro.</p>
       </div>
       <div class="login-points">
-        <span>Aislamiento estricto por proyecto</span>
-        <span>Configuración MCP lista para copiar</span>
-        <span>Dual Plan, dispatch y kill switch</span>
+        <span>Acceso seguro a tus proyectos</span>
+        <span>Colaboración y seguimiento centralizados</span>
+        <span>Control claro de tareas y accesos</span>
       </div>
     </section>
     <section class="login-form">
       <div>
-        <h2 style="margin:0 0 4px">Acceso al Portal</h2>
-        <div class="muted" style="font-size:13px">Inicia sesión con tu correo corporativo.</div>
+        <h2 style="margin:0 0 4px">Iniciar sesión</h2>
+        <div class="muted" style="font-size:13px">Ingresa con tu cuenta corporativa.</div>
       </div>
       <div class="login-tabs" id="loginTabs">
         <button id="loginTabEmail" class="active" type="button">Correo y contraseña</button>
-        <button id="loginTabKey" type="button">Admin API Key</button>
+        <button id="loginTabKey" type="button">Acceso API</button>
       </div>
       <div id="loginEmailPane" class="stack" style="gap:12px">
         <form id="loginForm" class="stack" style="gap:12px">
-          <div class="field"><label for="loginEmail">Email</label><input id="loginEmail" type="email" autocomplete="username" placeholder="dev1@empresa.com" required></div>
-          <div class="field"><label for="loginPassword">Contraseña</label><input id="loginPassword" type="password" autocomplete="current-password" placeholder="••••••••" required></div>
+          <div class="field"><label for="loginEmail">Email</label><input id="loginEmail" type="email" autocomplete="username" required></div>
+          <div class="field"><label for="loginPassword">Contraseña</label><input id="loginPassword" type="password" autocomplete="current-password" required></div>
           <div id="loginMfaWrap" class="field hidden">
-            <label for="loginTotp">Código MFA</label>
-            <input id="loginTotp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456">
-            <div class="login-note">Solo para operadores de licencia. Si tu cuenta no tiene MFA configurado, deja este campo vacío.</div>
+            <label for="loginTotp">Código de verificación</label>
+            <input id="loginTotp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6">
           </div>
-          <button id="loginMfaToggle" class="login-note" type="button" style="background:none;border:0;padding:0;text-align:left;cursor:pointer;color:var(--accent);width:fit-content">¿Operador de licencia? Añadir MFA</button>
-          <button id="loginBtn" class="btn primary" type="submit" style="width:100%;padding:11px">Entrar al Portal</button>
+          <button id="loginBtn" class="btn primary" type="submit" style="width:100%;padding:11px">Iniciar sesión</button>
         </form>
       </div>
       <div id="loginKeyPane" class="stack hidden" style="gap:12px">
-        <div class="field"><label for="adminKey">X-Harness-Admin-Key</label><input id="adminKey" type="password" autocomplete="off" placeholder="Clave de automatización"></div>
-        <button id="adminKeyBtn" class="btn" type="button" style="width:100%;padding:11px">Entrar con Admin Key</button>
-        <div class="login-note">Compatible con scripts y automatización. La clave no se guarda al recargar.</div>
+        <div class="field"><label for="adminKey">Clave de acceso</label><input id="adminKey" type="password" autocomplete="off"></div>
+        <button id="adminKeyBtn" class="btn" type="button" style="width:100%;padding:11px">Entrar</button>
       </div>
       <div id="mfaEnrollPane" class="stack hidden" style="gap:12px">
         <div>
-          <h2 style="margin:0 0 4px">Configura MFA</h2>
-          <div class="muted" style="font-size:13px">Este es el primer inicio del operador de licencia. Agrega la cuenta en tu app autenticadora y confirma con un código de 6 dígitos.</div>
+          <h2 style="margin:0 0 4px">Configuración de seguridad</h2>
+          <div class="muted" style="font-size:13px">Este es el primer inicio de esta cuenta. Agrega la cuenta en tu aplicación de autenticación y confirma con el código de 6 dígitos.</div>
         </div>
         <div class="field">
-          <label for="mfaEnrollSecret">Clave secreta (se muestra una sola vez)</label>
+          <label for="mfaEnrollSecret">Clave de configuración (se muestra una sola vez)</label>
           <textarea id="mfaEnrollSecret" readonly rows="2"></textarea>
         </div>
         <div class="field">
-          <label for="mfaEnrollUri">URI otpauth</label>
+          <label for="mfaEnrollUri">Enlace de configuración</label>
           <textarea id="mfaEnrollUri" readonly rows="2"></textarea>
         </div>
         <div class="row" style="gap:8px">
           <button id="mfaCopySecret" class="btn sm" type="button">Copiar clave</button>
-          <button id="mfaCopyUri" class="btn sm" type="button">Copiar URI</button>
+          <button id="mfaCopyUri" class="btn sm" type="button">Copiar enlace</button>
         </div>
         <div class="field">
-          <label for="mfaEnrollCode">Código de 6 dígitos</label>
-          <input id="mfaEnrollCode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456">
+          <label for="mfaEnrollCode">Código de verificación</label>
+          <input id="mfaEnrollCode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6">
         </div>
         <div class="row" style="gap:8px">
-          <button id="mfaEnrollConfirm" class="btn primary" type="button">Confirmar MFA</button>
+          <button id="mfaEnrollConfirm" class="btn primary" type="button">Confirmar</button>
           <button id="mfaEnrollCancel" class="btn sm ghost" type="button">Cancelar</button>
         </div>
         <div id="mfaEnrollError" class="login-error hidden"></div>
       </div>
       <div id="loginError" class="login-error hidden"></div>
-      <div class="login-note">La sesión se guarda solo en esta pestaña. Cierra sesión al terminar.</div>
+      <div class="login-note">Por seguridad, cierra sesión al terminar.</div>
     </section>
   </div>
 </div>
@@ -681,8 +678,6 @@ function showMfa(visible) {
   const wrap = $("loginMfaWrap");
   if (!wrap) return;
   wrap.classList.toggle("hidden", !visible);
-  const toggle = $("loginMfaToggle");
-  if (toggle) toggle.textContent = visible ? "Ocultar MFA" : "¿Operador de licencia? Añadir MFA";
   if (!visible) $("loginTotp").value = "";
 }
 
@@ -742,7 +737,7 @@ async function confirmMfaEnrollment() {
   } catch (err) {
     const detail = err.detail || {};
     let message = err.message;
-    if (detail.code === "MFA_INVALID") message = "Código MFA inválido. Intenta de nuevo.";
+    if (detail.code === "MFA_INVALID") message = "Código de verificación inválido. Intenta de nuevo.";
     else if (detail.code === "MFA_ENROLL_TOKEN_INVALID") message = "El enrollment expiró. Inicia sesión de nuevo.";
     else if (detail.code === "ACCOUNT_LOCKED") message = detail.message || "Cuenta bloqueada temporalmente.";
     $("mfaEnrollError").textContent = message;
@@ -860,11 +855,15 @@ async function doEmailLogin(event) {
     const code = detail.code || "";
     if (code === "MFA_REQUIRED") {
       showMfa(true);
-      showLogin("Esta cuenta requiere MFA. Ingresa el código de 6 dígitos de tu app autenticadora.", false);
+      showLogin("Esta cuenta requiere una verificación adicional. Ingresa el código de 6 dígitos.", false);
       $("loginTotp").focus();
     } else if (code === "MFA_INVALID" || code === "MFA_REPLAY" || code === "ACCOUNT_LOCKED") {
       showMfa(true);
-      showLogin(detail.message || err.message, false);
+      let message = detail.message || err.message;
+      if (code === "MFA_INVALID") message = "Código de verificación inválido. Intenta de nuevo.";
+      else if (code === "MFA_REPLAY") message = "Ese código ya fue utilizado. Espera el siguiente.";
+      else if (code === "ACCOUNT_LOCKED") message = "La cuenta está bloqueada temporalmente. Intenta más tarde.";
+      showLogin(message, false);
     } else {
       showLogin(err.message);
     }
@@ -875,10 +874,10 @@ async function doEmailLogin(event) {
 
 async function doKeyLogin() {
   const key = $("adminKey").value.trim();
-  if (!key) { showLogin("Ingresa la Admin API Key."); return; }
+  if (!key) { showLogin("Ingresa la clave de acceso."); return; }
   state.adminKey = key;
   state.token = null;
-  state.user = { email:"admin-key", full_name:"Admin API Key", role:"ADMIN" };
+  state.user = { email:"api-access", full_name:"Acceso API", role:"ADMIN" };
   state.role = "ADMIN";
   $("adminKey").value = "";
   try {
@@ -2505,11 +2504,10 @@ async function toggleProjectSlot(projectId, active) {
 
 function bindStaticEvents() {
   $("loginForm").addEventListener("submit", doEmailLogin);
-  $("loginMfaToggle").onclick = () => showMfa($("loginMfaWrap").classList.contains("hidden"));
   $("mfaEnrollConfirm").onclick = confirmMfaEnrollment;
   $("mfaEnrollCancel").onclick = () => { hideMfaEnroll(); showLogin(""); };
-  $("mfaCopySecret").onclick = () => copyText($("mfaEnrollSecret").value, "Clave MFA");
-  $("mfaCopyUri").onclick = () => copyText($("mfaEnrollUri").value, "URI MFA");
+  $("mfaCopySecret").onclick = () => copyText($("mfaEnrollSecret").value, "Clave de configuración");
+  $("mfaCopyUri").onclick = () => copyText($("mfaEnrollUri").value, "Enlace de configuración");
   $("mfaEnrollCode").addEventListener("keydown", (e) => { if (e.key === "Enter") confirmMfaEnrollment(); });
   $("loginTabEmail").onclick = () => setLoginTab("email");
   $("loginTabKey").onclick = () => setLoginTab("key");

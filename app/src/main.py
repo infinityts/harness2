@@ -2932,7 +2932,7 @@ def portal_login(payload: PortalLoginRequest, request: Request):
                 status_code=423,
                 detail={
                     "code": "ACCOUNT_LOCKED",
-                    "message": "License operator account is temporarily locked",
+                    "message": "Account temporarily locked",
                     "locked_until": locked_until.isoformat(),
                 },
             )
@@ -2948,7 +2948,7 @@ def portal_login(payload: PortalLoginRequest, request: Request):
         if not payload.totp_code:
             raise HTTPException(status_code=401, detail={
                 "code": "MFA_REQUIRED",
-                "message": "TOTP code required for license operator",
+                "message": "Additional verification is required",
             })
         secret = open_secret(user["mfa_totp_secret_vault"])
         step = totp.matching_step(secret, payload.totp_code) if secret else None
@@ -3681,7 +3681,7 @@ def add_project_member(project_id: str, payload: ProjectMemberRequest, backgroun
                 status_code=403,
                 detail={
                     "code": "LICENSE_ADMIN_NOT_PROJECT_MEMBER",
-                    "message": "The license operator is not a project user",
+                    "message": "This account cannot be added to a project",
                 },
             )
         if payload.password:
@@ -4277,7 +4277,7 @@ async def admin_reset_user_password(
             status_code=403,
             detail={
                 "code": "PASSWORD_SEALED",
-                "message": "License operator password is sealed; vendor-side break-glass is required",
+                "message": "This account password is sealed; vendor-side break-glass is required",
             },
         )
 
