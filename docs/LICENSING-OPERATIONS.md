@@ -45,16 +45,17 @@ podman exec harness-app python tools/provision_license_operator.py \
 chmod 600 /root/harness-license-operator.credentials.json
 ```
 
-La salida contiene password y secreto TOTP una sola vez. La cuenta:
+La salida contiene solo la password una sola vez. La cuenta:
 
 - tiene `password_change_allowed = false` y no se puede resetear desde el portal;
-- exige TOTP en cada login;
+- en el primer login exige configurar MFA y confirmar un código;
+- en logins posteriores exige TOTP;
 - bloquea 15 minutos tras 5 intentos fallidos;
 - rechaza reutilización del mismo código TOTP;
 - no puede crear proyectos, usuarios ni sesiones;
 - queda auditada con actor e IP.
 
-Rotación/break-glass:
+Rotación/break-glass (resetea password y enrollment MFA):
 
 ```bash
 podman exec harness-app python tools/provision_license_operator.py --rotate \

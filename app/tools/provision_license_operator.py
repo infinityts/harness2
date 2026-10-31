@@ -4,8 +4,9 @@ Uso (dentro del contenedor harness-app):
     python tools/provision_license_operator.py
     python tools/provision_license_operator.py --rotate
 
-La salida contiene la password y el secreto TOTP en claro una sola vez.
-Redirigirla a un archivo con permisos 600; nunca se imprime en logs normales.
+La salida contiene solo la password en claro una sola vez. El MFA se configura
+obligatoriamente en el primer login desde el portal; el script no imprime ni
+pre-genera el secreto TOTP.
 """
 import argparse
 import json
@@ -21,8 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import sqlalchemy as sa
 from sqlalchemy import create_engine
 
-from src.security import hash_password, seal_secret
-from src import totp
+from src.security import hash_password
 
 DEFAULT_EMAIL = os.getenv("HARNESS_LICENSE_OPERATOR_EMAIL", "license-operator@harness.local")
 DEFAULT_NAME = "License Operator"
@@ -46,7 +46,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Create or rotate the sealed LICENSE_ADMIN account")
     parser.add_argument("--email", default=DEFAULT_EMAIL)
     parser.add_argument("--full-name", default=DEFAULT_NAME)
-    parser.add_argument("--rotate", action="store_true", help="Rotate password and TOTP for an existing account")
+    parser.add_argument("--rotate", action="store_true", help="Rotate password and reset MFA enrollment for an existing account")
     args = parser.parse_args()
 
     database_url = os.getenv("DATABASE_URL")
@@ -80,9 +80,7 @@ def main() -> int:
             return 5
 
         password = generate_password()
-        secret = totp.generate_secret(32)
         password_hash = hash_password(password)
-        sealed_secret = seal_secret(secret)
 
         if existing:
             conn.execute(
@@ -92,8 +90,8 @@ def main() -> int:
                         full_name = :full_name,
                         role = 'LICENSE_ADMIN',
                         status = 'ACTIVE',
-                        mfa_enabled = true,
-                        mfa_totp_secret_vault = :vault,
+                        mfa_enabled = false,
+                        mfa_totp_secret_vault = NULL,
                         password_change_allowed = false,
                         mfa_last_used_step = NULL,
                         failed_login_attempts = 0,
@@ -103,7 +101,6 @@ def main() -> int:
                 {
                     "password_hash": password_hash,
                     "full_name": args.full_name,
-                    "vault": sealed_secret,
                     "uid": existing["id"],
                 },
             )
@@ -119,14 +116,13 @@ def main() -> int:
                     VALUES
                         (CAST(:id AS UUID), :email, :full_name, :password_hash,
                          'LICENSE_ADMIN', 'ACTIVE', CAST('[]' AS JSONB),
-                         true, :vault, false)
+                         false, NULL, false)
                 """),
                 {
                     "id": user_id,
                     "email": email,
                     "full_name": args.full_name,
                     "password_hash": password_hash,
-                    "vault": sealed_secret,
                 },
             )
             action = "created"
@@ -138,10 +134,10 @@ def main() -> int:
         "full_name": args.full_name,
         "role": "LICENSE_ADMIN",
         "password": password,
-        "totp_secret": secret,
-        "otpauth_uri": totp.provisioning_uri(secret, email),
         "password_change_allowed": False,
         "mfa_required": True,
+        "mfa_enrollment_required": True,
+        "next_step": "Inicia sesion en el portal con esta password y configura MFA cuando se solicite.",
     }, indent=2))
     return 0
 

@@ -258,7 +258,7 @@ WAR_ROOM_HTML = r"""<!doctype html>
         <h2 style="margin:0 0 4px">Acceso al Portal</h2>
         <div class="muted" style="font-size:13px">Inicia sesión con tu correo corporativo.</div>
       </div>
-      <div class="login-tabs">
+      <div class="login-tabs" id="loginTabs">
         <button id="loginTabEmail" class="active" type="button">Correo y contraseña</button>
         <button id="loginTabKey" type="button">Admin API Key</button>
       </div>
@@ -279,6 +279,33 @@ WAR_ROOM_HTML = r"""<!doctype html>
         <div class="field"><label for="adminKey">X-Harness-Admin-Key</label><input id="adminKey" type="password" autocomplete="off" placeholder="Clave de automatización"></div>
         <button id="adminKeyBtn" class="btn" type="button" style="width:100%;padding:11px">Entrar con Admin Key</button>
         <div class="login-note">Compatible con scripts y automatización. La clave no se guarda al recargar.</div>
+      </div>
+      <div id="mfaEnrollPane" class="stack hidden" style="gap:12px">
+        <div>
+          <h2 style="margin:0 0 4px">Configura MFA</h2>
+          <div class="muted" style="font-size:13px">Este es el primer inicio del operador de licencia. Agrega la cuenta en tu app autenticadora y confirma con un código de 6 dígitos.</div>
+        </div>
+        <div class="field">
+          <label for="mfaEnrollSecret">Clave secreta (se muestra una sola vez)</label>
+          <textarea id="mfaEnrollSecret" readonly rows="2"></textarea>
+        </div>
+        <div class="field">
+          <label for="mfaEnrollUri">URI otpauth</label>
+          <textarea id="mfaEnrollUri" readonly rows="2"></textarea>
+        </div>
+        <div class="row" style="gap:8px">
+          <button id="mfaCopySecret" class="btn sm" type="button">Copiar clave</button>
+          <button id="mfaCopyUri" class="btn sm" type="button">Copiar URI</button>
+        </div>
+        <div class="field">
+          <label for="mfaEnrollCode">Código de 6 dígitos</label>
+          <input id="mfaEnrollCode" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456">
+        </div>
+        <div class="row" style="gap:8px">
+          <button id="mfaEnrollConfirm" class="btn primary" type="button">Confirmar MFA</button>
+          <button id="mfaEnrollCancel" class="btn sm ghost" type="button">Cancelar</button>
+        </div>
+        <div id="mfaEnrollError" class="login-error hidden"></div>
       </div>
       <div id="loginError" class="login-error hidden"></div>
       <div class="login-note">La sesión se guarda solo en esta pestaña. Cierra sesión al terminar.</div>
@@ -609,7 +636,7 @@ const STATUS_COLORS = { ONLINE:"#34d399", BUSY:"#fbbf24", OFFLINE:"#8fa3c4", REV
 const TOOL_LABELS = { opencode:"OpenCode", claudecode:"Claude Code", cursor:"Cursor", hermes:"Hermes", pi:"Pi", minimaxcode:"MiniMax Code", custom:"Custom", "headless-worker":"Docs Curator" };
 const SKILL_CATEGORY_LABELS = { backend:"Backend / APIs", frontend:"Frontend / UI", database:"Base de datos", documents:"Documentos", writing:"Redacción", qa:"QA / Testing", devops:"DevOps", security:"Seguridad", general:"General" };
 const state = {
-  token: null, adminKey: null, user: null, role: null,
+  token: null, adminKey: null, user: null, role: null, mfaEnrollmentToken: null,
   projects: [], topology: null, activeView: "projects",
   adminUsers: [], skills: [], skillViewer: null, skillFilter: "",
   editingSkillSlug: null, skillPreviewTimer: null,
@@ -659,9 +686,76 @@ function showMfa(visible) {
   if (!visible) $("loginTotp").value = "";
 }
 
+function hideMfaEnroll() {
+  state.mfaEnrollmentToken = null;
+  const pane = $("mfaEnrollPane");
+  if (!pane) return;
+  pane.classList.add("hidden");
+  $("loginTabs").classList.remove("hidden");
+  const keyActive = $("loginTabKey").classList.contains("active");
+  $("loginEmailPane").classList.toggle("hidden", keyActive);
+  $("loginKeyPane").classList.toggle("hidden", !keyActive);
+  $("mfaEnrollSecret").value = "";
+  $("mfaEnrollUri").value = "";
+  $("mfaEnrollCode").value = "";
+  $("mfaEnrollError").textContent = "";
+  $("mfaEnrollError").classList.add("hidden");
+}
+
+function showMfaEnroll(data) {
+  state.mfaEnrollmentToken = data.enrollment_token;
+  $("loginTabs").classList.add("hidden");
+  $("loginEmailPane").classList.add("hidden");
+  $("loginKeyPane").classList.add("hidden");
+  $("mfaEnrollPane").classList.remove("hidden");
+  $("mfaEnrollSecret").value = data.secret || "";
+  $("mfaEnrollUri").value = data.otpauth_uri || "";
+  $("mfaEnrollCode").value = "";
+  $("mfaEnrollError").textContent = "";
+  $("mfaEnrollError").classList.add("hidden");
+  $("loginError").classList.add("hidden");
+  $("mfaEnrollCode").focus();
+}
+
+async function confirmMfaEnrollment() {
+  const token = state.mfaEnrollmentToken;
+  const code = $("mfaEnrollCode").value.trim();
+  if (!token) { showLogin("El enrollment expiró. Inicia sesión de nuevo."); return; }
+  if (!/^\d{6}$/.test(code)) {
+    $("mfaEnrollError").textContent = "Ingresa un código de 6 dígitos.";
+    $("mfaEnrollError").classList.remove("hidden");
+    return;
+  }
+  $("mfaEnrollConfirm").disabled = true;
+  try {
+    const data = await api("/api/v1/auth/mfa/enroll/confirm", {
+      method: "POST",
+      body: JSON.stringify({ enrollment_token: token, totp_code: code }),
+    });
+    state.token = data.access_token;
+    state.adminKey = null;
+    state.user = data.user;
+    state.role = data.user.role;
+    sessionStorage.setItem("harness.token", state.token);
+    hideMfaEnroll();
+    await enterApp();
+  } catch (err) {
+    const detail = err.detail || {};
+    let message = err.message;
+    if (detail.code === "MFA_INVALID") message = "Código MFA inválido. Intenta de nuevo.";
+    else if (detail.code === "MFA_ENROLL_TOKEN_INVALID") message = "El enrollment expiró. Inicia sesión de nuevo.";
+    else if (detail.code === "ACCOUNT_LOCKED") message = detail.message || "Cuenta bloqueada temporalmente.";
+    $("mfaEnrollError").textContent = message;
+    $("mfaEnrollError").classList.remove("hidden");
+  } finally {
+    $("mfaEnrollConfirm").disabled = false;
+  }
+}
+
 function showLogin(message = "", resetMfa = true) {
   $("appView").classList.add("hidden");
   $("loginView").classList.remove("hidden");
+  hideMfaEnroll();
   $("loginError").textContent = message;
   $("loginError").classList.toggle("hidden", !message);
   if (resetMfa) showMfa(false);
@@ -671,6 +765,7 @@ function showLogin(message = "", resetMfa = true) {
 
 function setLoginTab(which) {
   const email = which === "email";
+  hideMfaEnroll();
   $("loginTabEmail").classList.toggle("active", email);
   $("loginTabKey").classList.toggle("active", !email);
   $("loginEmailPane").classList.toggle("hidden", !email);
@@ -747,6 +842,10 @@ async function doEmailLogin(event) {
     const body = { email, password };
     if (totpCode) body.totp_code = totpCode;
     const data = await api("/api/v1/auth/login", { method:"POST", body:JSON.stringify(body) });
+    if (data.mfa_enrollment_required) {
+      showMfaEnroll(data);
+      return;
+    }
     state.token = data.access_token;
     state.adminKey = null;
     state.user = data.user;
@@ -2407,6 +2506,11 @@ async function toggleProjectSlot(projectId, active) {
 function bindStaticEvents() {
   $("loginForm").addEventListener("submit", doEmailLogin);
   $("loginMfaToggle").onclick = () => showMfa($("loginMfaWrap").classList.contains("hidden"));
+  $("mfaEnrollConfirm").onclick = confirmMfaEnrollment;
+  $("mfaEnrollCancel").onclick = () => { hideMfaEnroll(); showLogin(""); };
+  $("mfaCopySecret").onclick = () => copyText($("mfaEnrollSecret").value, "Clave MFA");
+  $("mfaCopyUri").onclick = () => copyText($("mfaEnrollUri").value, "URI MFA");
+  $("mfaEnrollCode").addEventListener("keydown", (e) => { if (e.key === "Enter") confirmMfaEnrollment(); });
   $("loginTabEmail").onclick = () => setLoginTab("email");
   $("loginTabKey").onclick = () => setLoginTab("key");
   $("adminKeyBtn").onclick = doKeyLogin;

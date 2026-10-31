@@ -2723,6 +2723,11 @@ class PortalLoginRequest(BaseModel):
     totp_code: Optional[str] = Field(default=None, max_length=10)
 
 
+class MfaEnrollConfirmRequest(BaseModel):
+    enrollment_token: str = Field(..., min_length=10, max_length=4000)
+    totp_code: str = Field(..., min_length=6, max_length=10)
+
+
 class PortalRegisterRequest(BaseModel):
     email: str = Field(..., min_length=3, max_length=255)
     password: str = Field(..., min_length=8, max_length=200)
@@ -2757,6 +2762,7 @@ class ProjectMemberRequest(BaseModel):
 
 LICENSE_LOGIN_MAX_ATTEMPTS = 5
 LICENSE_LOGIN_LOCK_MINUTES = 15
+MFA_ENROLLMENT_TTL_MINUTES = 10
 
 
 def _license_audit_login(event_type: str, email: Optional[str], data: Dict[str, Any], request: Optional[Request]) -> None:
@@ -2839,6 +2845,65 @@ def _license_login_success(user, step: int, request: Optional[Request]) -> bool:
     return True
 
 
+def _issue_mfa_enrollment_token(user) -> str:
+    now = int(datetime.now(timezone.utc).timestamp())
+    payload = {
+        "sub": str(user["id"]),
+        "email": user["email"],
+        "role": user["role"],
+        "typ": "mfa_enroll",
+        "iat": now,
+        "jti": str(uuid.uuid4()),
+        "exp": now + MFA_ENROLLMENT_TTL_MINUTES * 60,
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def _start_license_mfa_enrollment(user, request: Optional[Request]) -> Dict[str, Any]:
+    secret = open_secret(user["mfa_totp_secret_vault"]) if user["mfa_totp_secret_vault"] else ""
+    if not secret:
+        secret = totp.generate_secret(32)
+        sealed = seal_secret(secret)
+        with engine.begin() as conn:
+            conn.execute(
+                sa.text("""
+                    UPDATE harness_users
+                    SET mfa_enabled = false,
+                        mfa_totp_secret_vault = :vault,
+                        mfa_last_used_step = NULL,
+                        failed_login_attempts = 0,
+                        locked_until = NULL
+                    WHERE id = CAST(:uid AS UUID)
+                """),
+                {"uid": user["id"], "vault": sealed},
+            )
+    else:
+        with engine.begin() as conn:
+            conn.execute(
+                sa.text("""
+                    UPDATE harness_users
+                    SET failed_login_attempts = 0,
+                        locked_until = NULL
+                    WHERE id = CAST(:uid AS UUID)
+                """),
+                {"uid": user["id"]},
+            )
+    _license_audit_login(
+        "LICENSE_ADMIN_MFA_ENROLL_STARTED",
+        user["email"],
+        {"mfa_enabled": False, "expires_minutes": MFA_ENROLLMENT_TTL_MINUTES},
+        request,
+    )
+    return {
+        "mfa_enrollment_required": True,
+        "enrollment_token": _issue_mfa_enrollment_token(user),
+        "otpauth_uri": totp.provisioning_uri(secret, user["email"]),
+        "secret": secret,
+        "expires_in_minutes": MFA_ENROLLMENT_TTL_MINUTES,
+        "user": _public_user(user),
+    }
+
+
 @app.post("/api/v1/auth/login")
 def portal_login(payload: PortalLoginRequest, request: Request):
     email = payload.email.strip().lower()
@@ -2879,7 +2944,7 @@ def portal_login(payload: PortalLoginRequest, request: Request):
         raise HTTPException(status_code=403, detail="User not active")
     if user["role"] == "LICENSE_ADMIN":
         if not user["mfa_enabled"] or not user["mfa_totp_secret_vault"]:
-            raise HTTPException(status_code=403, detail="License operator MFA is not configured")
+            return _start_license_mfa_enrollment(user, request)
         if not payload.totp_code:
             raise HTTPException(status_code=401, detail={
                 "code": "MFA_REQUIRED",
@@ -2899,6 +2964,97 @@ def portal_login(payload: PortalLoginRequest, request: Request):
                 "code": "MFA_REPLAY",
                 "message": "TOTP code has already been used",
             })
+    token = _issue_portal_token(user)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in_hours": PORTAL_JWT_TTL_HOURS,
+        "user": _public_user(user),
+    }
+
+
+@app.post("/api/v1/auth/mfa/enroll/confirm")
+def confirm_mfa_enrollment(payload: MfaEnrollConfirmRequest, request: Request):
+    try:
+        decoded = jwt.decode(
+            payload.enrollment_token,
+            JWT_SECRET,
+            algorithms=["HS256"],
+            options={"require": ["exp", "jti", "sub"]},
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail={
+            "code": "MFA_ENROLL_TOKEN_INVALID",
+            "message": "Enrollment token is invalid or expired",
+        })
+    if decoded.get("typ") != "mfa_enroll":
+        raise HTTPException(status_code=401, detail={
+            "code": "MFA_ENROLL_TOKEN_INVALID",
+            "message": "Enrollment token is invalid or expired",
+        })
+    with engine.connect() as conn:
+        user = conn.execute(
+            sa.text("""
+                SELECT id::text, email, full_name, role, status, default_skills,
+                       mfa_enabled, mfa_totp_secret_vault, password_change_allowed,
+                       mfa_last_used_step, failed_login_attempts, locked_until
+                FROM harness_users WHERE id = CAST(:uid AS UUID)
+            """),
+            {"uid": decoded.get("sub")},
+        ).mappings().fetchone()
+    if not user or user["role"] != "LICENSE_ADMIN" or user["status"] != "ACTIVE":
+        raise HTTPException(status_code=403, detail={
+            "code": "MFA_ENROLL_NOT_ALLOWED",
+            "message": "Enrollment is not allowed for this account",
+        })
+    if user["locked_until"]:
+        locked_until = user["locked_until"]
+        if locked_until.tzinfo is None:
+            locked_until = locked_until.replace(tzinfo=timezone.utc)
+        if locked_until > datetime.now(timezone.utc):
+            raise HTTPException(status_code=423, detail={
+                "code": "ACCOUNT_LOCKED",
+                "message": "License operator account is temporarily locked",
+                "locked_until": locked_until.isoformat(),
+            })
+    if user["mfa_enabled"]:
+        raise HTTPException(status_code=409, detail={
+            "code": "MFA_ALREADY_ENROLLED",
+            "message": "MFA is already enabled for this account",
+        })
+    secret = open_secret(user["mfa_totp_secret_vault"] or "")
+    if not secret:
+        raise HTTPException(status_code=400, detail={
+            "code": "MFA_ENROLL_NOT_STARTED",
+            "message": "Start enrollment by logging in with your password first",
+        })
+    step = totp.matching_step(secret, payload.totp_code)
+    if step is None:
+        _register_license_login_failure(user, "invalid_totp_enrollment", request)
+        raise HTTPException(status_code=401, detail={
+            "code": "MFA_INVALID",
+            "message": "Invalid TOTP code",
+        })
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text("""
+                UPDATE harness_users
+                SET mfa_enabled = true,
+                    mfa_last_used_step = :step,
+                    failed_login_attempts = 0,
+                    locked_until = NULL
+                WHERE id = CAST(:uid AS UUID)
+            """),
+            {"uid": user["id"], "step": step},
+        )
+    _license_audit_login(
+        "LICENSE_ADMIN_MFA_ENROLLED",
+        user["email"],
+        {"mfa_step": step},
+        request,
+    )
+    user = dict(user)
+    user["mfa_enabled"] = True
     token = _issue_portal_token(user)
     return {
         "access_token": token,

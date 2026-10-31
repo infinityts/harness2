@@ -33,21 +33,23 @@ por accidente o por abuso interno.
 - Rol: `LICENSE_ADMIN`.
 - Estado: `ACTIVE`.
 - `password_change_allowed = false`.
-- `mfa_enabled = true`.
-- Secreto TOTP cifrado en el vault (`mfa_totp_secret_vault`); nunca se devuelve
-  al navegador.
+- `mfa_enabled = false` hasta completar el enrollment del primer login.
+- El secreto TOTP se genera en el primer login, se cifra en el vault
+  (`mfa_totp_secret_vault`) y se muestra **una sola vez** para configurar la app.
 - Password aleatoria de 40 caracteres, PBKDF2-SHA256 con salt.
-- La contraseña y el secreto TOTP se muestran **una sola vez** al provisionar.
+- La contraseña se muestra **una sola vez** al provisionar.
 
 ## MFA
 
 - TOTP RFC 6238, HMAC-SHA1, 30 s, 6 dígitos, ventana ±1.
-- Obligatorio en cada login de `LICENSE_ADMIN`.
+- **Primer login**: el portal pide configurar MFA, muestra la clave/URI una sola
+  vez y exige confirmar un código antes de habilitar la cuenta.
+- **Logins posteriores**: MFA obligatorio en cada login de `LICENSE_ADMIN`.
 - Anti-replay: se guarda `mfa_last_used_step`; un código usado no se acepta de
   nuevo aunque siga dentro de la ventana.
 - Bloqueo: 5 intentos fallidos de password/TOTP bloquean la cuenta 15 minutos.
-- Cada login, fallo, bloqueo y reset bloqueado se registra en la auditoría de
-  licencia con actor e IP.
+- Cada login, enrollment, fallo, bloqueo y reset bloqueado se registra en la
+  auditoría de licencia con actor e IP.
 
 ## Endpoints
 
@@ -84,10 +86,11 @@ python tools/provision_license_operator.py \
 chmod 600 /root/harness-license-operator.credentials.json
 ```
 
-El JSON contiene `email`, `password`, `totp_secret` y `otpauth_uri`. Cargar el
-secreto en una app TOTP y no dejarlo en el historial de shell.
+El JSON contiene `email`, `password` y `mfa_enrollment_required=true`. En el
+primer login el portal muestra la clave/URI TOTP una sola vez y exige confirmar
+un código antes de habilitar MFA.
 
-Para rotar password + TOTP:
+Para rotar password y **resetear el enrollment MFA**:
 
 ```bash
 python tools/provision_license_operator.py --rotate \
@@ -96,7 +99,8 @@ chmod 600 /root/harness-license-operator.credentials.json
 ```
 
 La rotación es vendor-side/break-glass, auditada y fuera del portal. No existe
-un endpoint de reset para esta cuenta.
+un endpoint de reset para esta cuenta. Después de rotar, el siguiente login
+vuelve a pedir la configuración de MFA.
 
 ## Login
 
@@ -106,6 +110,27 @@ Content-Type: application/json
 
 {
   "email": "license-operator@harness.local",
+  "password": "<password>"
+}
+```
+
+Primer login: responde `mfa_enrollment_required=true` con `enrollment_token`,
+`secret` y `otpauth_uri`. El portal muestra la configuración y confirma con:
+
+```http
+POST /api/v1/auth/mfa/enroll/confirm
+
+{
+  "enrollment_token": "<token temporal>",
+  "totp_code": "123456"
+}
+```
+
+Logins posteriores:
+
+```json
+{
+  "email": "license-operator@harness.local",
   "password": "<password>",
   "totp_code": "123456"
 }
@@ -113,6 +138,7 @@ Content-Type: application/json
 
 Respuestas relevantes:
 
+- `mfa_enrollment_required`: primer login; configurar MFA.
 - `401 MFA_REQUIRED`: falta TOTP.
 - `401 MFA_INVALID`: TOTP incorrecto.
 - `401 MFA_REPLAY`: TOTP ya usado.
