@@ -4183,6 +4183,8 @@ def portal_session_config_bundle(session_id: str, auth: Dict[str, Any] = Depends
         "# export MCODE_PROVIDER_API_KEY=\"<MINIMAX_API_KEY>\"",
         "# mcode provider set-minimax-key",
         "# Guarda el bloque 'MiniMax Code MCP JSON' como .mcp.json en la raiz del proyecto.",
+        "# Windows/MiniMax Code resuelve args contra el home del usuario.",
+        "# Usa ruta absoluta en args, ej: C:/ruta/al/proyecto/harness_mcp_bridge.py",
         "# Luego ejecuta: mcode",
     ])
     download = f"curl -fsSL {HARNESS_PUBLIC_URL}/api/v1/client/bridge.py -o harness_mcp_bridge.py"

@@ -72,12 +72,36 @@ Descargar el bridge si no existe:
 curl -fsSL <HARNESS_URL>/api/v1/client/bridge.py -o harness_mcp_bridge.py
 ```
 
+### Windows: usar ruta absoluta
+
+MiniMax Code en Windows resuelve `args` de un servidor MCP stdio contra el
+**home del usuario**, no contra el directorio del workspace. Si el bridge está en:
+
+```text
+D:\minimax\projects\desktop-organizer\harness_mcp_bridge.py
+```
+
+el `.mcp.json` debe usar:
+
+```json
+"args": [
+  "D:/minimax/projects/desktop-organizer/harness_mcp_bridge.py"
+]
+```
+
+No uses `"harness_mcp_bridge.py"` relativo: el runtime intentará abrirlo desde
+`C:\Users\<usuario>\harness_mcp_bridge.py` y fallará.
+
 Verificar:
 
 ```bash
 mcode mcp list --human
 mcode mcp tools harness
 ```
+
+La sesión de Harness permanece `ONLINE` solo mientras `mcode` mantenga el
+proceso MCP/bridge vivo. Una prueba one-shot (`mcode exec` o un `tools/list`
+aislado) puede terminar y el watchdog marcará la sesión `OFFLINE`.
 
 ## Ejecución
 
