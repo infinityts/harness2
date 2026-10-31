@@ -1349,11 +1349,11 @@ function renderMyProjects() {
       <div class="stack" style="gap:8px;margin-top:6px">
         <div class="grid-2">
           <div class="field"><label>Herramienta</label><select class="session-tool">${Object.entries(TOOL_LABELS).filter(([k]) => k !== "custom").map(([k,v]) => `<option value="${k}">${v}</option>`).join("")}</select></div>
-          <div class="field"><label>Proveedor LLM</label><select class="session-provider"><option value="cloud-llm">Cloud (preferido)</option><option value="local-llm">IA Local</option><option value="minimax">MiniMax</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="custom">Custom</option></select></div>
-          <div class="field"><label>Perfil de modelo</label><select class="session-profile"><option value="">Auto por max_context</option><option value="local-32k">Local 32k</option><option value="local-64k">Local 64k</option><option value="local-120k">Local 120k</option><option value="cloud-128k">Cloud 128k</option><option value="minimax-m3.1-flash">MiniMax M3.1 Flash</option></select></div>
-          <div class="field"><label>max_context_tokens</label><input class="session-max" type="number" min="1024" value="32000"></div>
+          <div class="field"><label>Proveedor</label><select class="session-provider"><option value="cloud-llm">Cloud</option><option value="local-llm">Local</option><option value="minimax">MiniMax</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="custom">Custom</option></select></div>
+          <div class="field"><label>Perfil</label><select class="session-profile"><option value="">Auto</option><option value="local-32k">Local 32k</option><option value="local-64k">Local 64k</option><option value="local-120k">Local 120k</option><option value="cloud-128k">Cloud 128k</option><option value="minimax-m3.1-flash">MiniMax M3.1</option></select></div>
+          <div class="field"><label>Contexto máximo</label><input class="session-max" type="number" min="1024" value="32000"></div>
         </div>
-        <button class="btn primary start-session-btn" data-project="${esc(p.id)}" type="button">Iniciar / Configurar Mi Sesión en este Proyecto</button>
+        <button class="btn primary start-session-btn" data-project="${esc(p.id)}" type="button" style="width:100%;white-space:normal;line-height:1.25">Iniciar / configurar sesión</button>
       </div>
       <div class="config-slot" data-config-slot="${esc(p.id)}"></div>
     </article>`;
