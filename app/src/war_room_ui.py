@@ -133,6 +133,8 @@ WAR_ROOM_HTML = r"""<!doctype html>
   .check-row input[type=checkbox], .check-row input[type=radio] { width:18px; height:18px; min-width:18px; flex:0 0 18px; margin-top:1px; accent-color:var(--accent); }
   .check-row .grow { flex:1; min-width:0; }
   .check-row.selected { border-color:var(--accent); background:rgba(56,189,248,.08); }
+  .flow-summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }
+  @media (max-width: 600px) { .flow-summary { grid-template-columns:repeat(2,minmax(0,1fr)); } }
   .check-row .skills-input { margin-top:7px; }
   .result-box { background:#08111f; border:1px dashed var(--line-strong); border-radius:10px; padding:10px; font-size:12px; white-space:pre-wrap; word-break:break-word; }
   .copy-row { display:flex; gap:8px; align-items:flex-start; }
@@ -609,6 +611,35 @@ WAR_ROOM_HTML = r"""<!doctype html>
           </div>
           <div id="myProjectsGrid" class="project-grid"></div>
         </section>
+
+        <section id="viewAgentFlow" class="view hidden">
+          <div class="view-head">
+            <div><h1>Agentes y Flujo</h1><p>Sesiones, tareas y actividad de tus proyectos. Vista de solo lectura.</p></div>
+            <div class="spacer"></div>
+            <select id="flowProject" style="max-width:180px;flex:0 1 180px"></select>
+            <button id="flowRefresh" class="btn sm" type="button" style="flex:0 0 auto">Refrescar</button>
+          </div>
+          <div id="flowSummary" class="flow-summary"></div>
+          <div class="grid-2" style="align-items:start">
+            <div class="card">
+              <h3>Agentes del proyecto</h3>
+              <div id="flowAgents" class="stack" style="gap:8px"></div>
+            </div>
+            <div class="card">
+              <h3>Tareas en curso</h3>
+              <div class="table-wrap">
+                <table>
+                  <thead><tr><th>Tarea</th><th>Estado</th><th>Asignada</th><th>Tipo</th><th>Budget</th></tr></thead>
+                  <tbody id="flowTasks"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+          <div class="card">
+            <h3>Actividad reciente</h3>
+            <div id="flowEvents" class="console" style="height:180px"></div>
+          </div>
+        </section>
       </div>
     </div>
   </div>
@@ -792,6 +823,7 @@ function navItems() {
   }
   return [
     { id:"myprojects", icon:"▤", label:"Mis Proyectos", bottom:"Proyectos" },
+    { id:"agentflow", icon:"◎", label:"Agentes y Flujo", bottom:"Agentes" },
     { id:"knowledge", icon:"▤", label:"Base de Conocimiento", bottom:"Docs" },
     { id:"skills", icon:"✦", label:"Skill Studio", bottom:"Skills" },
   ];
@@ -808,11 +840,11 @@ function buildNav() {
 
 function setView(name) {
   state.activeView = name;
-  const views = { projects:"viewProjects", knowledge:"viewKnowledge", skills:"viewSkills", engineers:"viewEngineers", license:"viewLicense", warroom:"viewWarRoom", smtp:"viewSmtp", myprojects:"viewMyProjects" };
+  const views = { projects:"viewProjects", knowledge:"viewKnowledge", skills:"viewSkills", engineers:"viewEngineers", license:"viewLicense", warroom:"viewWarRoom", smtp:"viewSmtp", myprojects:"viewMyProjects", agentflow:"viewAgentFlow" };
   Object.values(views).forEach(id => $(id).classList.add("hidden"));
   if (views[name]) $(views[name]).classList.remove("hidden");
   document.querySelectorAll("[data-view]").forEach(btn => btn.classList.toggle("active", btn.dataset.view === name));
-  $("topTitle").textContent = ({projects:"Proyectos", knowledge:"Base de Conocimiento", skills:"Skill Studio", engineers:"Usuarios y Accesos", license:"Licencia y Pool Hermes", warroom:"Sala de Control", smtp:"SMTP y Correos", myprojects:"Mis Proyectos"})[name] || "Harness";
+  $("topTitle").textContent = ({projects:"Proyectos", knowledge:"Base de Conocimiento", skills:"Skill Studio", engineers:"Usuarios y Accesos", license:"Licencia y Pool Hermes", warroom:"Sala de Control", smtp:"SMTP y Correos", myprojects:"Mis Proyectos", agentflow:"Agentes y Flujo"})[name] || "Harness";
   closeDrawer();
   if (name === "warroom") { if (state.role === "ADMIN") { ensureWarRoom(); } }
   if (name === "knowledge") loadKnowledge();
@@ -822,6 +854,7 @@ function setView(name) {
   if (name === "projects") renderProjects();
   if (name === "smtp") { loadSmtpConfig(); loadEmailLogs(); }
   if (name === "myprojects") renderMyProjects();
+  if (name === "agentflow") loadAgentFlow();
 }
 
 function openDrawer() { $("sidebar").classList.add("open"); $("drawerBackdrop").classList.add("open"); }
@@ -1361,6 +1394,83 @@ function renderMyProjects() {
   }).join("");
   grid.querySelectorAll(".start-session-btn").forEach(btn => { btn.onclick = () => startSession(btn.dataset.project, btn); });
   grid.querySelectorAll("[data-config-session]").forEach(btn => { btn.onclick = () => openSessionConfig(btn.dataset.configSession, btn); });
+}
+
+async function loadAgentFlow() {
+  const select = $("flowProject");
+  if (!select) return;
+  const previous = select.value;
+  select.innerHTML = state.projects.length
+    ? state.projects.map(p => `<option value="${esc(p.id)}">${esc(p.display_name)}</option>`).join("")
+    : '<option value="">Sin proyectos</option>';
+  if (previous && [...select.options].some(o => o.value === previous)) select.value = previous;
+  const projectId = select.value;
+  try {
+    const data = await api(`/api/v1/agent-flow${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`);
+    renderAgentFlow(data);
+  } catch (err) {
+    toast(err.message, "bad");
+    $("flowAgents").innerHTML = '<div class="muted" style="font-size:12px">No se pudo cargar el flujo.</div>';
+  }
+}
+
+function flowAgentLabel(node) {
+  if (node.is_headless_worker || node.agent_tool === "headless-worker") return "Docs Curator";
+  if (node.worker_role === "RAG_CURATOR") return "Hermes RAG Curator";
+  if (node.worker_role) return node.worker_role;
+  return TOOL_LABELS[node.agent_tool] || node.agent_tool || "Agente";
+}
+
+function flowAgentRole(node) {
+  if (node.is_headless_worker || node.agent_tool === "headless-worker") return "Documentación";
+  if (node.worker_role === "RAG_CURATOR") return "RAG";
+  if (node.session_kind === "SYSTEM_WORKER") return "Worker del sistema";
+  return "Interactivo";
+}
+
+function renderAgentFlow(data) {
+  const nodes = data.nodes || [];
+  const tasks = data.tasks || [];
+  const events = data.events || [];
+  const active = nodes.filter(n => n.status === "ONLINE" || n.status === "BUSY");
+  const system = nodes.filter(n => n.session_kind === "SYSTEM_WORKER" || n.is_headless_worker);
+  const tasksOpen = tasks.filter(t => ["PENDING", "IN_PROGRESS", "VALIDATING", "CONFLICT"].includes(t.status));
+  const summary = [
+    ["Agentes visibles", nodes.length],
+    ["Agentes activos", active.length],
+    ["Workers del sistema", system.length],
+    ["Tareas abiertas", tasksOpen.length],
+  ];
+  $("flowSummary").innerHTML = summary.map(([label, value]) => `<div class="card" style="padding:14px">
+    <div class="muted" style="font-size:12px">${esc(label)}</div>
+    <div style="font-size:26px;font-weight:800;margin-top:4px">${esc(String(value))}</div>
+  </div>`).join("");
+
+  $("flowAgents").innerHTML = nodes.length ? nodes.map(node => {
+    const status = node.status || "UNKNOWN";
+    const cls = status === "ONLINE" ? "ok" : status === "BUSY" ? "warn" : status === "REVOKED" ? "bad" : "";
+    const context = `${node.current_context_tokens || 0} / ${node.max_context_tokens || 0} tokens`;
+    return `<div class="check-row" style="cursor:default">
+      <span class="pill ${cls}">${esc(status)}</span>
+      <div class="grow">
+        <div class="row" style="gap:6px"><b>${esc(flowAgentLabel(node))}</b><span class="pill info">${esc(flowAgentRole(node))}</span></div>
+        <div class="muted" style="font-size:11px">${esc(node.project_slug || "")} · ${esc(node.model_profile || "sin perfil")} · ${esc(context)} · tokenizer ${esc(node.tokenizer_status || "HEURISTIC")}</div>
+        <div class="muted" style="font-size:11px">Último heartbeat: ${esc(node.last_heartbeat ? new Date(node.last_heartbeat).toLocaleString() : "—")}</div>
+      </div>
+    </div>`;
+  }).join("") : '<div class="muted" style="font-size:12px">No hay agentes registrados en este proyecto.</div>';
+
+  $("flowTasks").innerHTML = tasks.length ? tasks.map(task => `<tr>
+    <td>${esc(task.title || "—")}</td>
+    <td><span class="pill ${task.status === "CONFLICT" ? "bad" : task.status === "IN_PROGRESS" ? "warn" : ""}">${esc(task.status || "—")}</span></td>
+    <td class="mono" style="font-size:11px">${esc(task.assigned_session_id ? task.assigned_session_id.slice(0, 8) : "—")}</td>
+    <td>${esc(task.task_kind || "IMPLEMENT")}</td>
+    <td class="muted" style="font-size:11px">${esc(task.estimated_input_tokens || 0)} / ${esc(task.max_input_tokens || 0)}</td>
+  </tr>`).join("") : '<tr><td colspan="5" class="muted">Sin tareas abiertas.</td></tr>';
+
+  $("flowEvents").textContent = events.length
+    ? events.map(e => `[${e.created_at ? new Date(e.created_at).toLocaleString() : "—"}] ${e.event_type}${e.source_session_id ? " · " + e.source_session_id.slice(0, 8) : ""}`).join("\n")
+    : "Sin actividad reciente.";
 }
 
 async function startSession(projectId, btn) {
@@ -2630,6 +2740,8 @@ function bindStaticEvents() {
   $("usersRefresh").onclick = () => loadAdminUsers();
   $("userSearch").oninput = renderAdminUsers;
   $("myRefresh").onclick = () => refreshProjects().catch(err => toast(err.message, "bad"));
+  $("flowRefresh").onclick = () => loadAgentFlow();
+  $("flowProject").onchange = () => loadAgentFlow();
   $("smtpSave").onclick = () => saveSmtp(false);
   $("smtpSaveTest").onclick = () => saveSmtp(true);
   $("smtpTest").onclick = sendSmtpTest;

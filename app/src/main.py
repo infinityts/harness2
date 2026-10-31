@@ -2146,6 +2146,53 @@ def war_room_topology():
     return get_topology(engine)
 
 
+@app.get("/api/v1/agent-flow")
+def get_agent_flow(
+    project_id: Optional[str] = Query(default=None),
+    auth: Dict[str, Any] = Depends(verify_portal_or_admin),
+):
+    """Vista de solo lectura para ingenieros: agentes y tareas de sus proyectos."""
+    if project_id:
+        try:
+            uuid.UUID(project_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid project_id")
+    is_admin = auth.get("role_name") == "ADMIN"
+    if is_admin:
+        allowed: Optional[List[str]] = [project_id] if project_id else None
+        if project_id:
+            with engine.connect() as conn:
+                exists = conn.execute(
+                    sa.text("SELECT 1 FROM harness_projects WHERE id = CAST(:pid AS UUID)"),
+                    {"pid": project_id},
+                ).fetchone()
+            if not exists:
+                raise HTTPException(status_code=404, detail="Project not found")
+    else:
+        uid = auth.get("user_id")
+        if not uid:
+            raise HTTPException(status_code=403, detail="Engineer user required")
+        with engine.connect() as conn:
+            allowed = [
+                row[0] for row in conn.execute(
+                    sa.text("""
+                        SELECT project_id::text
+                        FROM project_memberships
+                        WHERE user_id = CAST(:uid AS UUID) AND status = 'APPROVED'
+                    """),
+                    {"uid": uid},
+                ).fetchall()
+            ]
+        if project_id:
+            if project_id not in allowed:
+                raise HTTPException(status_code=403, detail="Project access not approved")
+            allowed = [project_id]
+    data = get_topology(engine, allowed)
+    data["scope"] = "admin" if is_admin else "member"
+    data["project_ids"] = allowed
+    return data
+
+
 @app.post("/api/v1/war-room/relay")
 async def relay_agent_message(payload: WarRoomRelayRequest, auth: Dict[str, Any] = Depends(verify_auth)):
     if auth["role"] != "agent":
