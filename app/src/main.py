@@ -2327,6 +2327,18 @@ def download_bridge():
     )
 
 
+@app.get("/api/v1/client/minimax-presence.ps1", response_class=PlainTextResponse)
+def download_minimax_presence():
+    script_path = Path(__file__).resolve().parent.parent / "client" / "install_minimax_presence.ps1"
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail="installer not found")
+    return PlainTextResponse(
+        script_path.read_text(encoding="utf-8"),
+        media_type="text/plain",
+        headers={"Content-Disposition": 'attachment; filename="install_minimax_presence.ps1"'},
+    )
+
+
 @app.post("/api/v1/tasks/{task_id}/reopen-from-main")
 async def reopen_task_from_main(task_id: str, auth: Dict[str, Any] = Depends(verify_auth)):
     with engine.connect() as conn:

@@ -128,6 +128,41 @@ Recomendaciones:
 - si usas `mcode exec` one-shot, la tarea se ejecuta y luego la sesión puede
   volver a `OFFLINE` si no queda presencia.
 
+### Automatizar presence en Windows
+
+Harness2 sirve el instalador:
+
+```powershell
+curl.exe -fsSL http://11.0.0.3:8444/api/v1/client/minimax-presence.ps1 `
+  -o install_minimax_presence.ps1
+
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\install_minimax_presence.ps1
+```
+
+El instalador:
+
+- lee `%USERPROFILE%\.minimax\mcp.json`;
+- valida que el bridge use ruta absoluta;
+- crea un wrapper en `%LOCALAPPDATA%\Harness2`;
+- agrega un arranque automático al iniciar sesión;
+- escribe logs en `%LOCALAPPDATA%\Harness2\minimax-presence.log`;
+- no guarda la session key: la lee del `mcp.json` en cada arranque.
+
+Para iniciarlo ahora sin cerrar sesión:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File "$env:LOCALAPPDATA\Harness2\minimax-presence.ps1"
+```
+
+Desinstalar:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File .\install_minimax_presence.ps1 -Uninstall
+```
+
 ## Ejecución
 
 Dentro del repositorio del proyecto:
