@@ -632,6 +632,7 @@ const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const STATUS_COLORS = { ONLINE:"#34d399", BUSY:"#fbbf24", OFFLINE:"#8fa3c4", REVOKED:"#f87171" };
 const TOOL_LABELS = { opencode:"OpenCode", claudecode:"Claude Code", cursor:"Cursor", hermes:"Hermes", pi:"Pi", minimaxcode:"MiniMax Code", custom:"Custom", "headless-worker":"Docs Curator" };
+const PROVIDER_LABELS = { "cloud-llm":"Otro cloud", "local-llm":"Local / on-prem", openai:"OpenAI", anthropic:"Anthropic", deepseek:"DeepSeek", minimax:"MiniMax", custom:"Otro compatible" };
 const SKILL_CATEGORY_LABELS = { backend:"Backend / APIs", frontend:"Frontend / UI", database:"Base de datos", documents:"Documentos", writing:"Redacción", qa:"QA / Testing", devops:"DevOps", security:"Seguridad", general:"General" };
 const state = {
   token: null, adminKey: null, user: null, role: null, mfaEnrollmentToken: null,
@@ -1349,7 +1350,7 @@ function renderMyProjects() {
       <div class="stack" style="gap:8px;margin-top:6px">
         <div class="grid-2">
           <div class="field"><label>Herramienta</label><select class="session-tool">${Object.entries(TOOL_LABELS).filter(([k]) => k !== "custom").map(([k,v]) => `<option value="${k}">${v}</option>`).join("")}</select></div>
-          <div class="field"><label>Proveedor</label><select class="session-provider"><option value="cloud-llm">Cloud</option><option value="local-llm">Local</option><option value="minimax">MiniMax</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="custom">Custom</option></select></div>
+          <div class="field"><label>Proveedor</label><select class="session-provider"><option value="cloud-llm">Otro cloud</option><option value="local-llm">Local / on-prem</option><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="deepseek">DeepSeek</option><option value="minimax">MiniMax</option><option value="custom">Otro compatible</option></select></div>
           <div class="field"><label>Perfil</label><select class="session-profile"><option value="">Auto</option><option value="local-32k">Local 32k</option><option value="local-64k">Local 64k</option><option value="local-120k">Local 120k</option><option value="cloud-128k">Cloud 128k</option><option value="minimax-m3.1-flash">MiniMax M3.1</option></select></div>
           <div class="field"><label>Contexto máximo</label><input class="session-max" type="number" min="1024" value="32000"></div>
         </div>
@@ -1623,7 +1624,7 @@ function renderWarInspector() {
   box.innerHTML = `<div class="stack" style="gap:8px">
     <div class="row"><b style="flex:1">${esc(node.engineer_username)}</b>${node.is_headless_worker ? '<span class="pill info">HEADLESS DOC</span>' : ""}${sessionPill(node.status)}</div>
     <div class="muted mono" style="font-size:11px">${esc(node.session_id)}</div>
-    <div class="row"><span class="pill">${esc(TOOL_LABELS[node.agent_tool] || node.agent_tool)}</span><span class="pill">${esc(node.llm_provider || "—")}</span><span class="pill info">${esc(node.project_slug || "sin proyecto")}</span><span class="pill">${esc(node.model_profile || "local-32k")}</span><span class="pill ${node.tokenizer_status === "EXACT" ? "ok" : node.tokenizer_status === "CALIBRATED" ? "warn" : ""}">${esc(node.tokenizer_status || "HEURISTIC")}</span></div>
+    <div class="row"><span class="pill">${esc(TOOL_LABELS[node.agent_tool] || node.agent_tool)}</span><span class="pill">${esc(PROVIDER_LABELS[node.llm_provider] || node.llm_provider || "—")}</span><span class="pill info">${esc(node.project_slug || "sin proyecto")}</span><span class="pill">${esc(node.model_profile || "local-32k")}</span><span class="pill ${node.tokenizer_status === "EXACT" ? "ok" : node.tokenizer_status === "CALIBRATED" ? "warn" : ""}">${esc(node.tokenizer_status || "HEURISTIC")}</span></div>
     <div style="font-size:12px">Contexto: <b>${esc(node.current_context_tokens)}</b> / ${esc(node.max_context_tokens)} tokens · compactaciones: ${esc(node.context_compactions || 0)}</div>
     <div style="font-size:12px">Skills: ${(node.skills || []).map(s => `<span class="pill">${esc(s)}</span>`).join(" ") || '<span class="muted">—</span>'}</div>
     <div style="font-size:12px">Reglas: ${(node.system_contract_rules || []).map(s => `<span class="pill warn">${esc(s)}</span>`).join(" ") || '<span class="muted">—</span>'}</div>
