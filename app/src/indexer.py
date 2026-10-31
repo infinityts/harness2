@@ -1,6 +1,7 @@
 import os
 import re
 import ast
+import base64
 import math
 import json
 import hashlib
@@ -24,6 +25,8 @@ ALLOWED_GIT_HOSTS = {
     for h in os.getenv("ALLOWED_GIT_HOSTS", "github.com,gitlab.com,bitbucket.org").split(",")
     if h.strip()
 }
+GIT_HTTP_TOKEN = os.getenv("HARNESS_GIT_TOKEN") or os.getenv("GITHUB_TOKEN") or ""
+GIT_HTTP_USER = os.getenv("HARNESS_GIT_USER", "x-access-token")
 
 IGNORED_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build", "target", ".idea", ".vscode"}
 SUPPORTED_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".go", ".sql", ".md"}
@@ -79,9 +82,25 @@ def validate_repo_url(repo_url: Optional[str]) -> Optional[str]:
     return repo_url
 
 
+def _git_auth_env() -> Dict[str, str]:
+    """Inyecta un PAT de GitHub sin exponerlo en argv."""
+    if not GIT_HTTP_TOKEN:
+        return {}
+    token = base64.b64encode(
+        f"{GIT_HTTP_USER}:{GIT_HTTP_TOKEN}".encode("utf-8")
+    ).decode("ascii")
+    return {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+        "GIT_CONFIG_VALUE_0": f"Authorization: Basic {token}",
+    }
+
+
 def _run_git(args: List[str], cwd: Optional[str] = None, check: bool = True) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env.update(_git_auth_env())
     try:
-        return subprocess.run(args, cwd=cwd, check=check, capture_output=True, text=True)
+        return subprocess.run(args, cwd=cwd, check=check, capture_output=True, text=True, env=env)
     except FileNotFoundError as exc:
         raise RuntimeError("git no esta instalado en el contenedor") from exc
     except subprocess.CalledProcessError as exc:
@@ -263,10 +282,50 @@ def _ensure_project_repo_locked(repo_name: str, repo_url: Optional[str] = None, 
 
     if repo_url:
         if not repo_path.exists():
-            _run_git(["git", "clone", "-b", branch, repo_url, str(repo_path)])
+            try:
+                _run_git(["git", "clone", "-b", branch, repo_url, str(repo_path)])
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"No se pudo clonar {repo_url}. Verifica la URL, la rama '{branch}' "
+                    f"y las credenciales Git del servidor. Detalle: {exc}"
+                ) from exc
         else:
-            _run_git(["git", "fetch", "--all"], cwd=str(repo_path), check=False)
+            # Directorio existente: puede ser un repo valido o un intento previo
+            # que creo el directorio pero no .git.
+            if not (repo_path / ".git").exists():
+                extras = sorted(
+                    item.name for item in repo_path.iterdir()
+                    if item.name not in (".harness.lock", "README.md")
+                )
+                if extras:
+                    raise RuntimeError(
+                        f"El directorio {repo_path} existe pero no es un repositorio Git "
+                        f"y contiene archivos: {', '.join(extras)}. "
+                        "Muevelos o elimina el directorio antes de reintentar."
+                    )
+                readme = repo_path / "README.md"
+                if readme.exists():
+                    readme.unlink()
+                _run_git(["git", "init", "-b", branch], cwd=str(repo_path))
+                _run_git(["git", "remote", "add", "origin", repo_url], cwd=str(repo_path))
+            _run_git(["git", "fetch", "--all", "--prune"], cwd=str(repo_path), check=False)
             _run_git(["git", "checkout", branch], cwd=str(repo_path), check=False)
+            head = _run_git(["git", "rev-parse", "--verify", "HEAD"], cwd=str(repo_path), check=False)
+            if head.returncode != 0:
+                try:
+                    _run_git(["git", "fetch", "origin", branch], cwd=str(repo_path))
+                    _run_git(["git", "checkout", "-B", branch, "FETCH_HEAD"], cwd=str(repo_path))
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        f"No se pudo preparar el repositorio {repo_url} en {repo_path}. "
+                        f"Verifica la URL, la rama '{branch}' y las credenciales Git. Detalle: {exc}"
+                    ) from exc
+                head = _run_git(["git", "rev-parse", "--verify", "HEAD"], cwd=str(repo_path), check=False)
+                if head.returncode != 0:
+                    raise RuntimeError(
+                        f"El repositorio {repo_url} no dejo un HEAD valido en {repo_path}. "
+                        "Verifica la rama y el contenido remoto."
+                    )
     else:
         if not repo_path.exists():
             repo_path.mkdir(parents=True, exist_ok=True)
@@ -277,6 +336,11 @@ def _ensure_project_repo_locked(repo_name: str, repo_url: Optional[str] = None, 
 
     head = _run_git(["git", "rev-parse", "--verify", "HEAD"], cwd=str(repo_path), check=False)
     if head.returncode != 0:
+        if not (repo_path / ".git").exists():
+            raise RuntimeError(
+                f"El directorio {repo_path} no es un repositorio Git valido. "
+                "No se puede crear el commit inicial."
+            )
         readme = repo_path / "README.md"
         if not readme.exists():
             readme.write_text(

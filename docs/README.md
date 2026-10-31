@@ -25,6 +25,10 @@
 
 - [MiniMax Code en Harness2](MINIMAX-CODE.md)
 
+## Operación de repositorios
+
+- [Repositorios Git y credenciales](GIT-REPOSITORIES.md)
+
 ## Licenciamiento y pool Hermes
 
 - [Operación consolidada de licenciamiento](LICENSING-OPERATIONS.md)
