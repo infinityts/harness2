@@ -266,7 +266,12 @@ WAR_ROOM_HTML = r"""<!doctype html>
         <form id="loginForm" class="stack" style="gap:12px">
           <div class="field"><label for="loginEmail">Email</label><input id="loginEmail" type="email" autocomplete="username" placeholder="dev1@empresa.com" required></div>
           <div class="field"><label for="loginPassword">Contraseña</label><input id="loginPassword" type="password" autocomplete="current-password" placeholder="••••••••" required></div>
-          <div class="field"><label for="loginTotp">Código MFA <span class="muted">(operador de licencia)</span></label><input id="loginTotp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456"></div>
+          <div id="loginMfaWrap" class="field hidden">
+            <label for="loginTotp">Código MFA</label>
+            <input id="loginTotp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456">
+            <div class="login-note">Solo para operadores de licencia. Si tu cuenta no tiene MFA configurado, deja este campo vacío.</div>
+          </div>
+          <button id="loginMfaToggle" class="login-note" type="button" style="background:none;border:0;padding:0;text-align:left;cursor:pointer;color:var(--accent);width:fit-content">¿Operador de licencia? Añadir MFA</button>
           <button id="loginBtn" class="btn primary" type="submit" style="width:100%;padding:11px">Entrar al Portal</button>
         </form>
       </div>
@@ -635,17 +640,31 @@ async function api(path, options = {}) {
   let data = null;
   try { data = text ? JSON.parse(text) : null; } catch { data = text; }
   if (!res.ok) {
-    const detail = data && typeof data === "object" ? (data.detail || JSON.stringify(data)) : String(data || res.statusText);
-    throw new Error(res.status + " · " + detail);
+    const detail = data && typeof data === "object" ? (data.detail || data) : String(data || res.statusText);
+    const message = typeof detail === "string" ? detail : (detail && detail.message ? detail.message : JSON.stringify(detail));
+    const error = new Error(res.status + " · " + message);
+    error.status = res.status;
+    error.detail = detail;
+    throw error;
   }
   return data;
 }
 
-function showLogin(message = "") {
+function showMfa(visible) {
+  const wrap = $("loginMfaWrap");
+  if (!wrap) return;
+  wrap.classList.toggle("hidden", !visible);
+  const toggle = $("loginMfaToggle");
+  if (toggle) toggle.textContent = visible ? "Ocultar MFA" : "¿Operador de licencia? Añadir MFA";
+  if (!visible) $("loginTotp").value = "";
+}
+
+function showLogin(message = "", resetMfa = true) {
   $("appView").classList.add("hidden");
   $("loginView").classList.remove("hidden");
   $("loginError").textContent = message;
   $("loginError").classList.toggle("hidden", !message);
+  if (resetMfa) showMfa(false);
   if (state.ws) { try { state.ws.close(); } catch {} state.ws = null; }
   if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
 }
@@ -657,6 +676,7 @@ function setLoginTab(which) {
   $("loginEmailPane").classList.toggle("hidden", !email);
   $("loginKeyPane").classList.toggle("hidden", email);
   $("loginError").classList.add("hidden");
+  if (!email) showMfa(false);
 }
 
 function capital(v) { return String(v || "?").slice(0, 2).toUpperCase(); }
@@ -719,7 +739,8 @@ async function doEmailLogin(event) {
   event.preventDefault();
   const email = $("loginEmail").value.trim();
   const password = $("loginPassword").value;
-  const totpCode = $("loginTotp").value.trim();
+  const mfaVisible = !$("loginMfaWrap").classList.contains("hidden");
+  const totpCode = mfaVisible ? $("loginTotp").value.trim() : "";
   if (!email || !password) { showLogin("Completa email y contraseña."); return; }
   $("loginBtn").disabled = true;
   try {
@@ -733,9 +754,21 @@ async function doEmailLogin(event) {
     sessionStorage.setItem("harness.token", state.token);
     $("loginPassword").value = "";
     $("loginTotp").value = "";
+    showMfa(false);
     await enterApp();
   } catch (err) {
-    showLogin(err.message);
+    const detail = err.detail || {};
+    const code = detail.code || "";
+    if (code === "MFA_REQUIRED") {
+      showMfa(true);
+      showLogin("Esta cuenta requiere MFA. Ingresa el código de 6 dígitos de tu app autenticadora.", false);
+      $("loginTotp").focus();
+    } else if (code === "MFA_INVALID" || code === "MFA_REPLAY" || code === "ACCOUNT_LOCKED") {
+      showMfa(true);
+      showLogin(detail.message || err.message, false);
+    } else {
+      showLogin(err.message);
+    }
   } finally {
     $("loginBtn").disabled = false;
   }
@@ -2373,6 +2406,7 @@ async function toggleProjectSlot(projectId, active) {
 
 function bindStaticEvents() {
   $("loginForm").addEventListener("submit", doEmailLogin);
+  $("loginMfaToggle").onclick = () => showMfa($("loginMfaWrap").classList.contains("hidden"));
   $("loginTabEmail").onclick = () => setLoginTab("email");
   $("loginTabKey").onclick = () => setLoginTab("key");
   $("adminKeyBtn").onclick = doKeyLogin;
