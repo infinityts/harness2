@@ -8,6 +8,8 @@ import hashlib
 import ipaddress
 import socket
 import subprocess
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse
@@ -16,6 +18,7 @@ import urllib.request
 import sqlalchemy as sa
 
 from src.repo_lock import repo_lock
+from src.security import open_secret
 
 REPOS_BASE_DIR = Path(os.getenv("HARNESS_REPOS_DIR", "/var/lib/harness/repos"))
 EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL", "")
@@ -27,6 +30,7 @@ ALLOWED_GIT_HOSTS = {
 }
 GIT_HTTP_TOKEN = os.getenv("HARNESS_GIT_TOKEN") or os.getenv("GITHUB_TOKEN") or ""
 GIT_HTTP_USER = os.getenv("HARNESS_GIT_USER", "x-access-token")
+_GIT_CREDENTIAL: ContextVar[Optional[Dict[str, str]]] = ContextVar("harness_git_credential", default=None)
 
 IGNORED_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", "dist", "build", "target", ".idea", ".vscode"}
 SUPPORTED_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx", ".rs", ".go", ".sql", ".md"}
@@ -83,17 +87,41 @@ def validate_repo_url(repo_url: Optional[str]) -> Optional[str]:
 
 
 def _git_auth_env() -> Dict[str, str]:
-    """Inyecta un PAT de GitHub sin exponerlo en argv."""
-    if not GIT_HTTP_TOKEN:
+    """Inyecta un PAT de Git sin exponerlo en argv.
+
+    Prioriza la credencial del proyecto (contextvar) y cae al token global.
+    """
+    credential = _GIT_CREDENTIAL.get() or {}
+    token = credential.get("token") or GIT_HTTP_TOKEN
+    if not token:
         return {}
-    token = base64.b64encode(
-        f"{GIT_HTTP_USER}:{GIT_HTTP_TOKEN}".encode("utf-8")
+    host = credential.get("host") or "github.com"
+    username = credential.get("username") or GIT_HTTP_USER
+    encoded = base64.b64encode(
+        f"{username}:{token}".encode("utf-8")
     ).decode("ascii")
     return {
         "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
-        "GIT_CONFIG_VALUE_0": f"Authorization: Basic {token}",
+        "GIT_CONFIG_KEY_0": f"http.https://{host}/.extraheader",
+        "GIT_CONFIG_VALUE_0": f"Authorization: Basic {encoded}",
     }
+
+
+@contextmanager
+def _git_credential(token: Optional[str], repo_url: Optional[str], username: Optional[str] = None):
+    if not token:
+        yield
+        return
+    host = urlparse(repo_url or "").hostname or "github.com"
+    cv = _GIT_CREDENTIAL.set({
+        "token": token,
+        "host": host,
+        "username": username or GIT_HTTP_USER,
+    })
+    try:
+        yield
+    finally:
+        _GIT_CREDENTIAL.reset(cv)
 
 
 def _run_git(args: List[str], cwd: Optional[str] = None, check: bool = True) -> subprocess.CompletedProcess:
@@ -264,10 +292,17 @@ def parse_generic_code(source: str, ext: str) -> Dict[str, Any]:
     return {"imports": sorted(list(set(imports))), "symbols": symbols}
 
 
-def ensure_project_repo(repo_name: str, repo_url: Optional[str] = None, branch: str = "main") -> Path:
+def ensure_project_repo(
+    repo_name: str,
+    repo_url: Optional[str] = None,
+    branch: str = "main",
+    git_token: Optional[str] = None,
+    git_username: Optional[str] = None,
+) -> Path:
     """Crea/clona el repo del proyecto y garantiza que exista un HEAD (README inicial)."""
     with repo_lock(repo_name):
-        return _ensure_project_repo_locked(repo_name, repo_url, branch)
+        with _git_credential(git_token, repo_url, git_username):
+            return _ensure_project_repo_locked(repo_name, repo_url, branch)
 
 
 def _ensure_project_repo_locked(repo_name: str, repo_url: Optional[str] = None, branch: str = "main") -> Path:
@@ -356,7 +391,18 @@ def _ensure_project_repo_locked(repo_name: str, repo_url: Optional[str] = None, 
     return repo_path
 
 
-def ensure_git_repo(repo_name: str, repo_url: Optional[str], branch: str) -> Path:
+def ensure_git_repo(
+    repo_name: str,
+    repo_url: Optional[str],
+    branch: str,
+    git_token: Optional[str] = None,
+    git_username: Optional[str] = None,
+) -> Path:
+    with _git_credential(git_token, repo_url, git_username):
+        return _ensure_git_repo_credentialed(repo_name, repo_url, branch)
+
+
+def _ensure_git_repo_credentialed(repo_name: str, repo_url: Optional[str], branch: str) -> Path:
     repo_name = validate_repo_name(repo_name)
     repo_url = validate_repo_url(repo_url)
 
@@ -389,14 +435,46 @@ def get_head_commit_sha(repo_path: Path) -> str:
         return "0" * 40
 
 
-def index_repository(engine: sa.Engine, repo_name: str, repo_url: Optional[str] = None, branch: str = "main") -> Dict[str, Any]:
+def index_repository(
+    engine: sa.Engine,
+    repo_name: str,
+    repo_url: Optional[str] = None,
+    branch: Optional[str] = None,
+    git_token: Optional[str] = None,
+    git_username: Optional[str] = None,
+) -> Dict[str, Any]:
     # Lock distribuido: flock entre procesos + RLock intra-proceso.
     with repo_lock(repo_name):
-        return _index_repository_locked(engine, repo_name, repo_url, branch)
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.text("""
+                    SELECT repo_url, default_branch, git_auth_type,
+                           git_token_vault, git_username
+                    FROM harness_projects
+                    WHERE project_slug = :slug
+                """),
+                {"slug": repo_name},
+            ).mappings().first()
+        if row:
+            repo_url = repo_url or row["repo_url"]
+            branch = branch or row["default_branch"]
+            if not git_token and row["git_auth_type"] == "token":
+                git_token = open_secret(row["git_token_vault"] or "")
+                git_username = git_username or row["git_username"]
+        return _index_repository_locked(
+            engine, repo_name, repo_url, branch or "main", git_token, git_username
+        )
 
 
-def _index_repository_locked(engine: sa.Engine, repo_name: str, repo_url: Optional[str] = None, branch: str = "main") -> Dict[str, Any]:
-    repo_path = ensure_git_repo(repo_name, repo_url, branch)
+def _index_repository_locked(
+    engine: sa.Engine,
+    repo_name: str,
+    repo_url: Optional[str] = None,
+    branch: str = "main",
+    git_token: Optional[str] = None,
+    git_username: Optional[str] = None,
+) -> Dict[str, Any]:
+    repo_path = ensure_git_repo(repo_name, repo_url, branch, git_token, git_username)
     commit_sha = get_head_commit_sha(repo_path)
 
     files_indexed = 0

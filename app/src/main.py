@@ -2749,6 +2749,13 @@ class ProjectCreateRequest(BaseModel):
     description: Optional[str] = None
     repo_url: Optional[str] = None
     default_branch: str = Field(default="main", max_length=80)
+    git_token: Optional[str] = Field(default=None, max_length=500)
+    git_username: Optional[str] = Field(default=None, max_length=150)
+
+
+class ProjectGitCredentialRequest(BaseModel):
+    git_token: str = Field(..., min_length=8, max_length=500)
+    git_username: Optional[str] = Field(default=None, max_length=150)
 
 
 class ProjectMemberRequest(BaseModel):
@@ -3173,6 +3180,8 @@ def create_project(payload: ProjectCreateRequest, auth: Dict[str, Any] = Depends
         repo_url = validate_repo_url(payload.repo_url)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    if payload.git_token and not repo_url:
+        raise HTTPException(status_code=400, detail="git_token requiere repo_url")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", payload.default_branch):
         raise HTTPException(status_code=400, detail="Invalid default_branch")
     with engine.connect() as conn:
@@ -3187,17 +3196,27 @@ def create_project(payload: ProjectCreateRequest, auth: Dict[str, Any] = Depends
         assert_hermes_slot_available(conn, policy)
 
     try:
-        ensure_project_repo(slug, repo_url, payload.default_branch)
+        ensure_project_repo(
+            slug, repo_url, payload.default_branch,
+            git_token=payload.git_token, git_username=payload.git_username,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Repository setup failed: {exc}")
     try:
-        index_result = index_repository(engine, slug)
+        index_result = index_repository(
+            engine, slug, branch=payload.default_branch,
+            git_token=payload.git_token, git_username=payload.git_username,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Initial index failed: {exc}")
 
     try:
+        git_token = payload.git_token or None
+        git_auth_type = "token" if git_token else "none"
+        git_token_vault = seal_secret(git_token) if git_token else None
+        git_token_hint = git_token[-4:] if git_token else None
         with engine.begin() as conn:
             policy = get_policy(conn, for_update=True)
             assert_project_slot_available(conn, policy)
@@ -3206,12 +3225,17 @@ def create_project(payload: ProjectCreateRequest, auth: Dict[str, Any] = Depends
                 sa.text("""
                     INSERT INTO harness_projects
                         (id, project_slug, display_name, description, repo_url,
-                         default_branch, created_by_user_id, is_active_slot)
+                         default_branch, created_by_user_id, is_active_slot,
+                         git_auth_type, git_token_vault, git_username,
+                         git_token_hint, git_credential_updated_at)
                     VALUES
                         (CAST(:id AS UUID), :slug, :display_name, :description, :repo_url,
-                         :branch, CAST(:created_by AS UUID), true)
+                         :branch, CAST(:created_by AS UUID), true,
+                         :git_auth_type, :git_token_vault, :git_username,
+                         :git_token_hint, :git_credential_updated_at)
                     RETURNING id::text, project_slug, display_name, description, repo_url,
-                              default_branch, created_by_user_id::text, created_at, is_active_slot
+                              default_branch, created_by_user_id::text, created_at, is_active_slot,
+                              git_auth_type, git_token_hint
                 """),
                 {
                     "id": str(uuid.uuid4()),
@@ -3221,8 +3245,15 @@ def create_project(payload: ProjectCreateRequest, auth: Dict[str, Any] = Depends
                     "repo_url": repo_url,
                     "branch": payload.default_branch,
                     "created_by": auth.get("user_id"),
+                    "git_auth_type": git_auth_type,
+                    "git_token_vault": git_token_vault,
+                    "git_username": payload.git_username or ("x-access-token" if git_token else None),
+                    "git_token_hint": git_token_hint,
+                    "git_credential_updated_at": datetime.now(timezone.utc) if git_token else None,
                 }
             ).mappings().fetchone()
+            project = dict(project)
+            project["git_token_set"] = bool(project.get("git_token_hint"))
             if auth.get("user_id"):
                 conn.execute(
                     sa.text("""
@@ -3277,6 +3308,102 @@ def create_project(payload: ProjectCreateRequest, auth: Dict[str, Any] = Depends
     }
 
 
+@app.put("/api/v1/projects/{project_id}/git-credential")
+def set_project_git_credential(
+    project_id: str,
+    payload: ProjectGitCredentialRequest,
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    with engine.begin() as conn:
+        project = conn.execute(
+            sa.text("""
+                SELECT id::text, project_slug, repo_url
+                FROM harness_projects
+                WHERE id = CAST(:pid AS UUID)
+                FOR UPDATE
+            """),
+            {"pid": project_id},
+        ).mappings().first()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if not project["repo_url"]:
+            raise HTTPException(status_code=400, detail="Project has no repo_url")
+        token = payload.git_token.strip()
+        hint = token[-4:]
+        conn.execute(
+            sa.text("""
+                UPDATE harness_projects
+                SET git_auth_type = 'token',
+                    git_token_vault = :vault,
+                    git_username = :username,
+                    git_token_hint = :hint,
+                    git_credential_updated_at = NOW()
+                WHERE id = CAST(:pid AS UUID)
+            """),
+            {
+                "vault": seal_secret(token),
+                "username": payload.git_username or "x-access-token",
+                "hint": hint,
+                "pid": project_id,
+            },
+        )
+    record_event(engine, "PROJECT_GIT_CREDENTIAL_UPDATED", {
+        "project_id": project_id,
+        "project_slug": project["project_slug"],
+        "git_token_hint": hint,
+        "actor": auth.get("email") or "admin",
+    })
+    return {
+        "project_id": project_id,
+        "project_slug": project["project_slug"],
+        "git_auth_type": "token",
+        "git_token_set": True,
+        "git_token_hint": hint,
+    }
+
+
+@app.delete("/api/v1/projects/{project_id}/git-credential")
+def delete_project_git_credential(
+    project_id: str,
+    auth: Dict[str, Any] = Depends(verify_portal_admin),
+):
+    with engine.begin() as conn:
+        project = conn.execute(
+            sa.text("""
+                SELECT id::text, project_slug
+                FROM harness_projects
+                WHERE id = CAST(:pid AS UUID)
+                FOR UPDATE
+            """),
+            {"pid": project_id},
+        ).mappings().first()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        conn.execute(
+            sa.text("""
+                UPDATE harness_projects
+                SET git_auth_type = 'none',
+                    git_token_vault = NULL,
+                    git_username = NULL,
+                    git_token_hint = NULL,
+                    git_credential_updated_at = NOW()
+                WHERE id = CAST(:pid AS UUID)
+            """),
+            {"pid": project_id},
+        )
+    record_event(engine, "PROJECT_GIT_CREDENTIAL_REMOVED", {
+        "project_id": project_id,
+        "project_slug": project["project_slug"],
+        "actor": auth.get("email") or "admin",
+    })
+    return {
+        "project_id": project_id,
+        "project_slug": project["project_slug"],
+        "git_auth_type": "none",
+        "git_token_set": False,
+    }
+
+
 @app.get("/api/v1/projects")
 def list_projects(auth: Dict[str, Any] = Depends(verify_portal_or_admin)):
     is_admin = auth["role_name"] == "ADMIN"
@@ -3285,14 +3412,15 @@ def list_projects(auth: Dict[str, Any] = Depends(verify_portal_or_admin)):
         if is_admin:
             projects = conn.execute(sa.text("""
                 SELECT id::text, project_slug, display_name, description, repo_url, default_branch,
-                       created_by_user_id::text, created_at, is_active_slot
+                       created_by_user_id::text, created_at, is_active_slot,
+                       git_auth_type, git_token_hint
                 FROM harness_projects ORDER BY project_slug
             """)).mappings().all()
         else:
             projects = conn.execute(sa.text("""
                 SELECT p.id::text, p.project_slug, p.display_name, p.description, p.repo_url,
                        p.default_branch, p.created_by_user_id::text, p.created_at,
-                       p.is_active_slot,
+                       p.is_active_slot, p.git_auth_type, p.git_token_hint,
                        m.allowed_skills, m.status AS membership_status
                 FROM harness_projects p
                 JOIN project_memberships m ON m.project_id = p.id
@@ -3303,6 +3431,7 @@ def list_projects(auth: Dict[str, Any] = Depends(verify_portal_or_admin)):
         result = []
         for project in projects:
             item = dict(project)
+            item["git_token_set"] = bool(item.get("git_token_hint"))
             worker = conn.execute(sa.text("""
                 SELECT s.id::text, s.status, s.agent_tool, s.worker_role,
                        s.current_context_tokens, s.max_context_tokens, s.last_heartbeat

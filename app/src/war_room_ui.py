@@ -992,10 +992,10 @@ function renderProjects() {
     return `<article class="card project-card">
       <div class="row"><div style="flex:1;min-width:0"><h2>${esc(p.display_name)}</h2><div class="muted mono" style="font-size:12px">${esc(p.project_slug)}</div></div><span class="pill ${p.is_active_slot ? "ok" : "bad"}">${p.is_active_slot ? "Slot activo" : "Slot inactivo"}</span><span class="pill ${sessions.length ? "ok" : ""}">${sessions.length} sesiones activas</span></div>
       <div class="muted" style="font-size:12.5px">${esc(p.description || "Sin descripción")}</div>
-      <div class="meta"><span class="pill">${esc(p.default_branch || "main")}</span>${p.repo_url ? `<span class="pill info">repo remoto</span>` : `<span class="pill">repo local</span>`}<span class="pill">${members.length} miembros</span>${worker ? `<span class="pill ${worker.status === "ONLINE" || worker.status === "BUSY" ? "ok" : "warn"}">Hermes ${esc(worker.status)}</span>` : '<span class="pill">Hermes sin worker</span>'}</div>
+      <div class="meta"><span class="pill">${esc(p.default_branch || "main")}</span>${p.repo_url ? `<span class="pill info">repo remoto</span>` : `<span class="pill">repo local</span>`}${p.git_auth_type === "token" ? `<span class="pill ok">Git token ••••${esc(p.git_token_hint || "")}</span>` : (p.repo_url ? `<span class="pill warn">Git sin token</span>` : "")}<span class="pill">${members.length} miembros</span>${worker ? `<span class="pill ${worker.status === "ONLINE" || worker.status === "BUSY" ? "ok" : "warn"}">Hermes ${esc(worker.status)}</span>` : '<span class="pill">Hermes sin worker</span>'}</div>
       <div class="divider"></div>
       <div><div class="side-label" style="padding:0 0 6px">Miembros aprobados</div>${members.length ? members.map(m => `<div class="row" style="justify-content:space-between;font-size:12px;padding:2px 0"><span>${esc(m.email)}</span><span class="muted">${esc((m.allowed_skills || []).join(", ") || "sin skills")}</span></div>`).join("") : '<div class="muted" style="font-size:12px">Sin miembros</div>'}</div>
-      <div class="row" style="margin-top:auto"><button class="btn sm" data-war-pid="${esc(p.id)}" type="button">Abrir War Room</button><button class="btn sm" data-toggle-slot="${esc(p.id)}" data-active="${p.is_active_slot ? "false" : "true"}" type="button">${p.is_active_slot ? "Desactivar slot" : "Activar slot"}</button></div>
+      <div class="row" style="margin-top:auto"><button class="btn sm" data-war-pid="${esc(p.id)}" type="button">Abrir War Room</button>${p.repo_url ? `<button class="btn sm" data-git-pid="${esc(p.id)}" type="button">Credencial Git</button>` : ""}<button class="btn sm" data-toggle-slot="${esc(p.id)}" data-active="${p.is_active_slot ? "false" : "true"}" type="button">${p.is_active_slot ? "Desactivar slot" : "Activar slot"}</button></div>
     </article>`;
   }).join("");
   grid.querySelectorAll("[data-war-pid]").forEach(btn => {
@@ -1004,6 +1004,64 @@ function renderProjects() {
   grid.querySelectorAll("[data-toggle-slot]").forEach(btn => {
     btn.onclick = () => toggleProjectSlot(btn.dataset.toggleSlot, btn.dataset.active === "true");
   });
+  grid.querySelectorAll("[data-git-pid]").forEach(btn => {
+    btn.onclick = () => openGitCredentialModal(btn.dataset.gitPid);
+  });
+}
+
+function openGitCredentialModal(projectId) {
+  const project = state.projects.find(p => p.id === projectId);
+  if (!project) return;
+  $("modalTitle").textContent = `Credencial Git · ${project.project_slug}`;
+  $("modalBody").innerHTML = `<div class="stack" style="gap:12px">
+    <div class="muted" style="font-size:13px">${esc(project.repo_url || "")}</div>
+    <div class="field"><label for="gToken">Token de Git</label><input id="gToken" type="password" autocomplete="new-password"></div>
+    <div class="login-note">Se guarda cifrado y no se vuelve a mostrar. Para GitHub usa Contents: Read-only.</div>
+    <div id="gitCredentialMsg" class="result-box hidden"></div>
+  </div>`;
+  $("modalActions").innerHTML = `<button id="modalCancel" class="btn ghost" type="button">Cancelar</button>${project.git_token_set ? '<button id="removeGitBtn" class="btn ghost" type="button">Quitar token</button>' : ""}<button id="saveGitBtn" class="btn primary" type="button">Guardar token</button>`;
+  $("modal").classList.remove("hidden");
+  $("modalCancel").onclick = closeModal;
+  $("saveGitBtn").onclick = () => saveGitCredential(projectId);
+  if ($("removeGitBtn")) $("removeGitBtn").onclick = () => removeGitCredential(projectId);
+  $("gToken").focus();
+}
+
+async function saveGitCredential(projectId) {
+  const token = $("gToken").value.trim();
+  const msg = $("gitCredentialMsg");
+  if (!token) {
+    msg.textContent = "Ingresa el token.";
+    msg.classList.remove("hidden");
+    return;
+  }
+  $("saveGitBtn").disabled = true;
+  try {
+    await api(`/api/v1/projects/${projectId}/git-credential`, {
+      method: "PUT",
+      body: JSON.stringify({ git_token: token }),
+    });
+    toast("Credencial Git guardada", "ok");
+    await refreshProjects();
+    closeModal();
+  } catch (err) {
+    msg.textContent = "Error: " + err.message;
+    msg.classList.remove("hidden");
+  } finally {
+    $("saveGitBtn").disabled = false;
+  }
+}
+
+async function removeGitCredential(projectId) {
+  if (!confirm("¿Quitar el token de Git de este proyecto?")) return;
+  try {
+    await api(`/api/v1/projects/${projectId}/git-credential`, { method: "DELETE" });
+    toast("Credencial Git eliminada", "ok");
+    await refreshProjects();
+    closeModal();
+  } catch (err) {
+    toast(err.message, "bad");
+  }
 }
 
 function renderProjectChoosers() {
@@ -1713,6 +1771,8 @@ function openProjectModal() {
       <div class="field"><label for="pRepo">repo_url (opcional)</label><input id="pRepo" placeholder="https://github.com/org/repo.git"></div>
       <div class="field"><label for="pBranch">default_branch</label><input id="pBranch" value="main"></div>
     </div>
+    <div class="field"><label for="pGitToken">Token de Git (solo repos privados)</label><input id="pGitToken" type="password" autocomplete="new-password"></div>
+    <div class="login-note">El token se guarda cifrado y no se vuelve a mostrar. Para GitHub usa un token con permiso Contents: Read-only.</div>
     <div class="login-note">Sin repo_url, el servidor crea el directorio, ejecuta git init -b main, crea README.md y el commit base, e indexa el proyecto en el acto.</div>
     <div id="projectFormMsg" class="result-box hidden"></div>
   </div>`;
@@ -1732,6 +1792,7 @@ async function createProject() {
     description: $("pDesc").value.trim() || null,
     repo_url: $("pRepo").value.trim() || null,
     default_branch: $("pBranch").value.trim() || "main",
+    git_token: $("pGitToken") ? ($("pGitToken").value.trim() || null) : null,
   };
   const msg = $("projectFormMsg");
   msg.classList.remove("hidden");
