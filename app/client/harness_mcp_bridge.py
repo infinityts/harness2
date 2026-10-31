@@ -891,6 +891,11 @@ def run_cli(argv):
 def main():
     parser = argparse.ArgumentParser(description="Harness MCP/CLI bridge")
     parser.add_argument("--cli", nargs=argparse.REMAINDER, help="Ejecuta una tool y sale")
+    parser.add_argument(
+        "--presence",
+        action="store_true",
+        help="Mantiene WebSocket y heartbeat sin abrir el transporte MCP stdio",
+    )
     opts = parser.parse_args()
 
     if not SESSION_ID or not SESSION_KEY:
@@ -901,6 +906,16 @@ def main():
         # Modo one-shot: no abrir WebSocket ni latidos; el proceso termina y
         # cerrar el WS marcaria OFFLINE la sesion real del agente.
         return run_cli(opts.cli)
+
+    if opts.presence:
+        log(f"presence mode: session {SESSION_ID[:8]} -> {HARNESS_URL}")
+        start_daemon()
+        try:
+            while not _stop.wait(3600):
+                pass
+        except KeyboardInterrupt:
+            _stop.set()
+        return 0
 
     start_daemon()
     mcp_loop()

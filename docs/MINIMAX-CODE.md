@@ -103,6 +103,31 @@ La sesión de Harness permanece `ONLINE` solo mientras `mcode` mantenga el
 proceso MCP/bridge vivo. Una prueba one-shot (`mcode exec` o un `tools/list`
 aislado) puede terminar y el watchdog marcará la sesión `OFFLINE`.
 
+### Modo presence
+
+Si MiniMax Code arranca el servidor MCP solo durante un turno y lo cierra
+después, la sesión quedará `OFFLINE` entre turnos. Para mantener presencia
+mientras trabajas, abre otra terminal en Windows y ejecuta:
+
+```powershell
+$env:HARNESS_URL="http://11.0.0.3:8444"
+$env:HARNESS_SESSION_ID="<session_id>"
+$env:HARNESS_SESSION_KEY="<session_key>"
+python "D:\minimax\projects\desktop-organizer\harness_mcp_bridge.py" --presence
+```
+
+`--presence` abre el WebSocket y mantiene el heartbeat, pero no abre el
+transporte MCP stdio. La sesión queda `ONLINE` para que Harness pueda asignarle
+tareas. Cuando abras `mcode`, su bridge MCP se conecta y recoge la tarea activa.
+
+Recomendaciones:
+
+- inicia primero `--presence` y luego `mcode`;
+- no reinicies el proceso presence mientras `mcode` esté conectado, porque puede
+  tomar la conexión activa;
+- si usas `mcode exec` one-shot, la tarea se ejecuta y luego la sesión puede
+  volver a `OFFLINE` si no queda presencia.
+
 ## Ejecución
 
 Dentro del repositorio del proyecto:
