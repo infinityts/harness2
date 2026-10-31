@@ -129,9 +129,10 @@ WAR_ROOM_HTML = r"""<!doctype html>
   tr:last-child td { border-bottom:0; }
   .form-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
   .form-grid .span-2 { grid-column:span 2; }
-  .check-row { display:flex; align-items:flex-start; gap:10px; padding:9px 10px; border:1px solid var(--line); border-radius:9px; background:#0a1322; }
-  .check-row input[type=checkbox] { width:18px; height:18px; margin-top:1px; accent-color:var(--accent); }
+  .check-row { display:flex; align-items:flex-start; gap:10px; padding:9px 10px; border:1px solid var(--line); border-radius:9px; background:#0a1322; min-width:0; }
+  .check-row input[type=checkbox], .check-row input[type=radio] { width:18px; height:18px; min-width:18px; flex:0 0 18px; margin-top:1px; accent-color:var(--accent); }
   .check-row .grow { flex:1; min-width:0; }
+  .check-row.selected { border-color:var(--accent); background:rgba(56,189,248,.08); }
   .check-row .skills-input { margin-top:7px; }
   .result-box { background:#08111f; border:1px dashed var(--line-strong); border-radius:10px; padding:10px; font-size:12px; white-space:pre-wrap; word-break:break-word; }
   .copy-row { display:flex; gap:8px; align-items:flex-start; }
@@ -177,11 +178,11 @@ WAR_ROOM_HTML = r"""<!doctype html>
   .toast-item.ok { border-left-color:var(--ok); }
   @keyframes slide { from { transform:translateY(8px); opacity:0; } to { transform:none; opacity:1; } }
   .modal { position:fixed; inset:0; z-index:70; display:grid; place-items:center; padding:18px; background:rgba(2,6,14,.72); }
-  .modal-card { width:min(640px,100%); max-height:90dvh; overflow:auto; background:var(--panel); border:1px solid var(--line-strong); border-radius:16px; box-shadow:var(--shadow); }
-  .modal-head { display:flex; align-items:center; gap:10px; padding:15px 17px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--panel); z-index:1; }
+  .modal-card { width:min(680px,100%); max-height:90dvh; display:flex; flex-direction:column; overflow:hidden; background:var(--panel); border:1px solid var(--line-strong); border-radius:16px; box-shadow:var(--shadow); }
+  .modal-head { display:flex; align-items:center; gap:10px; padding:15px 17px; border-bottom:1px solid var(--line); flex:0 0 auto; background:var(--panel); z-index:1; }
   .modal-head h3 { margin:0; flex:1; font-size:15px; }
-  .modal-body { padding:17px; }
-  .modal-foot { padding:13px 17px; border-top:1px solid var(--line); display:flex; justify-content:flex-end; gap:8px; }
+  .modal-body { padding:17px; overflow:auto; min-height:0; flex:1 1 auto; }
+  .modal-foot { padding:13px 17px; border-top:1px solid var(--line); display:flex; justify-content:flex-end; gap:8px; flex:0 0 auto; }
 
   /* 16-inch / wide desktop: 3 columns */
   @media (min-width: 1200px) {
@@ -1209,22 +1210,23 @@ async function openAssignProjectModal(userId, email) {
   state.assignProjectId = null;
   state.assignSelectedSkills = new Set();
   $("modalTitle").textContent = "Asignar proyecto";
-  $("modalBody").innerHTML = `<div class="stack" style="gap:12px">
-    <div class="result-box">Usuario: <b>${esc(email)}</b><br>Primero elige el proyecto. Después marca las skills que puede usar en ese proyecto.</div>
-    <div class="field">
-      <label for="assignProjectSearch">Buscar proyecto</label>
-      <input id="assignProjectSearch" placeholder="Filtra por nombre o slug..." autocomplete="off">
-      <div id="assignProjectList" class="stack" style="gap:6px;max-height:210px;overflow:auto;margin-top:4px"></div>
+  $("modalBody").innerHTML = `<div class="stack" style="gap:14px">
+    <div class="result-box" style="white-space:normal">Usuario: <b>${esc(email)}</b><br>Selecciona el proyecto y luego las skills que podrá usar en él.</div>
+    <div>
+      <div class="side-label" style="padding:0 0 6px">1. Elige el proyecto</div>
+      <input id="assignProjectSearch" placeholder="Buscar proyecto por nombre o slug" autocomplete="off">
+      <div id="assignProjectList" class="stack" style="gap:8px;max-height:220px;overflow:auto;margin-top:8px"></div>
     </div>
-    <div class="field">
-      <label for="assignSkillSearch">Skills permitidas en este proyecto</label>
-      <input id="assignSkillSearch" placeholder="Buscar skill por nombre, categoría o slug..." autocomplete="off">
-      <div id="assignSkillList" class="stack" style="gap:6px;max-height:230px;overflow:auto;margin-top:4px"></div>
+    <div id="assignProjectSummary" class="result-box hidden" style="white-space:normal"></div>
+    <div>
+      <div class="side-label" style="padding:0 0 6px">2. Selecciona las skills</div>
+      <input id="assignSkillSearch" placeholder="Buscar skill por nombre, categoría o slug" autocomplete="off">
+      <div id="assignSkillList" class="stack" style="gap:8px;max-height:260px;overflow:auto;margin-top:8px"></div>
     </div>
-    <div class="login-note">Solo lectura = skill oficial que no se puede modificar. El agente recibirá el manual únicamente cuando la tarea lo requiera.</div>
+    <div class="login-note">Las skills oficiales se muestran solo para consulta. Las skills marcadas se habilitan para este usuario en este proyecto.</div>
     <div id="assignMsg" class="result-box hidden"></div>
   </div>`;
-  $("modalActions").innerHTML = `<button id="modalCancel" class="btn ghost" type="button">Cancelar</button><button id="assignSave" class="btn primary" type="button">Asignar proyecto</button>`;
+  $("modalActions").innerHTML = `<button id="modalCancel" class="btn ghost" type="button">Cancelar</button><button id="assignSave" class="btn primary" type="button" disabled>Asignar proyecto</button>`;
   $("modal").classList.remove("hidden");
   $("modalCancel").onclick = closeModal;
   $("assignSave").onclick = () => submitAssignProject(userId);
@@ -1242,9 +1244,9 @@ function renderAssignProjects() {
   const projects = state.projects.filter(p =>
     !q || p.display_name.toLowerCase().includes(q) || p.project_slug.toLowerCase().includes(q)
   );
-  box.innerHTML = projects.length ? projects.map(p => `<label class="check-row" style="cursor:pointer">
+  box.innerHTML = projects.length ? projects.map(p => `<label class="check-row ${state.assignProjectId === p.id ? "selected" : ""}" style="cursor:pointer">
     <input type="radio" name="assignProject" value="${esc(p.id)}" ${state.assignProjectId === p.id ? "checked" : ""}>
-    <div class="grow"><b>${esc(p.display_name)}</b><div class="muted mono" style="font-size:11px">${esc(p.project_slug)}</div></div>
+    <div class="grow"><b>${esc(p.display_name)}</b>${p.display_name !== p.project_slug ? `<div class="muted mono" style="font-size:11px">${esc(p.project_slug)}</div>` : ""}</div>
   </label>`).join("") : '<div class="muted" style="font-size:12px">Ningún proyecto coincide con el filtro.</div>';
   box.querySelectorAll('input[name="assignProject"]').forEach(radio => {
     radio.onchange = () => {
@@ -1252,9 +1254,26 @@ function renderAssignProjects() {
       const user = (state.adminUsers || []).find(u => u.id === state.assignUserId);
       const membership = ((user && user.memberships) || []).find(m => m.project_id === radio.value && m.status === "APPROVED");
       state.assignSelectedSkills = new Set((membership && membership.allowed_skills) || []);
+      renderAssignProjects();
       renderAssignSkills();
+      updateAssignSummary();
     };
   });
+  updateAssignSummary();
+}
+
+function updateAssignSummary() {
+  const box = $("assignProjectSummary");
+  const save = $("assignSave");
+  if (!box || !save) return;
+  const project = state.projects.find(p => p.id === state.assignProjectId);
+  save.disabled = !project;
+  if (!project) {
+    box.classList.add("hidden");
+    return;
+  }
+  box.classList.remove("hidden");
+  box.innerHTML = `Proyecto seleccionado: <b>${esc(project.display_name)}</b>${project.display_name !== project.project_slug ? ` · <span class="mono">${esc(project.project_slug)}</span>` : ""}<br>Skills seleccionadas: <b>${state.assignSelectedSkills.size}</b>`;
 }
 
 function renderAssignSkills() {
@@ -1280,8 +1299,10 @@ function renderAssignSkills() {
     chk.onchange = () => {
       if (chk.checked) state.assignSelectedSkills.add(chk.value);
       else state.assignSelectedSkills.delete(chk.value);
+      updateAssignSummary();
     };
   });
+  updateAssignSummary();
 }
 
 async function submitAssignProject(userId) {
